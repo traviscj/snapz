@@ -152,6 +152,18 @@ struct API {
         }
     }
 
+    func inbox() async throws -> InboxResponse { try await get("/api/inbox", query: ["limit": "200"]) }
+
+    func recordNamespaces() async throws -> [RecordNamespace] {
+        let l: NamespaceList = try await get("/api/records")
+        return l.namespaces
+    }
+
+    func records(ns: String) async throws -> [Record] {
+        let l: RecordList = try await get("/api/records/\(ns.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ns)", query: ["limit": "2000"])
+        return l.records
+    }
+
     func exchangeDeviceToken(code: String, verifier: String, name: String) async throws -> DeviceToken {
         try await send("POST", "/auth/device-token", json: ["code": code, "verifier": verifier, "name": name])
     }

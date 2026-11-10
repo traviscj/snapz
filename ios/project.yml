@@ -39,3 +39,24 @@ targets:
         NSAppTransportSecurity:
           # plain-http servers on the LAN (dev); real deployments are https
           NSAllowsLocalNetworking: true
+  SnapzUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [SnapzUITests]
+    dependencies:
+      - target: Snapz
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(SNAPZ_BUNDLE_PREFIX).snapz.uitests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  Snapz:
+    build:
+      targets:
+        Snapz: all
+        SnapzUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets: [SnapzUITests]

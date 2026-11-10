@@ -20,6 +20,23 @@ re-delivered with a higher feed_sync_id, deletes arrive as entries with "deleted
 cursor is committed only after a whole page was handled. Handlers must therefore be idempotent.
 Writing derived state with put_record() is: a value-identical put is a server-side no-op.
 
+Image transform workers (see transform_examples.py):
+
+    from snapz import image_transform, run, Skip, Halt
+
+    @image_transform("dominant-color", kind="extract", description="average RGB")
+    def dominant(intent, image, sz):          # image = bytes of the version the intent reads
+        return {"rgb": [...]}                 # result data; or (data, meta_patch)
+
+    @image_transform("gray", kind="rewrite")
+    def gray(intent, image, sz):
+        return new_image_bytes                # becomes a child version; or (bytes, data)
+
+    run()
+
+Each worker consumes the `intents` feed for its transform and posts a result. Raise Skip("why")
+when a photo doesn't apply (the chain continues) or Halt("why") to stop the collection's chain.
+
 CLI:
 
     snapz.py status                      feeds, sequences, consumer lag
@@ -153,6 +170,33 @@ class Snapz:
     def records(self, ns, prefix=None, limit=5000):
         return self.call("GET", f"/api/records/{self._q(ns)}", query={"prefix": prefix, "limit": limit})["records"]
 
+    # ---- transforms
+    def register_transform(self, name, kind, description=None):
+        self.call("PUT", f"/api/transforms/{self._q(name)}", {"kind": kind, "description": description})
+
+    def request_transform(self, token, transform, params=None):
+        return self.call("POST", f"/api/photos/{token}/intents", {"transform": transform, "params": params})
+
+    def history(self, token):
+        return self.call("GET", f"/api/photos/{token}/history")
+
+    def post_result(self, intent, status="ok", data=None, meta_patch=None, error=None, worker=None):
+        return self.call("POST", f"/api/intents/{intent}/results", {"status": status, "data": data, "meta_patch": meta_patch, "error": error, "worker": worker})
+
+    def post_output(self, intent, image, data=None, worker=None, current=True):
+        return self.call("POST", f"/api/intents/{intent}/output", raw=image, timeout=120, query={
+            "worker": worker, "data": json.dumps(data) if data is not None else None, "current": None if current else "false"})
+
+    def input_image(self, intent):
+        """Bytes of the exact version an intent (a feed entry) was issued against."""
+        req = urllib.request.Request(self.url + intent["input_url"], headers={"Authorization": f"Bearer {self.token}"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.read()
+
+    def inbox(self):
+        """[{"photo": …, "suggestions": [{"collection", "p"}, …], "features": {…}}], newest first."""
+        return self.call("GET", "/api/inbox")["photos"]
+
     # ---- feeds
     def fetch(self, feed, after=0, limit=100, **filters):
         """One page: {"entries": [...], "cursor": N}. filters: collection= (photos), ns= (records), shard=/shard_count=."""
@@ -214,6 +258,63 @@ def transform(feed, consumer, sink=None, **filters):
     return deco
 
 
+class Skip(Exception):
+    """Raised by an image transform: not applicable to this photo. The chain continues."""
+
+
+class Halt(Exception):
+    """Raised by an image transform: done, and the collection's chain stops here."""
+
+
+_IMAGE_TRANSFORMS = []
+
+
+def image_transform(name, kind="extract", description=None, current=True):
+    """Register fn(intent, image_bytes, sz) as the worker for transform `name`.
+
+    extract: return data, or (data, meta_patch) to also merge keys into photo.meta.
+    rewrite: return image bytes, or (bytes, data). `current=False` adds the version without
+             making it the photo's current one (do that for anything that changes geometry).
+    """
+    if kind not in ("extract", "rewrite"):
+        raise ValueError("kind must be extract or rewrite")
+
+    def deco(fn):
+        _IMAGE_TRANSFORMS.append({"fn": fn, "name": name, "kind": kind, "description": description or (fn.__doc__ or "").strip() or None, "current": current})
+        return fn
+    return deco
+
+
+def _work(t, sz, worker, dry_run, log):
+    def handle(intent):
+        # The feed is at-least-once and replayable: answer only what hasn't been answered.
+        if intent["state"] != "pending" or not intent.get("input_url"):
+            return
+        label = f"{t['name']} {intent.get('collection')}/{intent['photo']}"
+        if dry_run:
+            log(f"would run {label}")
+            return
+        try:
+            out = t["fn"](intent, sz.input_image(intent), sz)
+            if t["kind"] == "rewrite":
+                image, data = out if isinstance(out, tuple) else (out, None)
+                sz.post_output(intent["token"], image, data=data, worker=worker, current=t["current"])
+            else:
+                data, patch = out if isinstance(out, tuple) else (out, None)
+                sz.post_result(intent["token"], data=data, meta_patch=patch, worker=worker)
+            log(f"ok   {label}")
+        except Skip as e:
+            sz.post_result(intent["token"], status="skipped", data={"reason": str(e)}, worker=worker)
+            log(f"skip {label}: {e}")
+        except Halt as e:
+            sz.post_result(intent["token"], status="halt", data={"reason": str(e)}, worker=worker)
+            log(f"halt {label}: {e}")
+        except Exception as e:  # a failed photo must not wedge the worker; the error is the result
+            sz.post_result(intent["token"], status="error", error=f"{type(e).__name__}: {e}", worker=worker)
+            log(f"ERR  {label}: {e}")
+    return handle
+
+
 def _pairs(result):
     if result is None:
         return []
@@ -233,8 +334,10 @@ def run(argv=None):
     args = ap.parse_args(argv)
     sz = Snapz()
     todo = [t for t in _TRANSFORMS if not args.only or t["consumer"] == args.only]
-    if not todo:
+    workers = [t for t in _IMAGE_TRANSFORMS if not args.only or t["name"] == args.only]
+    if not todo and not workers:
         raise SystemExit("no transforms registered")
+    worker_id = f"{os.uname().nodename}:{os.path.basename(sys.argv[0])}"
 
     def log(msg):
         print(time.strftime("%Y-%m-%dT%H:%M:%S%z"), msg, file=sys.stderr, flush=True)
@@ -255,10 +358,18 @@ def run(argv=None):
         if args.rewind and not args.dry_run:
             sz.set_cursor(t["consumer"], t["feed"], 0)
             log(f"{t['consumer']}: rewound {t['feed']} to 0")
+    for t in workers:
+        if not args.dry_run:
+            sz.register_transform(t["name"], t["kind"], t["description"])
+            if args.rewind:
+                sz.set_cursor(f"worker:{t['name']}", "intents", 0)
     while True:
         total = 0
         for t in todo:
             total += sz.consume(t["feed"], t["consumer"], handler_for(t), commit=not args.dry_run, log=log, **t["filters"])
+        for t in workers:
+            total += sz.consume("intents", f"worker:{t['name']}", _work(t, sz, worker_id, args.dry_run, log),
+                                commit=not args.dry_run, transform=t["name"])
         if not args.follow:
             log(f"caught up ({total} entries)")
             return

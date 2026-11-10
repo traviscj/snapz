@@ -22,6 +22,8 @@ miskTesting = { module = "com.squareup.misk:misk-testing", version.ref = "misk" 
 mysql = { module = "com.mysql:mysql-connector-j", version = "8.4.0" }
 slf4jSimple = { module = "org.slf4j:slf4j-simple", version = "2.0.16" }
 wireMoshiAdapter = { module = "com.squareup.wire:wire-moshi-adapter", version.ref = "wire" }
+zxingCore = { module = "com.google.zxing:core", version = "3.5.3" }
+zxingJavase = { module = "com.google.zxing:javase", version = "3.5.3" }
 wireRuntime = { module = "com.squareup.wire:wire-runtime", version.ref = "wire" }
 
 [plugins]

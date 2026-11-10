@@ -1,0 +1,20 @@
+CREATE TABLE transform_intents (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  token VARCHAR(32) NOT NULL,
+  photo_id BIGINT NOT NULL,
+  version_id BIGINT NOT NULL,
+  transform VARCHAR(64) NOT NULL,
+  params LONGTEXT NULL,
+  origin VARCHAR(16) NOT NULL,
+  collection_id BIGINT NULL,
+  chain_position INT NULL,
+  requested_by VARCHAR(255) NULL,
+  created_at_ms BIGINT NOT NULL,
+  feed_sync_id BIGINT NULL,
+  shard INT NOT NULL DEFAULT 0,
+  PRIMARY KEY (id),
+  UNIQUE KEY u_token (token),
+  UNIQUE KEY u_fsi (feed_sync_id),
+  KEY idx_photo (photo_id),
+  KEY idx_transform (transform)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4

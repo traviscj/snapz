@@ -62,6 +62,29 @@ input:focus,textarea:focus,select:focus{outline:1px solid var(--acc);outline-off
 #login input{width:100%;margin:2px 0}
 .pane table{width:auto;min-width:50%}
 code{background:var(--bg3);padding:0 3px}
+.imgwrap{position:relative;display:inline-block;max-width:100%;line-height:0}
+.imgwrap img{margin:0!important}
+.bx{position:absolute;border:2px solid var(--ok);box-shadow:0 0 0 1px #000a;pointer-events:none}
+.bx span{position:absolute;left:-2px;bottom:100%;background:var(--ok);color:#000;font-size:10px;line-height:1.2;padding:0 3px;white-space:nowrap;font-weight:700}
+.bx.live{border-style:dashed}
+@keyframes chg{from{box-shadow:inset 0 0 0 3px var(--ok)}to{box-shadow:inset 0 0 0 3px transparent}}
+.t.chg::before{content:"";position:absolute;inset:0;animation:chg 2.5s ease-out forwards;z-index:1;pointer-events:none}
+tr.chg td{animation:chgrow 2.5s ease-out}
+@keyframes chgrow{from{background:color-mix(in srgb,var(--ok) 35%,transparent)}to{background:transparent}}
+button.on{color:var(--ok);border-color:var(--ok)}button.off{color:var(--bad);border-color:var(--bad);font-weight:700}
+.vers{display:flex;gap:3px;flex-wrap:wrap;margin:2px 0}
+.ver{position:relative;width:64px;cursor:pointer;border:2px solid var(--line);background:var(--bg3)}
+.ver img{width:100%;height:60px;object-fit:cover;display:block}
+.ver.cur{border-color:var(--ok)}
+.ver span{display:block;font-size:9px;line-height:1.2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 1px}
+.sug{display:flex;gap:3px;flex-wrap:wrap;margin:2px 0 4px}
+.sug button{position:relative;overflow:hidden;text-align:left;padding:2px 6px;min-width:70px}
+.sug button i{position:absolute;left:0;top:0;bottom:0;background:var(--ok);opacity:.28;font-style:normal}
+.sug button b,.sug button small{position:relative}
+.t .sg{position:absolute;top:0;right:0;background:#000a;color:var(--acc);font-size:10px;line-height:1.15;padding:0 2px}
+.st-pending{color:var(--warn)}.st-ok{color:var(--ok)}.st-skipped{color:var(--dim)}.st-halt{color:var(--acc)}.st-error{color:var(--bad);font-weight:700}
+.chip{display:inline-block;border:1px solid var(--line);background:var(--bg3);padding:0 4px;margin-right:2px;border-radius:2px}
+.chip a{color:var(--bad);margin-left:4px;cursor:pointer}
 .hide{display:none!important}
 td.wrap{white-space:normal;word-break:break-all;max-width:520px}
 </style>
@@ -72,7 +95,9 @@ td.wrap{white-space:normal;word-break:break-all;max-width:520px}
   <span class="tab" data-tab="photos">photos</span>
   <span class="tab" data-tab="feeds">feeds</span>
   <span class="tab" data-tab="records">records</span>
+  <span class="tab" data-tab="transforms">transforms</span>
   <span class="tab" data-tab="tokens">tokens</span>
+  <span class="tab" data-tab="info">info</span>
   <span class="sp"></span>
   <span id="who" class="dim"></span>
   <button id="logout" class="hide">logout</button>
@@ -131,7 +156,57 @@ const S = {
   photos: [], next: null, loading: false, sel: new Set(), cur: -1, anchor: -1,
   view: localStorage.snapzView || "grid", tile: +(localStorage.snapzTile || 112), barcode: "",
   recNs: null,
+  openTok: null,                        // photo shown in the detail pane (also in the URL)
+  feedCur: { photos: 0, collections: 0, results: 0 }, // live-refresh positions in the change feeds
+  inbox: null,                          // slug of the inbox collection (from /api/inbox)
+  sug: {},                              // photo token -> ranked [{collection, p}] while viewing the inbox
+  transforms: [],
+  fresh: new Set(),                     // tokens changed by the last live update (flashed once)
 };
+
+// ---------------------------------------------------------------------------- url <-> state
+// Everything needed to get back to what's on screen lives in the hash, so a URL can be pasted:
+//   #/photos/<collection|~all|~trash>[/<photo token>][?view=table&bc=<barcode>]
+//   #/feeds   #/records/<ns>   #/tokens   #/info
+const TABS = ["photos", "feeds", "records", "transforms", "tokens", "info"];
+function urlFor() {
+  if (S.tab !== "photos") return "#/" + S.tab + (S.tab === "records" && S.recNs ? "/" + encodeURIComponent(S.recNs) : "");
+  let h = "#/photos/" + encodeURIComponent(S.coll ?? "~all");
+  if (S.openTok) h += "/" + encodeURIComponent(S.openTok);
+  const q = new URLSearchParams();
+  if (S.view === "table") q.set("view", "table");
+  if (S.barcode) q.set("bc", S.barcode);
+  const qs = q.toString();
+  return h + (qs ? "?" + qs : "");
+}
+// push = a navigation worth a Back step (tab, collection); otherwise replace in place.
+function syncUrl(push = false) {
+  const h = urlFor();
+  if (location.hash === h) return;
+  if (push) history.pushState(null, "", h); else history.replaceState(null, "", h);
+}
+function parseUrl() {
+  const raw = location.hash.replace(/^#\/?/, "");
+  const [path, qs] = raw.split("?");
+  const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
+  const q = new URLSearchParams(qs || "");
+  const out = { tab: "photos", coll: null, openTok: null, view: q.get("view") === "table" ? "table" : null, barcode: q.get("bc") || "", recNs: null };
+  if (TABS.includes(parts[0])) {
+    out.tab = parts[0];
+    if (out.tab === "photos") { out.coll = !parts[1] || parts[1] === "~all" ? null : parts[1]; out.openTok = parts[2] || null; }
+    if (out.tab === "records") out.recNs = parts[1] || null;
+  } else if (parts[0]) out.coll = parts[0]; // legacy "#pantry"
+  return out;
+}
+function applyUrl() {
+  const u = parseUrl();
+  S.coll = u.coll; S.openTok = u.openTok; S.barcode = u.barcode;
+  if (u.view) S.view = u.view; else if (location.hash.includes("/photos")) S.view = "grid";
+  if (u.recNs) S.recNs = u.recNs;
+  S.sel.clear(); S.cur = -1; S.anchor = -1;
+  setTab(u.tab, false);
+}
+window.addEventListener("hashchange", () => { if (S.me && location.hash !== urlFor()) applyUrl(); });
 const main = $("#main");
 let poller = null; // the active tab's poll loop, if any
 
@@ -217,7 +292,7 @@ function photosShell() {
   $("#b-lg").onclick = () => setTile(S.tile + 24);
   $("#b-up").onclick = () => $("#b-file").click();
   $("#b-file").onchange = ev => { uploadFiles([...ev.target.files]); ev.target.value = ""; };
-  $("#b-bc").onchange = ev => { S.barcode = ev.target.value.trim(); loadPhotos(true); };
+  $("#b-bc").onchange = ev => { S.barcode = ev.target.value.trim(); syncUrl(); loadPhotos(true); };
   $("#b-purge").onclick = async () => {
     if (!confirm("Permanently delete everything in the trash? This cannot be undone.")) return;
     const r = await run("purge", () => api("POST", "/api/admin/purge?older_than_days=0"));
@@ -239,7 +314,7 @@ function setTile(px) {
   S.tile = Math.min(400, Math.max(64, px)); localStorage.snapzTile = S.tile;
   $("#content")?.style.setProperty("--tile", S.tile + "px");
 }
-function toggleView() { S.view = S.view === "grid" ? "table" : "grid"; localStorage.snapzView = S.view; $("#b-view").textContent = S.view === "grid" ? "table" : "grid"; renderPhotos(); }
+function toggleView() { S.view = S.view === "grid" ? "table" : "grid"; localStorage.snapzView = S.view; $("#b-view").textContent = S.view === "grid" ? "table" : "grid"; syncUrl(); renderPhotos(); }
 
 async function loadCollections() {
   S.collections = (await api("GET", "/api/collections")).collections;
@@ -290,8 +365,8 @@ function renderSide() {
   }
 }
 function selectColl(slug) {
-  S.coll = slug; S.sel.clear(); S.cur = -1; S.anchor = -1;
-  location.hash = slug ? encodeURIComponent(slug) : "";
+  S.coll = slug; S.sel.clear(); S.cur = -1; S.anchor = -1; S.openTok = null;
+  syncUrl(true);
   renderSide(); loadPhotos(true);
 }
 
@@ -306,8 +381,9 @@ async function loadPhotos(reset) {
     if (!reset && S.next) q.set("before", S.next);
     const page = await api("GET", "/api/photos?" + q);
     S.photos = reset ? page.photos : S.photos.concat(page.photos);
+    await loadSuggestions();
     S.next = page.next_before ?? null;
-    if (reset) { $("#content").scrollTop = 0; closeDetail(); }
+    if (reset) { $("#content").scrollTop = 0; await reopenDetail(); }
     renderPhotos();
     say(`${collLabel()}: ${S.photos.length}${S.next ? "+" : ""} photos`);
   } catch (e) { if (e.status !== 401) say("load failed: " + e.message, "bad"); }
@@ -329,21 +405,41 @@ function renderPhotos() {
   const showColl = !S.coll || inTrash();
   if (S.view === "grid") {
     content.innerHTML = `<div id="grid">` + S.photos.map((p, i) => `
-      <div class="t${S.sel.has(p.token) ? " sel" : ""}${i === S.cur ? " cur" : ""}${p.deleted_at ? " del" : ""}" data-i="${i}">
+      <div class="t${S.sel.has(p.token) ? " sel" : ""}${i === S.cur ? " cur" : ""}${p.deleted_at ? " del" : ""}${S.fresh.has(p.token) ? " chg" : ""}" data-i="${i}">
         <img loading="lazy" src="${esc(p.thumb_url)}" alt="">
         ${p.barcodes.length ? `<span class="bc">${esc(p.barcodes.join(" "))}</span>` : ""}
-        ${p.note && !S.sel.has(p.token) ? `<span class="nt" title="${esc(p.note)}">n</span>` : ""}
+        ${p.note && !S.sel.has(p.token) && !S.sug[p.token] ? `<span class="nt" title="${esc(p.note)}">n</span>` : ""}
+        ${S.sug[p.token]?.[0] && !S.sel.has(p.token) ? `<span class="sg">${esc(S.sug[p.token][0].collection)} ${pct(S.sug[p.token][0].p)}</span>` : ""}
         <span class="cap">${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
       </div>`).join("") + `</div>`;
   } else {
     content.innerHTML = `<table><thead><tr><th></th><th>taken</th><th class="n">age</th>${showColl ? "<th>collection</th>" : ""}<th>token</th><th class="n">w×h</th><th class="n">size</th><th>barcodes</th><th>note</th><th class="n">fsi</th></tr></thead><tbody>` +
-      S.photos.map((p, i) => `<tr data-i="${i}" class="${S.sel.has(p.token) ? "sel" : ""}${i === S.cur ? " cur" : ""}" style="cursor:pointer">
+      S.photos.map((p, i) => `<tr data-i="${i}" class="${S.sel.has(p.token) ? "sel" : ""}${i === S.cur ? " cur" : ""}${S.fresh.has(p.token) ? " chg" : ""}" style="cursor:pointer">
         <td style="padding:0"><img loading="lazy" src="${esc(p.thumb_url)}" alt="" style="height:28px;width:28px;object-fit:cover;display:block"></td>
         <td>${fmtTs(p.taken_at)}</td><td class="n dim">${age(p.taken_at)}</td>${showColl ? `<td>${esc(p.collection)}</td>` : ""}
         <td class="dim">${esc(p.token)}</td><td class="n">${p.width ?? "?"}×${p.height ?? "?"}</td><td class="n">${fmtBytes(p.bytes)}</td>
         <td class="ok">${esc(p.barcodes.join(" "))}</td><td style="max-width:320px;overflow:hidden;text-overflow:ellipsis">${esc(p.note)}</td>
         <td class="n ${p.feed_sync_id == null ? "warn" : "dim"}">${p.feed_sync_id ?? "pend"}</td></tr>`).join("") + `</tbody></table>`;
   }
+}
+// After a (re)load: put the detail pane back on the photo named in the URL, even when it isn't in
+// the loaded page (deep link to an old photo, or to one in another collection).
+async function reopenDetail() {
+  if (!S.openTok) { closeDetail(false); return; }
+  let i = S.photos.findIndex(p => p.token === S.openTok);
+  let p = S.photos[i];
+  if (!p) { try { p = await api("GET", `/api/photos/${encodeURIComponent(S.openTok)}`); } catch (e) { p = null; } }
+  if (!p) { say(`photo ${S.openTok} not found`, "warn"); closeDetail(); return; }
+  if (i >= 0) { S.cur = i; S.anchor = i; }
+  showDetail(p);
+  if (i >= 0) requestAnimationFrame(() => $(`[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" }));
+}
+// Detected regions (meta.barcodes[].box = [x, y, w, h] fractions of the upright image) as overlays.
+function boxesHtml(p) {
+  return (p.meta?.barcodes || []).filter(b => Array.isArray(b.box) && b.box.length === 4).map(b => {
+    const [x, y, w, h] = b.box.map(v => Math.max(0, Math.min(1, +v)) * 100);
+    return `<div class="bx${b.source === "live" ? " live" : ""}" style="left:${x}%;top:${y}%;width:${w}%;height:${h}%"><span>${esc(b.symbology || "?")} ${esc(b.value)}</span></div>`;
+  }).join("");
 }
 // click = focus + open detail; cmd/ctrl-click = toggle; shift-click = range
 function pick(i, ev) {
@@ -359,6 +455,7 @@ function pick(i, ev) {
 }
 function showDetail(p) {
   const d = $("#detail"); d.classList.add("on");
+  S.openTok = p.token; syncUrl();
   const rows = [
     ["token", p.token], ["collection", p.collection], ["taken", `${fmtTs(p.taken_at)} (${age(p.taken_at)})`],
     ["uploaded", fmtTs(p.created_at)], ["updated", fmtTs(p.updated_at)],
@@ -369,20 +466,47 @@ function showDetail(p) {
   ].filter(Boolean);
   d.innerHTML = `<div style="display:flex;gap:4px;margin-bottom:3px"><b class="acc" style="flex:1">${esc(p.token)}</b>
       <a href="${esc(p.url)}" target="_blank"><button>open</button></a><a href="${esc(p.url)}" download="${esc(p.collection)}-${esc(p.token)}"><button>download</button></a><button id="d-close">×</button></div>
-    <a href="${esc(p.url)}" target="_blank"><img src="${esc(p.url)}" alt=""></a>
+    <div style="text-align:center;margin-bottom:4px"><div class="imgwrap"><img src="${esc(p.url)}" alt="">${boxesHtml(p)}</div></div>
+    ${S.sug[p.token] ? `<div class="dim">file under <span title="P(collection | photo): naive Bayes over how past photos were filed — see the info tab">(1–9)</span></div>
+      <div class="sug">${S.sug[p.token].slice(0, 9).map((g, i) => `<button data-file="${esc(g.collection)}" style="flex:${Math.max(0.15, g.p)} 1 0;${i === 0 ? "font-weight:700;padding:5px 6px" : ""}" title="${pct(g.p)}"><i style="width:${g.p * 100}%"></i><b>${i + 1} ${esc(g.collection)}</b> <small class="dim">${pct(g.p)}</small></button>`).join("")}</div>` : ""}
     <dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>
+    <div id="d-hist"><span class="dim">history…</span></div>
     <div class="dim" style="margin-top:3px">note</div>
     <textarea id="d-note" ${p.deleted_at ? "disabled" : ""}>${esc(p.note)}</textarea>
     <button id="d-save" ${p.deleted_at ? "disabled" : ""}>save note</button>
     <div class="dim" style="margin-top:3px">meta</div><pre>${esc(JSON.stringify(p.meta, null, 1))}</pre>`;
   $("#d-close").onclick = closeDetail;
+  d.querySelectorAll("[data-file]").forEach(b => b.onclick = () => fileTo(b.dataset.file, [p.token]));
+  loadHistory(p);
   $("#d-save").onclick = async () => {
     const np = await run("save note", () => api("PATCH", `/api/photos/${p.token}`, { note: $("#d-note").value }));
     const i = S.photos.findIndex(x => x.token === p.token); if (i >= 0) S.photos[i] = np;
     renderPhotos();
   };
 }
-function closeDetail() { $("#detail")?.classList.remove("on"); }
+// Version tree + every transform intent and what it answered.
+async function loadHistory(p) {
+  let h; try { h = await api("GET", `/api/photos/${p.token}/history`); } catch (e) { return; }
+  const el = $("#d-hist"); if (!el || S.openTok !== p.token) return;
+  if (!S.transforms.length) { try { S.transforms = (await api("GET", "/api/transforms")).transforms; } catch (e) { /* keep empty */ } }
+  const depth = v => { let n = 0, cur = v; while (cur?.parent) { cur = h.versions.find(x => x.token === cur.parent); n++; } return n; };
+  const summary = r => r.error ? r.error : r.data == null ? "" : JSON.stringify(r.data);
+  el.innerHTML = `<div class="dim" style="margin-top:3px">versions <span title="each image-rewriting transform adds a child of the version it read; click one to make it current">(${h.versions.length})</span></div>
+    <div class="vers">${h.versions.map(v => `<div class="ver${v.current ? " cur" : ""}" data-ver="${esc(v.token)}" title="${esc(v.transform || "original")} · ${v.width ?? "?"}×${v.height ?? "?"} · ${fmtBytes(v.bytes)} · ${fmtTs(v.created_at)}${v.current ? " · CURRENT" : " · click to make current"}">
+      <img loading="lazy" src="${esc(v.thumb_url)}" alt=""><span class="${v.current ? "ok" : "dim"}">${"›".repeat(depth(v))}${esc(v.transform || "original")}</span></div>`).join("")}</div>
+    <div style="display:flex;gap:4px;align-items:center;margin:2px 0"><select id="d-tf">${S.transforms.map(t => `<option value="${esc(t.name)}" title="${esc(t.description || "")}">${esc(t.name)} (${esc(t.kind)})</option>`).join("")}</select>
+      <button id="d-run" ${p.deleted_at ? "disabled" : ""} title="queue this transform for this photo">run</button></div>
+    ${h.intents.length ? `<table><thead><tr><th>transform</th><th>via</th><th>state</th><th class="n">age</th><th>result</th></tr></thead><tbody>${h.intents.map(i => {
+      const r = i.results[i.results.length - 1];
+      return `<tr><td>${esc(i.transform)}</td><td class="dim">${i.origin === "chain" ? `chain#${i.chain_position}` : "manual"}</td><td class="st-${esc(i.state)}">${esc(i.state)}</td><td class="n dim">${age((r || i).created_at)}</td>
+        <td class="dim" style="max-width:150px;overflow:hidden;text-overflow:ellipsis" title="${esc(r ? summary(r) : "")}">${esc(r ? (r.output_version ? "→ new version " : "") + summary(r).slice(0, 80) : "")}</td></tr>`; }).join("")}</tbody></table>` : `<span class="dim">no transforms have run on this photo</span>`}`;
+  el.querySelectorAll("[data-ver]").forEach(v => v.onclick = async () => {
+    if (v.classList.contains("cur")) return;
+    await run("set current version", () => api("PUT", `/api/photos/${p.token}/current`, { version: v.dataset.ver }));
+  });
+  $("#d-run").onclick = async () => { await run("queue " + $("#d-tf").value, () => api("POST", `/api/photos/${p.token}/intents`, { transform: $("#d-tf").value })); loadHistory(p); };
+}
+function closeDetail(sync = true) { $("#detail")?.classList.remove("on"); S.openTok = null; if (sync) syncUrl(); }
 
 async function batch(op) {
   // With nothing selected, keyboard ops act on the focused photo.
@@ -399,7 +523,71 @@ async function batch(op) {
   S.sel.clear();
   refreshAll();
 }
+// Viewing the inbox: fetch P(collection) for everything in it. Ranks are computed server-side at
+// read time, so this is re-fetched after every filing (each one is new evidence).
+async function loadSuggestions() {
+  if (S.inbox === null) { try { const r = await api("GET", "/api/inbox?limit=1"); S.inbox = r.inbox; } catch (e) { S.inbox = ""; } }
+  if (!S.coll || S.coll !== S.inbox) { S.sug = {}; return; }
+  const r = await api("GET", "/api/inbox?limit=500");
+  S.sug = Object.fromEntries(r.photos.map(i => [i.photo.token, i.suggestions]));
+}
+const pct = p => `${Math.round(p * 100)}%`;
+// File one photo (or the selection) under a collection, then move focus to the next one.
+async function fileTo(collection, tokens) {
+  const at = S.cur;
+  await run(`file ${tokens.length} → ${collection}`, () => api("POST", "/api/photos/batch", { op: "move", tokens, collection }));
+  S.sel.clear(); S.openTok = null;
+  await refreshAll();
+  if (S.photos.length) pick(Math.min(at < 0 ? 0 : at, S.photos.length - 1), null);
+}
 async function refreshAll() { await Promise.all([loadCollections(), loadPhotos(true)]); }
+
+// ---------------------------------------------------------------------------- live refresh
+// The page is just another feed consumer: it remembers a feed_sync_id per feed and applies whatever
+// was published since — uploads from the phone, edits from another tab, deletes from a script.
+async function initLive() {
+  const st = await api("GET", "/_feeds/status");
+  for (const f of st.feeds) if (f.feed in S.feedCur) S.feedCur[f.feed] = f.sequence;
+}
+const matchesView = e => (inTrash() ? !!e.deleted_at : !e.deleted_at && (!S.coll || e.collection === S.coll)) && (!S.barcode || e.barcodes.includes(S.barcode));
+async function drainFeed(feed) {
+  const out = [];
+  for (;;) {
+    const page = await api("GET", `/_feeds/fetch/${feed}?after=${S.feedCur[feed]}&limit=200`);
+    out.push(...page.entries); S.feedCur[feed] = page.cursor;
+    if (page.entries.length < 200) return out;
+  }
+}
+async function liveTick() {
+  const [photos, colls, results] = await Promise.all([drainFeed("photos"), drainFeed("collections"), drainFeed("results")]);
+  if (S.openTok && results.some(r => r.photo === S.openTok)) { const p = S.photos.find(x => x.token === S.openTok); if (p) loadHistory(p); }
+  if (!photos.length && !colls.length) return;
+  if (photos.length && S.coll && S.coll === S.inbox) await loadSuggestions();
+  const curTok = S.photos[S.cur]?.token, anchorTok = S.photos[S.anchor]?.token;
+  let changed = 0;
+  for (const e of photos) {
+    const i = S.photos.findIndex(p => p.token === e.token), vis = matchesView(e);
+    if (i >= 0 && vis) { S.photos[i] = e; S.fresh.add(e.token); changed++; }
+    else if (i >= 0) { S.photos.splice(i, 1); S.sel.delete(e.token); changed++; }
+    else if (vis) {
+      const t = Date.parse(e.taken_at);
+      let at = S.photos.findIndex(p => Date.parse(p.taken_at) < t);
+      if (at < 0) at = S.photos.length;
+      // Older than everything loaded while more pages exist: it will arrive by scrolling.
+      if (at === S.photos.length && S.next) continue;
+      S.photos.splice(at, 0, e); S.fresh.add(e.token); changed++;
+    }
+    if (e.token === S.openTok && document.activeElement?.id !== "d-note") showDetail(e);
+  }
+  if (changed) {
+    S.cur = curTok ? S.photos.findIndex(p => p.token === curTok) : -1;
+    S.anchor = anchorTok ? S.photos.findIndex(p => p.token === anchorTok) : -1;
+    renderPhotos(); S.fresh.clear();
+    say(`live: ${changed} change${changed > 1 ? "s" : ""} · ${collLabel()}: ${S.photos.length}${S.next ? "+" : ""} photos`, "ok");
+  }
+  await loadCollections(); // counts / sizes / new collections
+  if (S.coll && !inTrash() && !S.collections.some(c => c.slug === S.coll)) { say(`collection '${S.coll}' was deleted`, "warn"); selectColl(null); }
+}
 
 async function uploadFiles(files) {
   files = files.filter(f => f.type.startsWith("image/") || /\.(jpe?g|png|heic|webp|gif)$/i.test(f.name));
@@ -433,6 +621,10 @@ function photoKeys(ev) {
   else if (k === "m") batch("move");
   else if (k === "c") { if (!inTrash()) batch("copy"); }
   else if (k === "r") { if (inTrash()) batch("restore"); else refreshAll(); }
+  else if (/^[1-9]$/.test(k) && S.coll && S.coll === S.inbox) {
+    const p = S.photos[S.cur]; const g = p && S.sug[p.token]?.[+k - 1];
+    if (g) fileTo(g.collection, S.sel.size ? [...S.sel] : [p.token]);
+  }
   else if (k === "v") toggleView();
   else if (k === "+" || k === "=") setTile(S.tile + 24);
   else if (k === "-") setTile(S.tile - 24);
@@ -449,19 +641,31 @@ async function feedsTab() {
   startPoll(async () => {
     const st = await api("GET", "/_feeds/status");
     const seq = Object.fromEntries(st.feeds.map(f => [f.feed, f.sequence]));
-    $("#f-feeds").innerHTML = `<table><thead><tr><th>feed</th><th class="n">sequence</th><th class="n">rows</th><th class="n">pending</th><th class="n">unpub</th></tr></thead><tbody>` +
-      st.feeds.map(f => `<tr><td>${esc(f.feed)}</td><td class="n">${f.sequence}</td><td class="n">${f.rows}</td><td class="n ${f.pending ? "warn" : "dim"}">${f.pending}</td><td class="n dim">${f.unpublished}</td></tr>`).join("") + `</tbody></table>`;
+    $("#f-feeds").innerHTML = `<table><thead><tr><th>feed</th><th class="n">sequence</th><th class="n">rows</th><th class="n">pending</th><th class="n">unpub</th><th>publishing</th><th></th></tr></thead><tbody>` +
+      st.feeds.map(f => `<tr><td>${esc(f.feed)}</td><td class="n">${f.sequence}</td><td class="n">${f.rows}</td><td class="n ${f.pending ? (f.publishing_enabled ? "warn" : "bad") : "dim"}">${f.pending}</td><td class="n dim">${f.unpublished}</td>
+        <td><button class="${f.publishing_enabled ? "on" : "off"}" data-pub="${esc(f.feed)}" data-to="${f.publishing_enabled ? 0 : 1}" title="${f.publishing_enabled ? "publishing every tick — click to pause" : "PAUSED: mutations pile up as pending, consumers see nothing new — click to resume"}">${f.publishing_enabled ? "ON" : "PAUSED"}</button></td>
+        <td><button data-step="${esc(f.feed)}" ${f.pending ? "" : "disabled"} title="publish this feed's pending rows now, even while paused">publish now</button></td></tr>`).join("") + `</tbody></table>`;
+    $("#f-feeds").querySelectorAll("[data-pub]").forEach(b => b.onclick = async () => {
+      await run(`${b.dataset.to === "1" ? "resume" : "pause"} ${b.dataset.pub}`, () => api("PUT", `/_feeds/publishing/${b.dataset.pub}`, { enabled: b.dataset.to === "1" }));
+      poller?.tick();
+    });
+    $("#f-feeds").querySelectorAll("[data-step]").forEach(b => b.onclick = async () => {
+      const r = await run(`publish ${b.dataset.step}`, () => api("POST", `/_feeds/publish?feed=${b.dataset.step}&force=true`));
+      say(`published ${r.published} ${b.dataset.step}`, "ok"); poller?.tick();
+    });
     $("#f-cursors").innerHTML = st.cursors.length ? `<table><thead><tr><th>consumer</th><th>feed</th><th class="n">shard</th><th class="n">cursor</th><th class="n">lag</th><th>updated</th><th class="n">age</th><th></th></tr></thead><tbody>` +
       st.cursors.map(c => `<tr><td>${esc(c.consumer)}</td><td>${esc(c.feed)}</td><td class="n dim">${c.shard}/${c.shard_count}</td><td class="n">${c.cursor}</td>
         <td class="n ${c.lag > 100 ? "bad" : c.lag > 0 ? "warn" : "ok"}">${c.lag ?? ""}</td><td>${fmtTs(c.updated_at)}</td><td class="n dim">${age(c.updated_at)}</td>
         <td><button data-rewind="${esc(c.consumer)}" data-feed="${esc(c.feed)}" data-shard="${c.shard}" data-sc="${c.shard_count}" title="set cursor to 0: replay the whole feed">rewind</button></td></tr>`).join("") + `</tbody></table>`
       : `<span class="dim">no consumers have stored a cursor yet</span>`;
     const tails = await Promise.all(st.feeds.map(f => api("GET", `/_feeds/fetch/${f.feed}?after=${Math.max(0, f.sequence - 40)}&limit=40`)));
-    const rows = tails.flatMap(t => t.entries.map(e => ({ feed: t.feed, e }))).sort((a, b) => (b.e.updated_at || "").localeCompare(a.e.updated_at || "")).slice(0, 80);
+    const rows = tails.flatMap(t => t.entries.map(e => ({ feed: t.feed, e }))).sort((a, b) => (b.e.updated_at || b.e.created_at || "").localeCompare(a.e.updated_at || a.e.created_at || "")).slice(0, 80);
     $("#f-tail").innerHTML = `<table><thead><tr><th>feed</th><th class="n">fsi</th><th>updated</th><th class="n">age</th><th>key</th><th>state</th><th>summary</th></tr></thead><tbody>` +
       rows.map(({ feed, e }) => {
-        const key = feed === "photos" ? `${e.collection}/${e.token}` : feed === "records" ? `${e.ns}/${e.k}` : e.slug;
-        const sum = feed === "photos" ? [e.barcodes.join(" "), e.note].filter(Boolean).join(" · ") : feed === "records" ? JSON.stringify(e.v) : `${e.name} (${e.photo_count})`;
+        const key = feed === "photos" ? `${e.collection}/${e.token}` : feed === "records" ? `${e.ns}/${e.k}` : feed === "collections" ? e.slug : `${e.transform} · ${e.photo ?? "(purged)"}`;
+        const sum = feed === "photos" ? [e.barcodes.join(" "), e.note].filter(Boolean).join(" · ") : feed === "records" ? JSON.stringify(e.v) : feed === "collections" ? `${e.name} (${e.photo_count})`
+          : feed === "intents" ? `${e.origin}${e.chain_position != null ? "#" + e.chain_position : ""} → ${e.state}` : `${e.status}${e.output_version ? " → new version" : ""} ${e.error || (e.data == null ? "" : JSON.stringify(e.data))}`;
+        e = { ...e, updated_at: e.updated_at || e.created_at };
         return `<tr><td>${esc(feed)}</td><td class="n">${e.feed_sync_id}</td><td>${fmtTs(e.updated_at)}</td><td class="n dim">${age(e.updated_at)}</td><td>${esc(key)}</td>
           <td class="${e.deleted_at ? "bad" : "ok"}">${e.deleted_at ? "DEL" : "live"}</td><td class="wrap dim">${esc((sum || "").slice(0, 300))}</td></tr>`;
       }).join("") + `</tbody></table>`;
@@ -479,10 +683,11 @@ async function recordsTab() {
   const load = async () => {
     const nss = (await api("GET", "/api/records")).namespaces;
     if (!S.recNs || !nss.some(n => n.ns === S.recNs)) S.recNs = nss[0]?.ns ?? null;
+    syncUrl();
     $("#side").innerHTML = `<table><thead><tr><th>namespace</th><th class="n">n</th><th class="n">upd</th></tr></thead><tbody>` +
       nss.map(n => `<tr data-ns="${esc(n.ns)}" class="${n.ns === S.recNs ? "on" : ""}"><td>${esc(n.ns)}</td><td class="n">${n.count}</td><td class="n dim">${age(n.updated_at)}</td></tr>`).join("") + `</tbody></table>` +
       (nss.length ? "" : `<div class="dim" style="padding:4px 6px">no records yet — transforms write here (PUT /api/records/{ns}/{k})</div>`);
-    $("#side").querySelectorAll("tr[data-ns]").forEach(tr => tr.onclick = () => { S.recNs = tr.dataset.ns; load(); });
+    $("#side").querySelectorAll("tr[data-ns]").forEach(tr => tr.onclick = () => { S.recNs = tr.dataset.ns; syncUrl(true); load(); });
     if (!S.recNs) { $("#r-main").innerHTML = ""; return; }
     const recs = (await api("GET", `/api/records/${encodeURIComponent(S.recNs)}?limit=2000`)).records;
     // Object-valued records become columns: one column per top-level key seen in the namespace.
@@ -526,14 +731,63 @@ async function tokensTab() {
   load();
 }
 
+// ---------------------------------------------------------------------------- transforms tab
+async function transformsTab() {
+  main.innerHTML = `<div class="pane"><div class="cols">
+    <div><h3>library <span class="dim" style="font-weight:400">— built-ins run in-process; others are workers consuming the intents feed</span></h3><div id="x-lib"></div></div>
+    <div><h3>collection chains <span class="dim" style="font-weight:400">— run in order on photos entering the collection</span></h3><div id="x-chains"></div></div></div>
+    <h3>pending intents <span class="dim" style="font-weight:400">— waiting for a worker</span></h3><div id="x-pending"></div></div>`;
+  const load = async () => {
+    const [lib, colls, pend] = await Promise.all([api("GET", "/api/transforms"), api("GET", "/api/collections"), api("GET", "/api/intents?limit=200")]);
+    S.transforms = lib.transforms;
+    const chains = await Promise.all(colls.collections.map(c => api("GET", `/api/collections/${encodeURIComponent(c.slug)}/transforms`)));
+    if (document.activeElement?.tagName === "SELECT") return; // don't yank an open dropdown
+    $("#x-lib").innerHTML = `<table><thead><tr><th>name</th><th>kind</th><th>runs</th><th class="n">seen</th><th>description</th></tr></thead><tbody>` +
+      lib.transforms.map(t => `<tr><td class="acc">${esc(t.name)}</td><td class="${t.kind === "rewrite" ? "warn" : "ok"}">${esc(t.kind)}</td><td class="dim">${t.builtin ? "built-in" : "external"}</td>
+        <td class="n dim">${age(t.updated_at)}</td><td class="wrap" style="word-break:normal">${esc(t.description)}</td></tr>`).join("") + `</tbody></table>`;
+    $("#x-chains").innerHTML = `<table><thead><tr><th>collection</th><th>chain</th><th></th></tr></thead><tbody>` +
+      chains.map(ch => `<tr><td>${esc(ch.collection)}</td><td>${ch.transforms.map((l, i) => `<span class="chip">${i + 1}. ${esc(l.transform)}<a data-rm="${esc(ch.collection)}" data-i="${i}" title="remove">×</a></span>`).join("→ ") || '<span class="dim">—</span>'}</td>
+        <td><select data-add="${esc(ch.collection)}"><option value="">+ add…</option>${lib.transforms.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join("")}</select></td></tr>`).join("") + `</tbody></table>`;
+    const put = (coll, names) => run(`set ${coll} chain`, () => api("PUT", `/api/collections/${encodeURIComponent(coll)}/transforms`, { transforms: names.map(n => ({ transform: n })) })).then(() => poller?.tick());
+    const namesOf = coll => chains.find(c => c.collection === coll).transforms.map(l => l.transform);
+    $("#x-chains").querySelectorAll("[data-rm]").forEach(a => a.onclick = () => put(a.dataset.rm, namesOf(a.dataset.rm).filter((_, i) => i !== +a.dataset.i)));
+    $("#x-chains").querySelectorAll("[data-add]").forEach(sel => sel.onchange = () => { if (sel.value) { const v = sel.value; sel.blur(); put(sel.dataset.add, [...namesOf(sel.dataset.add), v]); } });
+    $("#x-pending").innerHTML = pend.intents.length ? `<table><thead><tr><th>transform</th><th>photo</th><th>via</th><th>created</th><th class="n">age</th></tr></thead><tbody>` +
+      pend.intents.map(i => `<tr><td>${esc(i.transform)}</td><td><a href="#/photos/${encodeURIComponent(i.collection || "~all")}/${esc(i.photo)}">${esc(i.collection)}/${esc(i.photo)}</a></td>
+        <td class="dim">${i.origin === "chain" ? `chain#${i.chain_position}` : "manual"}</td><td>${fmtTs(i.created_at)}</td><td class="n ${Date.now() - new Date(i.created_at) > 60000 ? "warn" : "dim"}">${age(i.created_at)}</td></tr>`).join("") + `</tbody></table>`
+      : `<span class="dim">none</span>`;
+  };
+  startPoll(load, 3000);
+}
+
+// ---------------------------------------------------------------------------- info tab
+async function infoTab() {
+  main.innerHTML = `<div class="pane"><span class="dim">loading…</span></div>`;
+  const info = await api("GET", "/api/info");
+  const val = v => v == null ? '<span class="dim">—</span>' : esc(typeof v === "object" ? JSON.stringify(v) : v);
+  main.innerHTML = `<div class="pane"><div class="cols">
+    <div><h3>settings <span class="dim" style="font-weight:400">— effective server config (no secrets)</span></h3>
+      <table><tbody>${Object.entries(info.settings).map(([k, v]) => `<tr><td class="dim">${esc(k)}</td><td>${val(v)}</td></tr>`).join("")}</tbody></table></div>
+    ${info.enums.map(e => `<div><h3>${esc(e.name)} <span class="dim" style="font-weight:400">— ${esc(e.description)}</span></h3>
+      <table><tbody>${e.values.map(v => `<tr><td class="acc" style="vertical-align:top">${esc(v.name)}</td><td class="wrap" style="word-break:normal">${esc(v.description)}</td></tr>`).join("")}</tbody></table></div>`).join("")}
+  </div></div>`;
+}
+
 // ---------------------------------------------------------------------------- shell
-function setTab(tab) {
+function setTab(tab, push = true) {
   S.tab = tab; stopPoll();
+  syncUrl(push);
   document.querySelectorAll("#top .tab").forEach(t => t.classList.toggle("on", t.dataset.tab === tab));
-  $("#st-keys").textContent = tab === "photos" ? "←↑↓→ move · x sel · ⇧click range · ⌘click toggle · m move · c copy · ⌫ del · v view · +/- size · esc" : "";
-  if (tab === "photos") { photosShell(); refreshAll(); }
+  $("#st-keys").textContent = tab === "photos" ? "live · 1–9 file (inbox) · ←↑↓→ move · x sel · ⇧click range · ⌘click toggle · m move · c copy · ⌫ del · v view · +/- size · esc" : "";
+  if (tab === "photos") {
+    photosShell();
+    // Feed positions first, then the snapshot: anything in between is re-applied, never missed.
+    initLive().catch(() => {}).then(refreshAll).then(() => { if (S.tab === "photos") startPoll(liveTick, 2000); });
+  }
   else if (tab === "feeds") feedsTab();
   else if (tab === "records") recordsTab();
+  else if (tab === "transforms") transformsTab();
+  else if (tab === "info") infoTab();
   else tokensTab();
 }
 document.querySelectorAll("#top .tab").forEach(t => t.onclick = () => { if (S.me) setTab(t.dataset.tab); });
@@ -542,9 +796,7 @@ document.addEventListener("keydown", ev => { if (S.me && S.tab === "photos") pho
 async function boot() {
   try { S.me = await api("GET", "/api/me"); } catch (e) { if (e.status !== 401) say("server unreachable: " + e.message, "bad"); return; }
   $("#who").textContent = S.me.principal; $("#logout").classList.remove("hide");
-  const h = decodeURIComponent(location.hash.slice(1));
-  S.coll = h || null;
-  setTab("photos");
+  applyUrl();
 }
 boot();
 </script>

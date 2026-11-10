@@ -26,6 +26,8 @@ dependencies {
   implementation(libs.miskService)
   implementation(libs.mysql)
   implementation(libs.slf4jSimple)
+  implementation(libs.zxingCore)
+  implementation(libs.zxingJavase)
 
   testImplementation(libs.miskTesting)
   testImplementation(platform(libs.junitBom))

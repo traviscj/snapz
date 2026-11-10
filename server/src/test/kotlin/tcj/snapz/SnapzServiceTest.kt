@@ -90,6 +90,7 @@ class SnapzServiceTest {
   @Inject lateinit var json: Json
   @Inject lateinit var publisher: FeedPublisher
   @Inject lateinit var blobs: BlobStore
+  @Inject lateinit var runner: TransformRunner
 
   private val http = OkHttpClient.Builder().followRedirects(false).build()
   private val jsonType = "application/json".toMediaType()
@@ -97,8 +98,12 @@ class SnapzServiceTest {
   @BeforeEach
   fun setUp() {
     db.tx { c ->
-      for (t in listOf("photos", "collections", "records", "api_tokens", "sequences", "feed_cursors")) c.exec("DELETE FROM $t")
+      for (t in listOf(
+        "photos", "collections", "records", "api_tokens", "sequences", "feed_cursors",
+        "photo_versions", "transforms", "collection_transforms", "transform_intents", "transform_results",
+      )) c.exec("DELETE FROM $t")
     }
+    runner.seed()
   }
 
   // ------------------------------------------------------------------------------ helpers
@@ -197,7 +202,11 @@ class SnapzServiceTest {
     assertThat(again["token"]).isEqualTo(p["token"])
     assertThat(api("GET", "/api/photos?collection=pantry").list("photos")).hasSize(1)
 
-    val full = call("GET", "/blobs/${p["token"]}")
+    // URLs the API hands out are pinned to the current bytes and cacheable forever; a bare
+    // /blobs/{token} follows the current version and must revalidate.
+    assertThat(p["url"] as String).startsWith("/blobs/${p["token"]}?v=")
+    assertThat(call("GET", "/blobs/${p["token"]}").header("Cache-Control")).isEqualTo("private, no-cache")
+    val full = call("GET", p["url"] as String)
     assertThat(full.header("Content-Type")).isEqualTo("image/jpeg")
     assertThat(full.header("Cache-Control")).contains("immutable")
     assertThat(full.body!!.bytes()).isEqualTo(bytes)
@@ -322,6 +331,41 @@ class SnapzServiceTest {
   }
 
   @Test
+  fun `a feed's publish switch holds rows back until re-enabled or stepped`() {
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    publisher.publishAll()
+    api("PUT", "/_feeds/publishing/photos", mapOf("enabled" to false))
+    val t1 = upload("pantry", jpeg(color = Color.BLUE))["token"]
+    assertThat(publisher.publishAll()).isEqualTo(0)
+    val st = api("GET", "/_feeds/status").list("feeds").first { it["feed"] == "photos" }
+    assertThat(st).containsEntry("publishing_enabled", false).containsEntry("pending", 1L)
+    assertThat(api("GET", "/_feeds/fetch/photos").list("entries")).isEmpty()
+    // other feeds are unaffected
+    api("PATCH", "/api/collections/pantry", mapOf("description" to "x"))
+    assertThat(publisher.publishAll()).isEqualTo(1)
+
+    // stepping by hand publishes despite the switch
+    assertThat(api("POST", "/_feeds/publish?feed=photos&force=true")["published"]).isEqualTo(1L)
+    assertThat(api("GET", "/_feeds/fetch/photos").list("entries").map { it["token"] }).isEqualTo(listOf(t1))
+
+    upload("pantry", jpeg(color = Color.GREEN))
+    assertThat(publisher.publishAll()).isEqualTo(0)
+    api("PUT", "/_feeds/publishing/photos", mapOf("enabled" to true))
+    assertThat(publisher.publishAll()).isEqualTo(1)
+    assertThat(call("PUT", "/_feeds/publishing/nope", mapOf("enabled" to true)).code).isEqualTo(404)
+  }
+
+  @Test
+  fun `info lists the product enums`() {
+    val info = api("GET", "/api/info")
+    val names = info.list("enums").map { it["name"] }
+    assertThat(names).contains("login mechanism", "token kind", "feed", "batch op", "barcode symbology")
+    assertThat((info["settings"] as Map<*, *>)["feed_shards"]).isEqualTo(16L)
+    assertThat(info.toString()).doesNotContain("s3cret")
+    assertThat(call("GET", "/api/info", token = null).code).isEqualTo(401)
+  }
+
+  @Test
   fun `records are a kv with a feed, and identical puts do not republish`() {
     val r = obj(call("PUT", "/api/records/order_items/0012345678905", """{"name":"beans","qty":2,"tags":["a"]}"""))
     assertThat(r["v"]).isEqualTo(mapOf("name" to "beans", "qty" to 2L, "tags" to listOf("a")))
@@ -344,6 +388,13 @@ class SnapzServiceTest {
     publisher.publishAll()
     assertThat(api("GET", "/_feeds/fetch/records?ns=order_items").list("entries").single()["deleted_at"]).isNotNull()
     assertThat(call("PUT", "/api/records/x/y", "{not json").code).isEqualTo(400)
+
+    // keys and consumer names are stored decoded, however the client escaped them
+    obj(call("PUT", "/api/records/my%20ns/a%20b%3Ac%2Bd", "1"))
+    assertThat(api("GET", "/api/records/my%20ns").list("records").single()).containsEntry("ns", "my ns").containsEntry("k", "a b:c+d")
+    assertThat(api("GET", "/api/records/my%20ns/a%20b:c%2Bd")["v"]).isEqualTo(1L)
+    api("PUT", "/_feeds/cursors/worker%3Agray", mapOf("feed" to "records", "cursor" to 1))
+    assertThat(api("GET", "/_feeds/status").list("cursors").map { it["consumer"] }).contains("worker:gray")
   }
 
   @Test
@@ -439,6 +490,182 @@ class SnapzServiceTest {
     assertThat(tok["principal"]).isEqualTo("travis@example.com")
     assertThat(obj(call("GET", "/api/me", token = tok["token"] as String))["principal"]).isEqualTo("travis@example.com")
     assertThat(api("GET", "/api/tokens").list("tokens").map { it["kind"] to it["name"] }).contains("device" to "Travis iPhone")
+  }
+
+  /** A white canvas with a real, decodable EAN-13 drawn on it. */
+  private fun barcodeJpeg(ean13: String, w: Int = 1200, h: Int = 900): ByteArray {
+    val bits = com.google.zxing.MultiFormatWriter().encode(ean13, com.google.zxing.BarcodeFormat.EAN_13, 420, 180)
+    val code = com.google.zxing.client.j2se.MatrixToImageWriter.toBufferedImage(bits)
+    val img = BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
+    img.createGraphics().apply { paint = Color.WHITE; fillRect(0, 0, w, h); drawImage(code, 500, 400, null); dispose() }
+    return ByteArrayOutputStream().also { ImageIO.write(img, "jpeg", it) }.toByteArray()
+  }
+
+  private fun setChain(collection: String, vararg transforms: String) =
+    api("PUT", "/api/collections/$collection/transforms", mapOf("transforms" to transforms.map { mapOf("transform" to it) }))
+
+  @Test
+  fun `a rewrite adds a child version, becomes current, and can be stepped back`() {
+    api("POST", "/api/collections", mapOf("name" to "work"))
+    val p = upload("work", jpeg(3000, 2000))
+    val root = p["current_version"] as String
+    val intent = api("POST", "/api/photos/${p["token"]}/intents", mapOf("transform" to "upright-2k"))
+    assertThat(intent).containsEntry("state", "pending").containsEntry("origin", "manual").containsEntry("version", root)
+    assertThat(intent["input_url"]).isEqualTo("/blobs/${p["token"]}?version=$root")
+    assertThat(runner.runPending()).isEqualTo(1)
+
+    val after = api("GET", "/api/photos/${p["token"]}")
+    assertThat(after["width"] to after["height"]).isEqualTo(2048L to 1365L)
+    assertThat(after["current_version"]).isNotEqualTo(root)
+    assertThat(after["url"]).isNotEqualTo(p["url"])                 // the cache-buster moved with the bytes
+    assertThat(after["feed_sync_id"]).isNull()                       // and the change is queued for the feed
+
+    val h = api("GET", "/api/photos/${p["token"]}/history")
+    val versions = h.list("versions")
+    assertThat(versions).hasSize(2)
+    assertThat(versions[0]).containsEntry("token", root).containsEntry("current", false).doesNotContainKey("parent")
+    assertThat(versions[1]).containsEntry("parent", root).containsEntry("transform", "upright-2k").containsEntry("current", true)
+    val done = h.list("intents").single()
+    assertThat(done).containsEntry("state", "ok")
+    @Suppress("UNCHECKED_CAST")
+    assertThat((done["results"] as List<Map<String, Any?>>).single()).containsEntry("output_version", versions[1]["token"]).containsEntry("worker", "builtin")
+
+    // the original is still there, byte for byte, and can be made current again
+    val orig = call("GET", "/blobs/${p["token"]}?version=$root")
+    assertThat(orig.header("Cache-Control")).contains("immutable")
+    assertThat(sha256Hex(orig.body!!.bytes())).isEqualTo(p["sha256"])
+    val back = api("PUT", "/api/photos/${p["token"]}/current", mapOf("version" to root))
+    assertThat(back).containsEntry("width", 3000L).containsEntry("sha256", p["sha256"]).containsEntry("current_version", root)
+    assertThat(call("PUT", "/api/photos/${p["token"]}/current", mapOf("version" to "nope")).code).isEqualTo(404)
+    assertThat(call("POST", "/api/photos/${p["token"]}/intents", mapOf("transform" to "nope")).code).isEqualTo(404)
+  }
+
+  @Test
+  fun `a collection chain runs link by link, each on what the previous one left`() {
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    assertThat(setChain("pantry", "barcodes", "crop-detections").list("transforms").map { it["position"] to it["transform"] })
+      .isEqualTo(listOf(0L to "barcodes", 1L to "crop-detections"))
+    val p = upload("pantry", barcodeJpeg("0016000275287"))
+    // only the first link is queued; the second exists once the first has answered
+    assertThat(api("GET", "/api/intents").list("intents").map { it["transform"] }).isEqualTo(listOf("barcodes"))
+    assertThat(runner.runPending()).isEqualTo(2)
+
+    val after = api("GET", "/api/photos/${p["token"]}")
+    assertThat(after["barcodes"]).isEqualTo(listOf("0016000275287"))
+    @Suppress("UNCHECKED_CAST")
+    val detected = ((after["meta"] as Map<String, Any?>)["barcodes"] as List<Map<String, Any?>>).single()
+    assertThat(detected).containsEntry("symbology", "ean13").containsEntry("source", "server")
+    @Suppress("UNCHECKED_CAST")
+    val box = detected["box"] as List<Number>
+    assertThat(box[0].toDouble()).isBetween(0.38, 0.50)   // drawn at x=500..920 of 1200
+    assertThat(box[1].toDouble()).isBetween(0.35, 0.60)
+
+    val h = api("GET", "/api/photos/${p["token"]}/history")
+    assertThat(h.list("intents").map { Triple(it["transform"], it["chain_position"], it["state"]) })
+      .isEqualTo(listOf(Triple("barcodes", 0L, "ok"), Triple("crop-detections", 1L, "ok")))
+    // the crop changes geometry, so it is a side version: listed, but not current
+    val crop = h.list("versions").last()
+    assertThat(crop).containsEntry("transform", "crop-detections").containsEntry("current", false)
+    assertThat((crop["width"] as Long)).isLessThan(1200L)
+    assertThat(after["width"]).isEqualTo(1200L)
+    assertThat(api("GET", "/api/photos?barcode=0016000275287").list("photos")).hasSize(1)
+
+    // a photo with nothing to find: both links answer, the crop as "skipped"
+    val blank = upload("pantry", jpeg(color = Color.WHITE))
+    runner.runPending()
+    assertThat(api("GET", "/api/photos/${blank["token"]}/history").list("intents").map { it["state"] }).isEqualTo(listOf("ok", "skipped"))
+  }
+
+  @Test
+  fun `external workers consume the intents feed, and halt stops a chain`() {
+    api("POST", "/api/collections", mapOf("name" to "work"))
+    api("PUT", "/api/transforms/gate", mapOf("kind" to "extract", "description" to "decides whether to go on"))
+    api("PUT", "/api/transforms/sepia", mapOf("kind" to "rewrite"))
+    assertThat(call("PUT", "/api/transforms/barcodes", mapOf("kind" to "extract")).code).isEqualTo(400) // built-ins can't be overwritten
+    assertThat(api("GET", "/api/transforms").list("transforms").map { it["name"] }).contains("gate", "sepia", "barcodes", "suggest-collection")
+    setChain("work", "gate", "sepia", "upright-2k")
+
+    val a = upload("work", jpeg(800, 600, Color.BLUE))
+    val b = upload("work", jpeg(800, 600, Color.GREEN))
+    assertThat(runner.runPending()).isEqualTo(0)                     // nothing built-in is pending
+    publisher.publishAll()
+    val page = api("GET", "/_feeds/fetch/intents?transform=gate")
+    val (ia, ib) = page.list("entries").also { assertThat(it.map { e -> e["photo"] }).isEqualTo(listOf(a["token"], b["token"])) }
+    assertThat(ia).containsEntry("state", "pending").containsEntry("collection", "work")
+
+    // a: the gate says go on, twice (a retried worker) — the chain still advances exactly once
+    repeat(2) { api("POST", "/api/intents/${ia["token"]}/results", mapOf("data" to mapOf("ok" to true), "meta_patch" to mapOf("gate" to "passed"), "worker" to "w1")) }
+    // b: the gate halts
+    api("POST", "/api/intents/${ib["token"]}/results", mapOf("status" to "halt", "worker" to "w1"))
+    assertThat(api("GET", "/api/photos/${b["token"]}/history").list("intents").map { it["transform"] to it["state"] }).isEqualTo(listOf("gate" to "halt"))
+    assertThat((api("GET", "/api/photos/${a["token"]}")["meta"] as Map<*, *>)["gate"]).isEqualTo("passed")
+
+    // a's next link is an external rewrite: the worker fetches the input and posts an image back
+    val sepia = api("GET", "/api/intents?transform=sepia").list("intents").single()
+    assertThat(sepia).containsEntry("photo", a["token"]).containsEntry("chain_position", 1L)
+    assertThat(call("GET", sepia["input_url"] as String).code).isEqualTo(200)
+    val out = obj(call("POST", "/api/intents/${sepia["token"]}/output?worker=w2&data=${enc("""{"tone":"warm"}""")}", raw = jpeg(800, 600, Color.ORANGE)))
+    assertThat(out).containsEntry("state", "ok")
+    // ...which queues the built-in third link, run against the sepia version
+    assertThat(runner.runPending()).isEqualTo(1)
+    val h = api("GET", "/api/photos/${a["token"]}/history")
+    assertThat(h.list("versions").map { it["transform"] }).isEqualTo(listOf(null, "sepia", "upright-2k"))
+    assertThat(h.list("versions")[2]["parent"]).isEqualTo(h.list("versions")[1]["token"])
+    assertThat(h.list("intents").map { it["state"] }).isEqualTo(listOf("ok", "ok", "ok"))
+
+    publisher.publishAll()
+    val results = api("GET", "/_feeds/fetch/results").list("entries")
+    assertThat(results.map { it["transform"] to it["status"] }).containsExactly(
+      "gate" to "ok", "gate" to "ok", "gate" to "halt", "sepia" to "ok", "upright-2k" to "ok",
+    )
+    assertThat(call("POST", "/api/intents/${ia["token"]}/results", mapOf("status" to "bogus")).code).isEqualTo(400)
+
+    // moving a photo starts the destination's chain from the top
+    api("POST", "/api/collections", mapOf("name" to "other"))
+    setChain("other", "gate")
+    api("PATCH", "/api/photos/${b["token"]}", mapOf("collection" to "other"))
+    assertThat(api("GET", "/api/photos/${b["token"]}/history").list("intents").map { it["collection"] to it["state"] }.last()).isEqualTo("other" to "pending")
+  }
+
+  @Test
+  fun `inbox photos are ranked by how similar photos were filed`() {
+    for (n in listOf("pantry", "work", "inbox")) api("POST", "/api/collections", mapOf("name" to n))
+    setChain("inbox", "suggest-collection")
+    val barcode = "&meta=" + enc("""{"source":"ios","barcodes":[{"symbology":"ean13","value":"0016000275287"}]}""")
+    val plain = "&meta=" + enc("""{"source":"ios"}""")
+    // history: barcoded shots go to the pantry, plain ones to work (all far apart in time)
+    val day = 86_400_000L
+    repeat(6) { i -> upload("pantry", jpeg(color = Color(i * 30, 0, 0)), "$barcode&taken_at=${1_700_000_000_000 + i * day}") }
+    repeat(6) { i -> upload("work", jpeg(color = Color(0, i * 30, 0)), "$plain&taken_at=${1_700_000_000_000 + i * day + 3_600_000}") }
+
+    val scanned = upload("inbox", jpeg(color = Color.MAGENTA), "$barcode&taken_at=${1_700_000_000_000 + 30 * day}")
+    val desk = upload("inbox", jpeg(color = Color.CYAN), "$plain&taken_at=${1_700_000_000_000 + 31 * day}")
+    val inbox = api("GET", "/api/inbox")
+    @Suppress("UNCHECKED_CAST")
+    fun ranks(token: Any?) = (inbox.list("photos").first { (it["photo"] as Map<*, *>)["token"] == token }["suggestions"] as List<Map<String, Any?>>)
+    assertThat(ranks(scanned["token"]).map { it["collection"] }).isEqualTo(listOf("pantry", "work"))
+    assertThat(ranks(desk["token"]).map { it["collection"] }).isEqualTo(listOf("work", "pantry"))
+    assertThat(ranks(scanned["token"])[0]["p"] as Double).isGreaterThan(0.7)
+    assertThat(ranks(scanned["token"]).sumOf { it["p"] as Double }).isBetween(0.99, 1.01)
+    assertThat(ranks(scanned["token"]).map { it["collection"] }).doesNotContain("inbox")
+
+    // the same ranking is recorded as a transform result when the inbox chain runs
+    assertThat(runner.runPending()).isEqualTo(2)
+    @Suppress("UNCHECKED_CAST")
+    val result = (api("GET", "/api/photos/${scanned["token"]}/history").list("intents").single()["results"] as List<Map<String, Any?>>).single()
+    @Suppress("UNCHECKED_CAST")
+    assertThat(((result["data"] as Map<String, Any?>)["suggestions"] as List<Map<String, Any?>>)[0]["collection"]).isEqualTo("pantry")
+
+    // bursts stick together: a plain photo taken a minute after one just filed under pantry leans pantry
+    val t = 1_700_000_000_000 + 40 * day
+    upload("pantry", jpeg(color = Color.PINK), "$barcode&taken_at=$t")
+    val follow = upload("inbox", jpeg(color = Color.YELLOW), "$plain&taken_at=${t + 60_000}")
+    val again = api("GET", "/api/inbox").list("photos").first { (it["photo"] as Map<*, *>)["token"] == follow["token"] }
+    assertThat((again["features"] as Map<*, *>)["prev"]).isEqualTo("pantry")
+
+    // filing = a move; it leaves the inbox and enters the destination
+    api("PATCH", "/api/photos/${scanned["token"]}", mapOf("collection" to "pantry"))
+    assertThat(api("GET", "/api/inbox").list("photos").map { (it["photo"] as Map<*, *>)["token"] }).doesNotContain(scanned["token"])
   }
 
   @Test

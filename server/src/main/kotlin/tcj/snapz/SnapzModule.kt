@@ -17,6 +17,7 @@ class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
 
     install(JdbcModule(SnapzDb::class, config.data_source))
     install(ServiceModule<FeedPublisher>().dependsOn<SchemaMigratorService>(SnapzDb::class))
+    install(ServiceModule<TransformRunner>().dependsOn<SchemaMigratorService>(SnapzDb::class))
 
     install(WebActionModule.create<WebUiAction>())
     install(WebActionModule.create<LoginAction>())
@@ -32,5 +33,8 @@ class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
     install(WebActionModule.create<RecordActions>())
     install(WebActionModule.create<FeedActions>())
     install(WebActionModule.create<TokenActions>())
+    install(WebActionModule.create<InfoAction>())
+    install(WebActionModule.create<TransformActions>())
+    install(WebActionModule.create<InboxAction>())
   }
 }

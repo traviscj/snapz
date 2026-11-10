@@ -1,53 +1,83 @@
 import PhotosUI
 import SwiftUI
 
-/// Full-screen camera. The shutter is free again as soon as the sensor hands back the JPEG;
-/// barcode detection and the durable enqueue run behind it, so bursts aren't rate-limited by either.
+/// Full-screen camera with a heads-up display.
+///
+/// The viewfinder decodes barcodes continuously and draws what it sees, so you know a code was
+/// read *before* anything is saved. Two ways to take a picture:
+///   - the shutter: saves the current view, tagged with whatever is locked right now;
+///   - AUTO: saves by itself the moment a code it hasn't captured this session locks, then holds
+///     fire until something new shows up. Point, wait for the chirp, move to the next item.
 struct CaptureView: View {
     @EnvironmentObject private var app: AppState
     @EnvironmentObject private var queue: UploadQueue
     @Environment(\.dismiss) private var dismiss
     @StateObject private var camera = CameraController()
+    @AppStorage("captureAuto") private var auto = true
 
     @State private var shooting = false
     @State private var shots = 0
-    @State private var lastCodes: [Barcode] = []
+    /// Code values already saved this session, oldest first. AUTO never re-fires on these.
+    @State private var captured: [String] = []
     @State private var note = ""
     @State private var showNote = false
     @State private var picked: [PhotosPickerItem] = []
     @State private var flash = false
+    @State private var focusPoint: CGPoint?
+    @State private var focusStamp = 0
+    @State private var autoFire: Task<Void, Never>?
+
+    private var locked: [LiveCode] { camera.liveCodes.filter(\.locked) }
+    private var fresh: [LiveCode] { locked.filter { !captured.contains($0.value) } }
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-            switch camera.status {
-            case .running, .idle:
-                CameraPreview(layer: camera.previewLayer).ignoresSafeArea()
-            case .denied:
-                message("Camera access is off for Snapz.\nSettings → Snapz → Camera.")
-            case .unavailable(let why):
-                message("\(why)\nYou can still import from the photo library below.")
+            // Preview and HUD drawing share one full-screen coordinate space (the preview layer's).
+            ZStack {
+                Color.black
+                switch camera.status {
+                case .running, .idle:
+                    CameraPreview(layer: camera.previewLayer)
+                        .onTapGesture { p in
+                            camera.focus(atLayerPoint: p)
+                            focusPoint = p
+                            focusStamp += 1
+                            let stamp = focusStamp
+                            Task { try? await Task.sleep(nanoseconds: 1_200_000_000); if stamp == focusStamp { focusPoint = nil } }
+                        }
+                    hud
+                case .denied:
+                    message("Camera access is off for Snapz.\nSettings → Snapz → Camera.")
+                case .unavailable(let why):
+                    message("\(why)\nYou can still import from the photo library below.")
+                }
+                if flash { Color.white.opacity(0.5) }
             }
-            if flash { Color.white.opacity(0.5).ignoresSafeArea() }
-            VStack(spacing: 8) {
+            .ignoresSafeArea()
+
+            VStack(spacing: 6) {
                 topBar
                 Spacer()
-                if !lastCodes.isEmpty {
-                    Text(lastCodes.map { "\($0.symbology) \($0.value)" }.joined(separator: "\n"))
-                        .font(.callout.monospaced().weight(.semibold)).foregroundStyle(.green)
-                        .padding(.horizontal, 8).padding(.vertical, 3).background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 4))
+                HStack(alignment: .bottom) {
+                    tape
+                    Spacer()
                 }
+                .padding(.horizontal, 10)
                 if showNote {
                     TextField("note for the next shots", text: $note).textFieldStyle(.roundedBorder).padding(.horizontal, 12)
                 }
+                lights
                 bottomBar
             }
             .padding(.vertical, 8)
         }
         .hideStatusBar()
         .sensoryFeedback(.impact(weight: .light), trigger: shots)
+        .sensoryFeedback(.selection, trigger: locked.map(\.value))
         .task { await camera.start() }
-        .onDisappear { camera.stop() }
+        .onDisappear { camera.stop(); autoFire?.cancel() }
+        .onChange(of: fresh.map(\.value)) { _, values in scheduleAutoFire(values) }
+        .onChange(of: auto) { _, on in if on { scheduleAutoFire(fresh.map(\.value)) } else { autoFire?.cancel() } }
         .onChange(of: picked) { _, items in
             guard !items.isEmpty, let collection = app.captureCollection else { return }
             picked = []
@@ -55,13 +85,103 @@ struct CaptureView: View {
         }
     }
 
+    // MARK: HUD
+
+    /// Drawn over the preview: center reticle, an outline + label on every code in view (amber
+    /// while acquiring, green once locked, dim once already captured), and the tap-to-focus box.
+    private var hud: some View {
+        Canvas { ctx, size in
+            let c = CGPoint(x: size.width / 2, y: size.height / 2)
+            let r: CGFloat = 86, arm: CGFloat = 20
+            var reticle = Path()
+            for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let corner = CGPoint(x: c.x + sx * r, y: c.y + sy * r)
+                reticle.move(to: CGPoint(x: corner.x - sx * arm, y: corner.y))
+                reticle.addLine(to: corner)
+                reticle.addLine(to: CGPoint(x: corner.x, y: corner.y - sy * arm))
+            }
+            reticle.move(to: CGPoint(x: c.x - 5, y: c.y)); reticle.addLine(to: CGPoint(x: c.x + 5, y: c.y))
+            reticle.move(to: CGPoint(x: c.x, y: c.y - 5)); reticle.addLine(to: CGPoint(x: c.x, y: c.y + 5))
+            ctx.stroke(reticle, with: .color(locked.isEmpty ? .white.opacity(0.55) : .green), lineWidth: 1.5)
+
+            for code in camera.liveCodes where code.corners.count >= 3 {
+                let done = captured.contains(code.value)
+                let color: Color = !code.locked ? .orange : done ? .green.opacity(0.55) : .green
+                var outline = Path()
+                outline.addLines(code.corners)
+                outline.closeSubpath()
+                ctx.fill(outline, with: .color(color.opacity(0.14)))
+                ctx.stroke(outline, with: .color(color), lineWidth: code.locked ? 3 : 1.5)
+                let top = code.corners.min { $0.y < $1.y }!
+                let minX = code.corners.map(\.x).min()!
+                let label = Text("\(done ? "✓ " : "")\(code.symbology) \(code.value)").font(.system(size: 12, weight: .bold, design: .monospaced)).foregroundColor(.black)
+                let resolved = ctx.resolve(label)
+                let sz = resolved.measure(in: size)
+                let origin = CGPoint(x: max(4, min(size.width - sz.width - 8, minX)), y: max(4, top.y - sz.height - 6))
+                ctx.fill(Path(CGRect(x: origin.x - 3, y: origin.y - 1, width: sz.width + 6, height: sz.height + 2)), with: .color(color))
+                ctx.draw(resolved, at: origin, anchor: .topLeading)
+            }
+
+            if let p = focusPoint {
+                let box = CGRect(x: p.x - 36, y: p.y - 36, width: 72, height: 72)
+                ctx.stroke(Path(box), with: .color(camera.focusing ? .yellow : .green), lineWidth: 1.5)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Annunciator row: lit = true right now.
+    private var lights: some View {
+        HStack(spacing: 5) {
+            light(camera.focusing ? "AF…" : "AF", on: !camera.focusing, color: camera.focusing ? .yellow : .green)
+            light(camera.lens.isEmpty ? "1x" : camera.lens.uppercased(), on: camera.lens == "macro", color: .cyan)
+            light(locked.isEmpty ? (camera.liveCodes.isEmpty ? "NO CODE" : "ACQ") : "CODE \(locked.count)", on: !locked.isEmpty,
+                  color: locked.isEmpty ? .orange : .green, blink: locked.isEmpty && !camera.liveCodes.isEmpty)
+            light(fresh.isEmpty ? (locked.isEmpty ? "—" : "HAVE") : "NEW", on: !fresh.isEmpty, color: .green)
+            light(queue.pendingCount == 0 ? "SENT" : "Q \(queue.pendingCount)", on: queue.pendingCount > 0,
+                  color: queue.stuckCount > 0 ? .red : queue.online ? .white : .orange)
+        }
+        .padding(.horizontal, 10)
+    }
+
+    private func light(_ text: String, on: Bool, color: Color, blink: Bool = false) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .bold, design: .monospaced))
+            .foregroundStyle(on ? Color.black : color.opacity(blink ? 1 : 0.75))
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .frame(minWidth: 46)
+            .background(on ? color : Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 3))
+            .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(color.opacity(on ? 1 : 0.5), lineWidth: 1))
+    }
+
+    /// Running tape of codes saved this session, newest last.
+    @ViewBuilder private var tape: some View {
+        if !captured.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(captured.suffix(6), id: \.self) { v in
+                    Text("✓ \(v)").lineLimit(1)
+                }
+            }
+            .font(.system(size: 11, weight: .semibold, design: .monospaced)).foregroundStyle(.green)
+            .padding(.horizontal, 5).padding(.vertical, 2)
+            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 3))
+        }
+    }
+
     private var topBar: some View {
-        HStack {
-            Button { dismiss() } label: { Image(systemName: "xmark").font(.title3.weight(.semibold)).padding(8) }
+        HStack(spacing: 8) {
+            Button { auto.toggle() } label: {
+                Text(auto ? "AUTO" : "MANUAL")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundStyle(auto ? Color.black : Color.white)
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+                    .background(auto ? Color.green : Color.black.opacity(0.6), in: Capsule())
+            }
+            .accessibilityLabel(auto ? "Auto capture on" : "Auto capture off")
             Spacer()
             Menu {
                 ForEach(app.collections) { c in
-                    Button { app.captureCollection = c.slug; lastCodes = [] } label: {
+                    Button { app.captureCollection = c.slug } label: {
                         Label("\(c.icon ?? "") \(c.slug)", systemImage: c.slug == app.captureCollection ? "checkmark" : "")
                     }
                 }
@@ -73,12 +193,15 @@ struct CaptureView: View {
                 .padding(.horizontal, 10).padding(.vertical, 6).background(.black.opacity(0.6), in: Capsule())
             }
             Spacer()
-            Button { showNote.toggle() } label: {
-                Image(systemName: note.isEmpty ? "text.bubble" : "text.bubble.fill").font(.title3).padding(8)
+            Button { dismiss() } label: {
+                Text(shots == 0 ? "Done" : "Done · \(shots)")
+                    .font(.system(size: 15, weight: .bold)).foregroundStyle(.black)
+                    .padding(.horizontal, 12).padding(.vertical, 6).background(Color.yellow, in: Capsule())
             }
+            .accessibilityIdentifier("capture-done")
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 6)
+        .padding(.horizontal, 10)
     }
 
     private var bottomBar: some View {
@@ -87,20 +210,19 @@ struct CaptureView: View {
                 Image(systemName: "photo.on.rectangle").font(.title2).frame(width: 64, height: 44)
             }
             Spacer()
-            Button(action: shoot) {
+            Button { shoot(auto: false) } label: {
                 ZStack {
-                    Circle().strokeBorder(.white, lineWidth: 4).frame(width: 74, height: 74)
+                    Circle().strokeBorder(fresh.isEmpty ? Color.white : Color.green, lineWidth: 4).frame(width: 74, height: 74)
                     Circle().fill(shooting ? Color.gray : Color.white).frame(width: 60, height: 60)
+                    if !locked.isEmpty { Image(systemName: "barcode.viewfinder").font(.title2).foregroundStyle(.black) }
                 }
             }
             .disabled(shooting || camera.status != .running || app.captureCollection == nil)
+            .accessibilityLabel("Shutter")
             Spacer()
-            VStack(spacing: 0) {
-                Text("\(shots)").font(.title3.monospacedDigit().weight(.bold))
-                Text(queue.pendingCount == 0 ? "sent" : "\(queue.pendingCount) queued")
-                    .font(.caption2.monospaced()).foregroundStyle(queue.pendingCount == 0 ? Color.green : queue.online ? Color.white : Color.orange)
+            Button { showNote.toggle() } label: {
+                Image(systemName: note.isEmpty ? "text.bubble" : "text.bubble.fill").font(.title2).frame(width: 64, height: 44)
             }
-            .frame(width: 64)
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 18)
@@ -110,30 +232,48 @@ struct CaptureView: View {
         Text(text).multilineTextAlignment(.center).foregroundStyle(.white).padding(24)
     }
 
-    private func shoot() {
-        guard let collection = app.captureCollection else { return }
+    // MARK: capture
+
+    /// AUTO: a new code just locked. Wait a beat so other codes on the same package can lock too
+    /// (one photo for the UPC and the lot code, not two), then fire if it's still new.
+    private func scheduleAutoFire(_ values: [String]) {
+        autoFire?.cancel()
+        guard auto, !values.isEmpty else { return }
+        autoFire = Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled, auto, !shooting, !fresh.isEmpty else { return }
+            shoot(auto: true)
+        }
+    }
+
+    private func shoot(auto fired: Bool) {
+        guard let collection = app.captureCollection, !shooting else { return }
         shooting = true
         let noteNow = note.isEmpty ? nil : note
         Task {
             defer { shooting = false }
             do {
-                let jpeg = try await camera.capture()
+                let shot = try await camera.capture()
                 shots += 1
+                // Everything in view at the shutter is now "had", so AUTO won't re-fire on it.
+                for code in shot.liveCodes where code.locked && !captured.contains(code.value) { captured.append(code.value) }
                 flash = true
                 Task { try? await Task.sleep(nanoseconds: 60_000_000); flash = false }
                 // Off the shutter path from here on.
-                Task { await save(jpeg, into: collection, note: noteNow, takenAt: Date()) }
+                Task { await save(shot, into: collection, note: noteNow, auto: fired) }
             } catch {
                 app.error = error.localizedDescription
             }
         }
     }
 
-    private func save(_ jpeg: Data, into collection: String, note: String?, takenAt: Date) async {
-        let codes = await BarcodeScanner.scan(jpeg: jpeg)
-        lastCodes = codes
+    private func save(_ shot: CapturedShot, into collection: String, note: String?, auto fired: Bool) async {
+        let still = await BarcodeScanner.scan(jpeg: shot.jpeg)
+        let lockedShot = CapturedShot(jpeg: shot.jpeg, rotationAngle: shot.rotationAngle, liveCodes: shot.liveCodes.filter(\.locked))
+        let codes = BarcodeScanner.merge(still: still, shot: lockedShot)
+        for c in codes where !captured.contains(c.value) { captured.append(c.value) }
         do {
-            try queue.enqueue(jpeg: jpeg, collection: collection, takenAt: takenAt, note: note, barcodes: codes)
+            try queue.enqueue(jpeg: shot.jpeg, collection: collection, takenAt: Date(), note: note, barcodes: codes)
         } catch {
             app.error = "Could not save the photo on this phone: \(error.localizedDescription)"
         }
@@ -147,7 +287,7 @@ struct CaptureView: View {
                   let cg = ImageDecoder.decode(data, maxPixel: 4096),
                   let jpeg = Self.jpegData(cg) else { continue }
             shots += 1
-            await save(jpeg, into: collection, note: note.isEmpty ? nil : note, takenAt: Date())
+            await save(CapturedShot(jpeg: jpeg, rotationAngle: 0, liveCodes: []), into: collection, note: note.isEmpty ? nil : note, auto: false)
         }
     }
 

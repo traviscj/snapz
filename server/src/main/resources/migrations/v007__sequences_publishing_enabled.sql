@@ -1,0 +1,1 @@
+ALTER TABLE sequences ADD COLUMN publishing_enabled TINYINT(1) NOT NULL DEFAULT 1

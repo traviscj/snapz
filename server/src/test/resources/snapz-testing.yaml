@@ -5,5 +5,8 @@ snapz:
   blob_dir: build/test-blobs
   # tests call FeedPublisher.publishAll() explicitly
   feed_publish_interval_ms: 3600000
+  # tests call TransformRunner.runPending() explicitly and create their own inbox
+  transform_interval_ms: 3600000
+  auto_create_inbox: false
   bootstrap_tokens:
     - { token: test-token, principal: tester }

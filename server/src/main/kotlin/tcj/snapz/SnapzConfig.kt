@@ -18,6 +18,12 @@ data class SnapzSettings(
   val public_url: String = "http://localhost:8788",
   val max_upload_bytes: Long = 64L * 1024 * 1024,
   val feed_publish_interval_ms: Long = 500,
+  /** How often the in-process worker looks for pending intents of built-in transforms. */
+  val transform_interval_ms: Long = 500,
+  /** Where "snap first, file later" photos land; GET /api/inbox ranks destinations for them. */
+  val inbox_slug: String = "inbox",
+  /** Create the inbox (with the suggest-collection transform attached) at startup if missing. */
+  val auto_create_inbox: Boolean = true,
   /** Data shards assigned at write time; consumer shards map onto these by modulus. */
   val feed_shards: Int = 16,
   val thumb_px: Int = 400,

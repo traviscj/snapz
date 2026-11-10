@@ -11,7 +11,10 @@ import misk.exceptions.NotFoundException
 import misk.logging.getLogger
 
 /** feed name -> backing table. Every feed table carries (id, feed_sync_id, shard). */
-val FEEDS = linkedMapOf("photos" to "photos", "collections" to "collections", "records" to "records")
+val FEEDS = linkedMapOf(
+  "photos" to "photos", "collections" to "collections", "records" to "records",
+  "intents" to "transform_intents", "results" to "transform_results",
+)
 
 fun feedTable(feed: String): String = FEEDS[feed] ?: throw NotFoundException("no feed '$feed' (have: ${FEEDS.keys.joinToString()})")
 
@@ -48,23 +51,38 @@ class FeedPublisher @Inject constructor(
     executor.shutdownNow()
   }
 
-  /** Drains every feed; returns rows published. */
+  /**
+   * Drains feeds; returns rows published. A feed whose publishing is switched off is skipped
+   * unless [force] — its rows stay pending (feed_sync_id NULL), invisible to consumers, until it
+   * is switched back on or stepped by hand. [only] restricts the run to one feed.
+   */
   @Synchronized
-  fun publishAll(): Int = FEEDS.keys.sumOf { feed ->
+  fun publishAll(only: String? = null, force: Boolean = false): Int = FEEDS.keys.filter { only == null || it == only }.sumOf { feed ->
     var total = 0
     do {
-      val n = publishBatch(feed)
+      val n = publishBatch(feed, force)
       total += n
     } while (n == BATCH)
     total
   }
 
-  private fun publishBatch(feed: String): Int = db.tx { c ->
+  /** Persisted per feed, so a pause survives restarts. */
+  fun setEnabled(feed: String, enabled: Boolean) {
+    feedTable(feed)
+    db.tx { c ->
+      c.exec("INSERT IGNORE INTO sequences (name, value) VALUES (?, 0)", listOf(feed))
+      c.exec("UPDATE sequences SET publishing_enabled = ? WHERE name = ?", listOf(enabled, feed))
+    }
+  }
+
+  private fun publishBatch(feed: String, force: Boolean): Int = db.tx { c ->
     val table = feedTable(feed)
     val pending = c.select("SELECT id FROM $table WHERE feed_sync_id IS NULL AND shard >= 0 ORDER BY id LIMIT $BATCH") { it.getLong(1) }
     if (pending.isEmpty()) return@tx 0
     c.exec("INSERT IGNORE INTO sequences (name, value) VALUES (?, 0)", listOf(feed))
-    var seq = c.select("SELECT value FROM sequences WHERE name = ? FOR UPDATE", listOf(feed)) { it.getLong(1) }.first()
+    val (current, enabled) = c.select("SELECT value, publishing_enabled FROM sequences WHERE name = ? FOR UPDATE", listOf(feed)) { it.getLong(1) to it.getBoolean(2) }.first()
+    if (!enabled && !force) return@tx 0
+    var seq = current
     c.prepareStatement("UPDATE $table SET feed_sync_id = ? WHERE id = ? AND feed_sync_id IS NULL").use { ps ->
       for (id in pending) {
         ps.setLong(1, ++seq)
@@ -95,7 +113,7 @@ data class CursorDto(
   val updated_at: String,
 )
 
-data class FeedStatusDto(val feed: String, val sequence: Long, val rows: Long, val pending: Long, val unpublished: Long)
+data class FeedStatusDto(val feed: String, val sequence: Long, val rows: Long, val pending: Long, val unpublished: Long, val publishing_enabled: Boolean)
 
 data class FeedsStatus(val feeds: List<FeedStatusDto>, val cursors: List<CursorDto>)
 
@@ -106,17 +124,20 @@ class FeedService @Inject constructor(
   private val photos: PhotoStore,
   private val collections: CollectionStore,
   private val records: RecordStore,
+  private val transforms: TransformStore,
 ) {
   /**
    * One page of entries with feed_sync_id > [after], ascending. `cursor` in the reply is the
    * position to pass as the next `after` (unchanged when the page is empty).
    */
-  fun fetch(feed: String, after: Long, limit: Int, shard: Int?, shardCount: Int?, collection: String?, ns: String?): FeedPage {
+  fun fetch(feed: String, after: Long, limit: Int, shard: Int?, shardCount: Int?, collection: String?, ns: String?, transform: String? = null): FeedPage {
     val n = limit.coerceIn(1, 1000)
     val (entries, last) = when (feed) {
       "photos" -> photos.feed(after, n, shard, shardCount, collection).let { it to it.lastOrNull()?.feed_sync_id }
       "collections" -> collections.feed(after, n, shard, shardCount).let { it to it.lastOrNull()?.feed_sync_id }
       "records" -> records.feed(after, n, shard, shardCount, ns).let { it to it.lastOrNull()?.feed_sync_id }
+      "intents" -> transforms.intentFeed(after, n, shard, shardCount, transform).let { it to it.lastOrNull()?.feed_sync_id }
+      "results" -> transforms.resultFeed(after, n, shard, shardCount, transform).let { it to it.lastOrNull()?.feed_sync_id }
       else -> throw NotFoundException("no feed '$feed' (have: ${FEEDS.keys.joinToString()})")
     }
     return FeedPage(feed, entries, last ?: after)
@@ -148,9 +169,10 @@ class FeedService @Inject constructor(
 
   fun status(): FeedsStatus = db.tx { c ->
     val seqs = c.select("SELECT name, value FROM sequences") { it.getString(1) to it.getLong(2) }.toMap()
+    val paused = c.select("SELECT name FROM sequences WHERE publishing_enabled = 0") { it.getString(1) }.toSet()
     val feeds = FEEDS.map { (feed, table) ->
       c.select("SELECT COUNT(*), COALESCE(SUM(feed_sync_id IS NULL AND shard >= 0), 0), COALESCE(SUM(shard < 0), 0) FROM $table") {
-        FeedStatusDto(feed, seqs[feed] ?: 0, it.getLong(1), it.getLong(2), it.getLong(3))
+        FeedStatusDto(feed, seqs[feed] ?: 0, it.getLong(1), it.getLong(2), it.getLong(3), feed !in paused)
       }.first()
     }
     val cursors = c.select("SELECT * FROM feed_cursors ORDER BY feed, consumer, shard") { rs ->

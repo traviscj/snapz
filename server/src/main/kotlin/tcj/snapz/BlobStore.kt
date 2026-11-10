@@ -63,6 +63,47 @@ class BlobStore @Inject constructor(config: SnapzConfig) {
     }
   }
 
+  /**
+   * The image as displayed (EXIF orientation applied), decoded so its longest side is at most
+   * roughly [maxSide]. For transforms that need pixels; null if ImageIO can't decode the format.
+   */
+  fun readUpright(sha: String, maxSide: Int): BufferedImage? {
+    val data = original(sha).takeIf { it.exists() }?.readBytes() ?: return null
+    val orientation = exifOrientation(data)
+    return ImageIO.createImageInputStream(ByteArrayInputStream(data)).use { input ->
+      val readers = ImageIO.getImageReaders(input)
+      if (!readers.hasNext()) return null
+      val reader = readers.next()
+      try {
+        reader.input = input
+        val param = reader.defaultReadParam
+        val sub = maxOf(1, maxOf(reader.getWidth(0), reader.getHeight(0)) / maxSide)
+        param.setSourceSubsampling(sub, sub, 0, 0)
+        val img = orient(reader.read(0, param), orientation)
+        if (img.type == BufferedImage.TYPE_INT_RGB) img else BufferedImage(img.width, img.height, BufferedImage.TYPE_INT_RGB).also { out ->
+          out.createGraphics().apply { drawImage(img, 0, 0, java.awt.Color.WHITE, null); dispose() }
+        }
+      } finally {
+        reader.dispose()
+      }
+    }
+  }
+
+  fun encodeJpeg(img: BufferedImage, quality: Float = 0.88f): ByteArray {
+    val out = java.io.ByteArrayOutputStream()
+    val writer = ImageIO.getImageWritersByFormatName("jpeg").next()
+    ImageIO.createImageOutputStream(out).use { ios ->
+      writer.output = ios
+      val wp = writer.defaultWriteParam.apply {
+        compressionMode = ImageWriteParam.MODE_EXPLICIT
+        compressionQuality = quality
+      }
+      writer.write(null, IIOImage(img, null, null), wp)
+      writer.dispose()
+    }
+    return out.toByteArray()
+  }
+
   fun delete(sha: String) {
     original(sha).delete()
     thumb(sha).delete()

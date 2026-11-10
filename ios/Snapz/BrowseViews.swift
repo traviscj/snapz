@@ -1,5 +1,11 @@
 import SwiftUI
 
+/// Navigation value for a photo grid. A wrapper because NavigationLink(value:) takes an optional:
+/// a bare `String?` would be unwrapped to `String`, and nil ("all") would disable the link.
+struct GridRoute: Hashable {
+    let collection: String?
+}
+
 struct CollectionsView: View {
     @EnvironmentObject private var app: AppState
     @State private var showNew = false
@@ -8,22 +14,47 @@ struct CollectionsView: View {
 
     var body: some View {
         List {
-            NavigationLink(value: Optional<String>.none) {
+            if let inbox = app.collections.first(where: { $0.slug == app.inboxSlug }), inbox.photoCount > 0 {
+                NavigationLink(value: TriageRoute()) {
+                    HStack(spacing: 6) {
+                        Text("📥").frame(width: 22)
+                        Text("file \(inbox.photoCount) from inbox").fontWeight(.bold)
+                        Spacer()
+                        Text(Fmt.age(inbox.lastPhotoAt)).foregroundStyle(.secondary)
+                    }
+                    .font(.callout.monospaced())
+                }
+                .listRowBackground(Color.accentColor.opacity(0.15))
+            }
+            NavigationLink(value: GridRoute(collection: nil)) {
                 row(icon: "∗", name: "all", count: app.collections.reduce(0) { $0 + $1.photoCount },
                     bytes: app.collections.reduce(0) { $0 + $1.bytes }, last: app.collections.compactMap(\.lastPhotoAt).max(), target: false)
             }
             ForEach(app.collections) { c in
-                NavigationLink(value: Optional(c.slug)) {
+                NavigationLink(value: GridRoute(collection: c.slug)) {
                     row(icon: c.icon ?? "·", name: c.slug, count: c.photoCount, bytes: c.bytes, last: c.lastPhotoAt, target: c.slug == app.captureCollection)
                 }
                 .swipeActions(edge: .leading) {
                     Button { app.captureCollection = c.slug } label: { Label("Shoot here", systemImage: "camera") }.tint(.accentColor)
                 }
             }
+            Section {
+                NavigationLink(value: RecordsRoute(ns: nil)) {
+                    HStack(spacing: 6) {
+                        Text("⧉").frame(width: 22)
+                        Text("records")
+                        Spacer()
+                        Text("derived data").foregroundStyle(.secondary)
+                    }
+                    .font(.callout.monospaced())
+                }
+            }
         }
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 30)
-        .navigationDestination(for: Optional<String>.self) { PhotoGridView(collection: $0) }
+        .navigationDestination(for: GridRoute.self) { PhotoGridView(collection: $0.collection) }
+        .navigationDestination(for: RecordsRoute.self) { RecordsView(ns: $0.ns) }
+        .navigationDestination(for: TriageRoute.self) { _ in TriageView() }
         .refreshable { await app.refreshCollections() }
         .toolbar {
             ToolbarItem(placement: .secondaryAction) {
@@ -141,6 +172,10 @@ struct PhotoGridView: View {
                     }
                 }
                 .contentShape(Rectangle())
+                .accessibilityElement()
+                .accessibilityLabel("photo \(p.token)")
+                .accessibilityIdentifier("tile")
+                .accessibilityAddTraits(.isButton)
         }
     }
 
@@ -178,6 +213,32 @@ struct PhotoGridView: View {
     }
 }
 
+/// Outlines what was detected in a photo, drawn in the image's own coordinate space. Dashed =
+/// decoded live in the viewfinder (the box is approximate); solid = found in the saved still.
+struct DetectionBoxes: View {
+    let barcodes: [Barcode]
+
+    var body: some View {
+        GeometryReader { geo in
+            ForEach(barcodes.filter { $0.box?.count == 4 }, id: \.self) { b in
+                let box = b.box!
+                let rect = CGRect(x: box[0] * geo.size.width, y: box[1] * geo.size.height, width: box[2] * geo.size.width, height: box[3] * geo.size.height)
+                Rectangle()
+                    .strokeBorder(Color.green, style: StrokeStyle(lineWidth: 2, dash: b.source == "live" ? [5, 3] : []))
+                    .frame(width: max(rect.width, 6), height: max(rect.height, 6))
+                    .overlay(alignment: .topLeading) {
+                        Text("\(b.symbology) \(b.value)")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundStyle(.black)
+                            .padding(.horizontal, 2).background(Color.green).fixedSize()
+                            .alignmentGuide(.top) { $0[.bottom] }
+                    }
+                    .position(x: rect.midX, y: rect.midY)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
 struct PhotoDetailView: View {
     let photo: Photo
     var onChange: () -> Void
@@ -194,7 +255,9 @@ struct PhotoDetailView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     if let api = app.api {
                         RemoteImage(path: photo.url, api: api, maxPixel: 2400, fill: false)
-                            .frame(maxWidth: .infinity, minHeight: 240)
+                            .aspectRatio(photo.aspect, contentMode: .fit)
+                            .overlay { DetectionBoxes(barcodes: photo.meta?.barcodes ?? []) }
+                            .frame(maxWidth: .infinity, minHeight: photo.aspect == nil ? 240 : 0)
                             .scaleEffect(zoom)
                             .gesture(MagnifyGesture().onChanged { zoom = max(1, min(6, $0.magnification)) }.onEnded { _ in withAnimation { zoom = 1 } })
                             .zIndex(1)

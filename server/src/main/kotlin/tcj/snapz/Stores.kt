@@ -42,6 +42,8 @@ data class PhotoDto(
   /** Denormalized from meta.barcodes[].value so feed consumers don't have to dig. */
   val barcodes: List<String>,
   val client_id: String?,
+  /** Token of the version the blob columns above describe (null for photos never versioned). */
+  val current_version: String?,
   val url: String,
   val thumb_url: String,
   val created_at: String,
@@ -178,6 +180,80 @@ internal fun shardCond(alias: String, shard: Int?, shardCount: Int?): Pair<Strin
 
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Low-level writes for a photo's history: its version tree and the transform intents queued
+ * against it. Lives below PhotoStore and TransformStore so both can use it inside their own
+ * transactions.
+ *
+ * A version is one stored image. The upload is the root; every image-rewriting transform adds a
+ * child of the version it read. The photo row mirrors whichever version is "current".
+ */
+@Singleton
+class Lineage @Inject constructor(private val clock: Clock, private val config: SnapzConfig) {
+  fun addVersion(c: Connection, photoId: Long, parentId: Long?, transform: String?, blob: BlobInfo, makeCurrent: Boolean): Long {
+    val id = c.insert(
+      "INSERT INTO photo_versions (token, photo_id, parent_version_id, transform, sha256, content_type, bytes, width, height, created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)",
+      listOf(randomToken(), photoId, parentId, transform, blob.sha256, blob.contentType, blob.bytes, blob.width, blob.height, clock.millis()),
+    )
+    if (makeCurrent) setCurrent(c, photoId, id)
+    return id
+  }
+
+  /** Points the photo at a version: copies its blob columns onto the row and requeues it for the feed. */
+  fun setCurrent(c: Connection, photoId: Long, versionId: Long) {
+    val n = c.exec(
+      """
+      UPDATE photos p JOIN photo_versions v ON v.id = ? AND v.photo_id = p.id
+      SET p.current_version_id = v.id, p.sha256 = v.sha256, p.content_type = v.content_type, p.bytes = v.bytes,
+          p.width = v.width, p.height = v.height, p.updated_at_ms = ?, p.feed_sync_id = NULL
+      WHERE p.id = ?
+      """.trimIndent(),
+      listOf(versionId, clock.millis(), photoId),
+    )
+    if (n == 0) throw NotFoundException("version does not belong to this photo")
+  }
+
+  /** Current version id, creating the root for photos that predate versioning. */
+  fun currentVersion(c: Connection, photoId: Long): Long {
+    val row = c.select("SELECT current_version_id, sha256, content_type, bytes, width, height FROM photos WHERE id = ? FOR UPDATE", listOf(photoId)) { rs ->
+      rs.longOrNull("current_version_id") to BlobInfo(rs.getString("sha256"), rs.getString("content_type"), rs.getLong("bytes"), rs.intOrNull("width"), rs.intOrNull("height"))
+    }.firstOrNull() ?: throw NotFoundException("no such photo")
+    row.first?.let { return it }
+    val id = c.insert(
+      "INSERT INTO photo_versions (token, photo_id, parent_version_id, transform, sha256, content_type, bytes, width, height, created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?)",
+      listOf(randomToken(), photoId, null, null, row.second.sha256, row.second.contentType, row.second.bytes, row.second.width, row.second.height, clock.millis()),
+    )
+    // Not a content change: no feed requeue.
+    c.exec("UPDATE photos SET current_version_id = ? WHERE id = ?", listOf(id, photoId))
+    return id
+  }
+
+  fun addIntent(c: Connection, photoId: Long, transform: String, params: String?, origin: String, collectionId: Long?, position: Int?, by: String?): String {
+    val token = randomToken()
+    c.insert(
+      """
+      INSERT INTO transform_intents (token, photo_id, version_id, transform, params, origin, collection_id, chain_position, requested_by, created_at_ms, shard)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      """.trimIndent(),
+      listOf(token, photoId, currentVersion(c, photoId), transform, params, origin, collectionId, position, by, clock.millis(), shardOf(token, config.snapz.feed_shards)),
+    )
+    return token
+  }
+
+  /**
+   * Queue the next link of a collection's transform chain: the first one at a position greater
+   * than [after] (null = start of the chain). Chains run one link at a time, each on the photo as
+   * the previous link left it — the interceptor model, with the hand-off made explicit as events.
+   */
+  fun advanceChain(c: Connection, photoId: Long, collectionId: Long, after: Int?): String? {
+    val next = c.select(
+      "SELECT position, transform, params FROM collection_transforms WHERE collection_id = ? AND position > ? ORDER BY position LIMIT 1",
+      listOf(collectionId, after ?: -1),
+    ) { Triple(it.getInt(1), it.getString(2), it.getString(3)) }.firstOrNull() ?: return null
+    return addIntent(c, photoId, next.second, next.third, "chain", collectionId, next.first, null)
+  }
+}
+
 data class PhotoPage(val photos: List<PhotoDto>, val next_before: String?)
 
 @Singleton
@@ -187,11 +263,13 @@ class PhotoStore @Inject constructor(
   private val config: SnapzConfig,
   private val json: Json,
   private val collections: CollectionStore,
+  private val lineage: Lineage,
 ) {
   private val select = """
     SELECT p.id, p.token, c.slug AS collection, p.sha256, p.content_type, p.bytes, p.width, p.height, p.taken_at_ms,
-           p.note, p.meta, p.barcodes, p.client_id, p.created_at_ms, p.updated_at_ms, p.deleted_at_ms, p.feed_sync_id
-    FROM photos p JOIN collections c ON c.id = p.collection_id
+           p.note, p.meta, p.barcodes, p.client_id, p.created_at_ms, p.updated_at_ms, p.deleted_at_ms, p.feed_sync_id,
+           v.token AS version_token
+    FROM photos p JOIN collections c ON c.id = p.collection_id LEFT JOIN photo_versions v ON v.id = p.current_version_id
   """.trimIndent()
 
   private fun dto(rs: ResultSet): PhotoDto {
@@ -209,8 +287,11 @@ class PhotoStore @Inject constructor(
       meta = json.parseObject(rs.getString("meta")),
       barcodes = rs.getString("barcodes")?.split(',')?.filter { it.isNotEmpty() } ?: listOf(),
       client_id = rs.getString("client_id"),
-      url = "/blobs/$token",
-      thumb_url = "/blobs/$token?size=thumb",
+      current_version = rs.getString("version_token"),
+      // `v` pins the URL to the current bytes: cacheable forever, and it changes when a
+      // transform swaps the current version.
+      url = "/blobs/$token?v=${rs.getString("sha256").take(10)}",
+      thumb_url = "/blobs/$token?size=thumb&v=${rs.getString("sha256").take(10)}",
       created_at = iso(rs.getLong("created_at_ms")),
       updated_at = iso(rs.getLong("updated_at_ms")),
       deleted_at = isoOrNull(rs.longOrNull("deleted_at_ms")),
@@ -279,7 +360,7 @@ class PhotoStore @Inject constructor(
         existing(c)?.let { return@tx it to false }
         val cid = collections.idOf(c, collection)
         val token = randomToken()
-        c.insert(
+        val id = c.insert(
           """
           INSERT INTO photos (token, collection_id, sha256, content_type, bytes, width, height, taken_at_ms, note, meta, barcodes,
                               client_id, created_at_ms, updated_at_ms, shard)
@@ -290,6 +371,9 @@ class PhotoStore @Inject constructor(
             json.write(meta), barcodeColumn(meta), clientId, now, now, shardOf(token, config.snapz.feed_shards),
           ),
         )
+        lineage.addVersion(c, id, null, null, blob, makeCurrent = false)
+          .also { v -> c.exec("UPDATE photos SET current_version_id = ? WHERE id = ?", listOf(v, id)) }
+        lineage.advanceChain(c, id, cid, null)
         get(c, token) to true
       }
     } catch (e: Exception) {
@@ -307,9 +391,26 @@ class PhotoStore @Inject constructor(
     note?.let { sets += "note = ?"; args += it.takeIf { n -> n.isNotBlank() } }
     meta?.let { sets += "meta = ?"; args += json.write(it); sets += "barcodes = ?"; args += barcodeColumn(it) }
     takenAtMs?.let { sets += "taken_at_ms = ?"; args += it }
-    collection?.let { sets += "collection_id = ?"; args += collections.idOf(c, it) }
+    val before = idOf(c, token)
+    val dest = collection?.let { collections.idOf(c, it) }
+    dest?.let { sets += "collection_id = ?"; args += it }
     c.exec("UPDATE photos SET ${sets.joinToString()} WHERE token = ?", args + token)
+    if (dest != null && dest != before.second) lineage.advanceChain(c, before.first, dest, null)
     get(c, token)
+  }
+
+  /** (photo id, collection id) for a token. */
+  fun idOf(c: Connection, token: String): Pair<Long, Long> =
+    c.select("SELECT id, collection_id FROM photos WHERE token = ?", listOf(token)) { it.getLong(1) to it.getLong(2) }.firstOrNull()
+      ?: throw NotFoundException("no photo '$token'")
+
+  /** Shallow-merges [patch] into the photo's meta (how data-extracting transforms tag a photo). */
+  fun patchMeta(c: Connection, photoId: Long, patch: Map<String, Any?>) {
+    val cur = c.select("SELECT meta FROM photos WHERE id = ? FOR UPDATE", listOf(photoId)) { it.getString(1) }.firstOrNull() ?: return
+    val merged = LinkedHashMap(json.parseObject(cur)).apply { putAll(patch) }
+    val text = json.write(merged)
+    if (text == cur) return
+    c.exec("UPDATE photos SET meta = ?, barcodes = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE id = ?", listOf(text, barcodeColumn(merged), clock.millis(), photoId))
   }
 
   /** New row, same blob. Copies are independent from then on (notes, meta, deletion). */
@@ -329,6 +430,10 @@ class PhotoStore @Inject constructor(
       """.trimIndent(),
       listOf(newToken, cid, now, now, shardOf(newToken, config.snapz.feed_shards), token),
     )
+    // The copy starts its own history at whatever the source currently looks like.
+    val newId = idOf(c, newToken).first
+    lineage.currentVersion(c, newId)
+    lineage.advanceChain(c, newId, cid, null)
     return get(c, newToken)
   }
 
@@ -360,9 +465,10 @@ class PhotoStore @Inject constructor(
           "copy" -> copy(c, t, collection ?: throw BadRequestException("copy needs 'collection'"))
           "move" -> {
             val cid = collections.idOf(c, collection ?: throw BadRequestException("move needs 'collection'"))
-            get(c, t)
+            val (pid, from) = idOf(c, t)
             // Moving out of the trash is allowed: it's how photos of a deleted collection are rescued.
             c.exec("UPDATE photos SET collection_id = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE token = ?", listOf(cid, clock.millis(), t))
+            if (from != cid) lineage.advanceChain(c, pid, cid, null)
             get(c, t)
           }
           else -> throw BadRequestException("unknown op '$op': want move|copy|delete|restore")
@@ -372,9 +478,15 @@ class PhotoStore @Inject constructor(
   }
 
   /** sha256 + content type for serving; soft-deleted photos stay viewable (the trash needs them). */
-  fun blobRef(token: String): Pair<String, String> = db.tx { c ->
-    c.select("SELECT sha256, content_type FROM photos WHERE token = ?", listOf(token)) { it.getString(1) to it.getString(2) }.firstOrNull()
-      ?: throw NotFoundException("no photo '$token'")
+  fun blobRef(token: String, version: String? = null): Pair<String, String> = db.tx { c ->
+    if (version == null) {
+      c.select("SELECT sha256, content_type FROM photos WHERE token = ?", listOf(token)) { it.getString(1) to it.getString(2) }.firstOrNull()
+        ?: throw NotFoundException("no photo '$token'")
+    } else {
+      c.select(
+        "SELECT v.sha256, v.content_type FROM photo_versions v JOIN photos p ON p.id = v.photo_id WHERE p.token = ? AND v.token = ?", listOf(token, version),
+      ) { it.getString(1) to it.getString(2) }.firstOrNull() ?: throw NotFoundException("no version '$version' of photo '$token'")
+    }
   }
 
   /**
@@ -384,9 +496,18 @@ class PhotoStore @Inject constructor(
    */
   fun purge(olderThanMs: Long): Pair<Int, List<String>> = db.tx { c ->
     val cutoff = clock.millis() - olderThanMs
-    val shas = c.select("SELECT DISTINCT sha256 FROM photos WHERE deleted_at_ms IS NOT NULL AND deleted_at_ms <= ?", listOf(cutoff)) { it.getString(1) }
+    val doomed = "SELECT id FROM photos WHERE deleted_at_ms IS NOT NULL AND deleted_at_ms <= ?"
+    val shas = (
+      c.select("SELECT DISTINCT sha256 FROM photos WHERE deleted_at_ms IS NOT NULL AND deleted_at_ms <= ?", listOf(cutoff)) { it.getString(1) } +
+        c.select("SELECT DISTINCT sha256 FROM photo_versions WHERE photo_id IN ($doomed)", listOf(cutoff)) { it.getString(1) }
+      ).distinct()
+    // Intents and results are an event log and outlive the photo; its images do not.
+    c.exec("DELETE FROM photo_versions WHERE photo_id IN (SELECT id FROM ($doomed) d)", listOf(cutoff))
     val n = c.exec("DELETE FROM photos WHERE deleted_at_ms IS NOT NULL AND deleted_at_ms <= ?", listOf(cutoff))
-    val orphans = shas.filter { sha -> c.select("SELECT 1 FROM photos WHERE sha256 = ? LIMIT 1", listOf(sha)) { 1 }.isEmpty() }
+    val orphans = shas.filter { sha ->
+      c.select("SELECT 1 FROM photos WHERE sha256 = ? LIMIT 1", listOf(sha)) { 1 }.isEmpty() &&
+        c.select("SELECT 1 FROM photo_versions WHERE sha256 = ? LIMIT 1", listOf(sha)) { 1 }.isEmpty()
+    }
     n to orphans
   }
 

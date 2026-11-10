@@ -11,6 +11,8 @@ final class AppState: ObservableObject {
     /// Where the camera shoots into; remembered across launches.
     @Published var captureCollection: String? { didSet { UserDefaults.standard.set(captureCollection, forKey: "captureCollection") } }
     @Published var error: String?
+    /// The "snap first, file later" collection (server-configured; learned from /api/inbox).
+    @Published var inboxSlug = "inbox"
 
     let queue = UploadQueue()
     private let webSignIn = WebSignIn()
@@ -21,6 +23,17 @@ final class AppState: ObservableObject {
         captureCollection = UserDefaults.standard.string(forKey: "captureCollection")
         token = Keychain.get("token")
         principal = UserDefaults.standard.string(forKey: "principal")
+        #if DEBUG
+        // Simulator/UI-test hook: `SIMCTL_CHILD_SNAPZ_DEBUG_TOKEN=… xcrun simctl launch … -serverURL http://localhost:8788`
+        if let t = ProcessInfo.processInfo.environment["SNAPZ_DEBUG_TOKEN"], !t.isEmpty {
+            token = t
+            principal = "debug"
+            // Persist, so later launches from the home screen stay signed in to the same server.
+            Keychain.set("token", t)
+            UserDefaults.standard.set("debug", forKey: "principal")
+            UserDefaults.standard.set(serverURL, forKey: "serverURL")
+        }
+        #endif
         configureQueue()
     }
 

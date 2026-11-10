@@ -134,7 +134,12 @@ final class UploadQueue: ObservableObject {
             uploading = item.id
             let meta: [String: Any] = [
                 "source": "ios",
-                "barcodes": item.barcodes.map { ["symbology": $0.symbology, "value": $0.value] },
+                "barcodes": item.barcodes.map { b -> [String: Any] in
+                    var d: [String: Any] = ["symbology": b.symbology, "value": b.value]
+                    if let box = b.box { d["box"] = box }
+                    if let source = b.source { d["source"] = source }
+                    return d
+                },
             ]
             let metaJSON = (try? JSONSerialization.data(withJSONObject: meta)).map { String(decoding: $0, as: UTF8.self) }
             do {
