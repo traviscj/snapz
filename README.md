@@ -1,5 +1,21 @@
 # snapz
 
+![snapz web UI walkthrough: collections, detections, live refresh, inbox filing, order items, transforms, feeds](docs/demo.gif)
+
+![iOS app: collections, grid, photo detail with detection box, inbox triage, derived order items](docs/ios.png)
+
+<table>
+<tr>
+<td width="50%"><img src="docs/web-photos.png" alt="Web: pantry collection with a photo open, barcode boxed, version strip and transform history"><br><sub>Collection grid, detection box, version tree, transform history</sub></td>
+<td width="50%"><img src="docs/web-inbox.png" alt="Web: inbox photo with collections ranked by probability"><br><sub>Inbox: file with one key, ranked by P(collection)</sub></td>
+</tr>
+<tr>
+<td colspan="2"><img src="docs/web-transforms.png" alt="Web: transform library and per-collection chains"><br><sub>Transform library and per-collection chains</sub></td>
+</tr>
+</table>
+
+<sub>All screenshots use generated, obviously fake data (ACME everything). The camera HUD isn't pictured: the simulator has no camera.</sub>
+
 Photos that never touch the iPhone library: shoot into named collections (pantry, food, work,
 illness…), browse/move/copy/delete from the web, and consume everything as a feedz-style change
 feed so small scripts can turn, say, pantry UPC scans into order items.

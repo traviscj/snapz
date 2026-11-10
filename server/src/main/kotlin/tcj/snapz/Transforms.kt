@@ -522,6 +522,26 @@ class Builtins @Inject constructor(
       BarcodeFormat.DATA_MATRIX to "datamatrix", BarcodeFormat.PDF_417 to "pdf417", BarcodeFormat.AZTEC to "aztec",
     )
 
+    /** Vertical run of "dark at either end of the scan line" around row [y]: the bars' top and bottom. */
+    private fun barExtent(img: BufferedImage, xl: Int, xr: Int, y: Int): Pair<Int, Int> {
+      fun dark(x: Int, yy: Int): Boolean = (-3..3).any { dx ->
+        val xx = (x + dx).coerceIn(0, img.width - 1)
+        val rgb = img.getRGB(xx, yy)
+        ((rgb shr 16 and 0xff) * 299 + (rgb shr 8 and 0xff) * 587 + (rgb and 0xff) * 114) / 1000 < 110
+      }
+      fun barRow(yy: Int) = dark(xl, yy) || dark(xr, yy)
+      var top = y.coerceIn(0, img.height - 1)
+      var bottom = top
+      var miss = 0
+      while (top > 0 && miss < 3) { top--; miss = if (barRow(top)) 0 else miss + 1 }
+      top += miss
+      miss = 0
+      while (bottom < img.height - 1 && miss < 3) { bottom++; miss = if (barRow(bottom)) 0 else miss + 1 }
+      bottom -= miss
+      // Nothing dark found either way (blurry, low contrast): fall back to a nominal band.
+      return if (bottom - top < 6) (y - (xr - xl) / 6).coerceAtLeast(0) to (y + (xr - xl) / 6).coerceAtMost(img.height - 1) else top to bottom
+    }
+
     /** [{symbology, value, box, source: "server"}], boxes as fractions of [img], origin top-left. */
     fun decodeBarcodes(img: BufferedImage): List<Map<String, Any?>> {
       val hints = mapOf(DecodeHintType.TRY_HARDER to true, DecodeHintType.POSSIBLE_FORMATS to FORMATS.keys.toList())
@@ -536,12 +556,17 @@ class Builtins @Inject constructor(
         val value = if (r.barcodeFormat == BarcodeFormat.UPC_A) "0" + r.text else r.text
         val pts = r.resultPoints.orEmpty().filterNotNull()
         val box = if (pts.isEmpty()) null else {
-          val x0 = pts.minOf { it.x } / img.width; val x1 = pts.maxOf { it.x } / img.width
-          val y0 = pts.minOf { it.y } / img.height; val y1 = pts.maxOf { it.y } / img.height
-          // 1D readers report the two ends of one scan line: give the box some height.
-          val h = maxOf(y1 - y0, (x1 - x0) * 0.35f); val w = maxOf(x1 - x0, (y1 - y0) * 0.35f)
-          val cx = (x0 + x1) / 2; val cy = (y0 + y1) / 2
-          listOf(cx - w / 2, cy - h / 2, w, h).map { Math.round(it.toDouble().coerceIn(0.0, 1.0) * 10000) / 10000.0 }
+          var x0 = pts.minOf { it.x }; var x1 = pts.maxOf { it.x }
+          var y0 = pts.minOf { it.y }; var y1 = pts.maxOf { it.y }
+          if (y1 - y0 < (x1 - x0) * 0.1f) {
+            // 1D readers report the two ends of the one scan line that decoded, not the symbol's
+            // height. The outer guard bars run the full height: follow them up and down.
+            val (top, bottom) = barExtent(img, x0.toInt(), x1.toInt(), ((y0 + y1) / 2).toInt())
+            y0 = top.toFloat(); y1 = bottom.toFloat()
+          } else if (x1 - x0 < (y1 - y0) * 0.1f) {
+            x0 -= (y1 - y0) * 0.175f; x1 += (y1 - y0) * 0.175f // rotated 1D code: no cheap extent, pad
+          }
+          listOf(x0 / img.width, y0 / img.height, (x1 - x0) / img.width, (y1 - y0) / img.height).map { Math.round(it.toDouble().coerceIn(0.0, 1.0) * 10000) / 10000.0 }
         }
         mapOf("symbology" to name, "value" to value, "box" to box, "source" to "server")
       }.distinctBy { it["value"] }

@@ -557,8 +557,10 @@ class SnapzServiceTest {
     assertThat(detected).containsEntry("symbology", "ean13").containsEntry("source", "server")
     @Suppress("UNCHECKED_CAST")
     val box = detected["box"] as List<Number>
-    assertThat(box[0].toDouble()).isBetween(0.38, 0.50)   // drawn at x=500..920 of 1200
-    assertThat(box[1].toDouble()).isBetween(0.35, 0.60)
+    // drawn at x=500..920, y=400..580 of 1200x900 (quiet zones and the digit row excluded)
+    assertThat(box[0].toDouble()).isBetween(0.40, 0.50)
+    assertThat(box[1].toDouble()).isBetween(0.43, 0.48)
+    assertThat(box[1].toDouble() + box[3].toDouble()).isBetween(0.58, 0.66)
 
     val h = api("GET", "/api/photos/${p["token"]}/history")
     assertThat(h.list("intents").map { Triple(it["transform"], it["chain_position"], it["state"]) })
