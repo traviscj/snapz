@@ -1,0 +1,41 @@
+# XcodeGen spec:  brew install xcodegen && xcodegen && open Snapz.xcodeproj
+name: Snapz
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+configFiles:
+  Debug: Config.xcconfig
+  Release: Config.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Signing team, bundle id prefix and default server come from Config.xcconfig -> Local.xcconfig.
+    CODE_SIGN_STYLE: Automatic
+targets:
+  Snapz:
+    type: application
+    platform: iOS
+    sources: [Snapz]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(SNAPZ_BUNDLE_PREFIX).snapz
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+    info:
+      path: Snapz/Info.plist
+      properties:
+        CFBundleDisplayName: Snapz
+        SnapzDefaultServer: $(SNAPZ_DEFAULT_SERVER)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSCameraUsageDescription: Snapz takes photos straight into your own collections, never into the Photos library.
+        # /auth/callback ends by redirecting to snapz://auth?code=...
+        CFBundleURLTypes:
+          - CFBundleURLName: $(SNAPZ_BUNDLE_PREFIX).snapz.auth
+            CFBundleURLSchemes: [snapz]
+        NSAppTransportSecurity:
+          # plain-http servers on the LAN (dev); real deployments are https
+          NSAllowsLocalNetworking: true

@@ -1,0 +1,18 @@
+web:
+  port: 8788
+  idle_timeout: 30000
+  http2: true
+
+data_source:
+  type: MYSQL
+  host: 127.0.0.1
+  port: 3306
+  database: snapz_dev
+  username: root
+  password: ""
+  migrations_resource: classpath:/migrations
+
+snapz:
+  blob_dir: data/blobs
+  public_url: http://localhost:8788
+  feed_publish_interval_ms: 500

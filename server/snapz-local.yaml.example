@@ -1,0 +1,5 @@
+# Copy to server/snapz-local.yaml (gitignored) for local dev:
+#   SNAPZ_CONFIG=$PWD/snapz-local.yaml ./gradlew run
+snapz:
+  bootstrap_tokens:
+    - { token: CHANGEME-any-string-for-local-dev, principal: dev }

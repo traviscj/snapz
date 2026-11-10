@@ -1,0 +1,29 @@
+[versions]
+junit = "5.11.4"
+kotlin = "2.1.10"
+misk = "2025.11.26.155736-9435a31"
+wire = "5.2.1"
+
+[libraries]
+assertj = { module = "org.assertj:assertj-core", version = "3.27.3" }
+junitBom = { module = "org.junit:junit-bom", version.ref = "junit" }
+junitApi = { module = "org.junit.jupiter:junit-jupiter-api" }
+junitEngine = { module = "org.junit.jupiter:junit-jupiter-engine" }
+junitPlatformLauncher = { module = "org.junit.platform:junit-platform-launcher" }
+
+misk = { module = "com.squareup.misk:misk", version.ref = "misk" }
+miskActions = { module = "com.squareup.misk:misk-actions", version.ref = "misk" }
+miskConfig = { module = "com.squareup.misk:misk-config", version.ref = "misk" }
+miskCore = { module = "com.squareup.misk:misk-core", version.ref = "misk" }
+miskInject = { module = "com.squareup.misk:misk-inject", version.ref = "misk" }
+miskJdbc = { module = "com.squareup.misk:misk-jdbc", version.ref = "misk" }
+miskService = { module = "com.squareup.misk:misk-service", version.ref = "misk" }
+miskTesting = { module = "com.squareup.misk:misk-testing", version.ref = "misk" }
+mysql = { module = "com.mysql:mysql-connector-j", version = "8.4.0" }
+slf4jSimple = { module = "org.slf4j:slf4j-simple", version = "2.0.16" }
+wireMoshiAdapter = { module = "com.squareup.wire:wire-moshi-adapter", version.ref = "wire" }
+wireRuntime = { module = "com.squareup.wire:wire-runtime", version.ref = "wire" }
+
+[plugins]
+kotlinJvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+wire = { id = "com.squareup.wire", version.ref = "wire" }

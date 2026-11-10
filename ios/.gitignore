@@ -1,0 +1,7 @@
+*.xcodeproj
+Snapz/Info.plist
+build
+DerivedData
+.build
+Local.xcconfig
+.DS_Store

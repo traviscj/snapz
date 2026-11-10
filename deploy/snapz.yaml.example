@@ -1,0 +1,21 @@
+# Copy to deploy/snapz.yaml (gitignored). Layered over snapz-common.yaml via SNAPZ_CONFIG.
+# Holds the secrets: chmod 600.
+data_source:
+  host: host.docker.internal
+  database: snapz
+  username: root
+  password: ""
+
+snapz:
+  blob_dir: /data/blobs
+  public_url: https://snapz.example.net
+  oidc:
+    issuer: https://id.example.net
+    client_id: CHANGEME
+    client_secret: CHANGEME
+    # Register this callback URL with the provider: <public_url>/auth/callback
+    allowed_emails: [you@example.net]
+    allowed_groups: []
+  # Optional break-glass token for first boot / when SSO is down. Remove once a script token exists.
+  # bootstrap_tokens:
+  #   - { token: CHANGEME-long-random, principal: bootstrap }

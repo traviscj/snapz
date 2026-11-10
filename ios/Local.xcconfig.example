@@ -1,0 +1,5 @@
+// Copy to ios/Local.xcconfig (gitignored), then re-run xcodegen.
+SNAPZ_BUNDLE_PREFIX = com.yourname
+DEVELOPMENT_TEAM = ABCDE12345
+// Pre-fills the server field on first launch. xcconfig treats // as a comment, hence the $() trick.
+SNAPZ_DEFAULT_SERVER = https:/$()/snapz.example.net

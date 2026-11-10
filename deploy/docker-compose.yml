@@ -1,0 +1,24 @@
+# Host-specific values come from deploy/.env (gitignored; copy .env.example) and the secrets from
+# deploy/snapz.yaml (gitignored; copy snapz.yaml.example). Create the DB first: CREATE DATABASE snapz;
+# If docker's default address pools collide with your LAN, pin SNAPZ_SUBNET in .env.
+services:
+  snapz:
+    image: snapz:local
+    container_name: snapz
+    restart: unless-stopped
+    ports:
+      - "${SNAPZ_BIND:-127.0.0.1:8788}:8788"     # put a TLS-terminating proxy in front
+    volumes:
+      - ./snapz.yaml:/config/snapz.yaml:ro
+      - ${SNAPZ_BLOB_DIR:?set SNAPZ_BLOB_DIR in deploy/.env}:/data/blobs   # originals + thumbs; back this up
+    extra_hosts:
+      - "host.docker.internal:host-gateway"      # reach a mysqld running on the host
+      # Split-horizon DNS: if containers can't resolve your OIDC issuer, map it here.
+      - "${OIDC_HOST:-oidc.invalid}:${OIDC_HOST_IP:-127.0.0.1}"
+    networks: [snapz]
+
+networks:
+  snapz:
+    ipam:
+      config:
+        - subnet: ${SNAPZ_SUBNET:-172.31.250.0/24}

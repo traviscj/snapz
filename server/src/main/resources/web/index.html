@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snapz</title>
+<style>
+:root{--bg:#0b0e11;--bg2:#12161b;--bg3:#1a2027;--line:#252c35;--fg:#d7dde3;--dim:#6b7580;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff;--sel:#1f3a5f;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+@media (prefers-color-scheme: light){:root{--bg:#f6f7f8;--bg2:#eceef1;--bg3:#e1e4e8;--line:#cfd4da;--fg:#1b1f24;--dim:#6a737d;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--acc:#0969da;--sel:#cfe3ff}}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font:12px/1.25 var(--mono);margin:0;display:flex;flex-direction:column;overflow:hidden}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+table{border-collapse:collapse;width:100%}
+th,td{padding:1px 6px;white-space:nowrap;text-align:left}
+th{color:var(--dim);font-weight:400;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);z-index:1}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr:nth-child(even){background:#80808010}
+tbody tr.sel{background:var(--sel)}
+tbody tr.cur{outline:1px solid var(--acc);outline-offset:-1px}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad);font-weight:700}.dim{color:var(--dim)}.acc{color:var(--acc)}
+button,select,input,textarea{font:inherit;color:var(--fg);background:var(--bg3);border:1px solid var(--line);padding:1px 6px;border-radius:2px}
+button{cursor:pointer}button:hover:not(:disabled){border-color:var(--acc)}button:disabled{color:var(--dim);cursor:default}
+button.danger:hover:not(:disabled){border-color:var(--bad);color:var(--bad)}
+input:focus,textarea:focus,select:focus{outline:1px solid var(--acc);outline-offset:-1px}
+#top{display:flex;gap:10px;align-items:center;padding:2px 8px;background:var(--bg2);border-bottom:1px solid var(--line);flex:none}
+#top b{color:var(--acc)}
+#top .tab{cursor:pointer;padding:0 4px;color:var(--dim)}#top .tab.on{color:var(--fg);font-weight:700;border-bottom:1px solid var(--acc)}
+#top .sp{flex:1}
+#main{flex:1;display:flex;min-height:0}
+#side{width:270px;flex:none;border-right:1px solid var(--line);overflow:auto}
+#side tr{cursor:pointer}#side tr.on{background:var(--sel)}
+#side td.name{max-width:120px;overflow:hidden;text-overflow:ellipsis}
+#center{flex:1;display:flex;flex-direction:column;min-width:0}
+#bar{display:flex;gap:6px;align-items:center;padding:2px 6px;border-bottom:1px solid var(--line);flex:none;flex-wrap:wrap}
+#bar .sp{flex:1}
+#content{flex:1;overflow:auto;position:relative}
+#content.drop{outline:2px dashed var(--acc);outline-offset:-4px}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tile,112px),1fr));gap:2px;padding:2px}
+.t{position:relative;aspect-ratio:1;background:var(--bg3);cursor:pointer;overflow:hidden}
+.t img{width:100%;height:100%;object-fit:cover;display:block}
+.t .cap{position:absolute;left:0;right:0;bottom:0;background:#000a;color:#ddd;font-size:10px;line-height:1.15;padding:0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t .bc{position:absolute;top:0;left:0;background:#000a;color:var(--ok);font-size:10px;line-height:1.15;padding:0 2px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t .nt{position:absolute;top:0;right:0;background:var(--warn);color:#000;font-size:10px;line-height:1.15;padding:0 2px}
+.t.sel{outline:2px solid var(--acc);outline-offset:-2px}.t.sel::after{content:"✓";position:absolute;top:0;right:1px;color:var(--acc);font-weight:700;text-shadow:0 0 2px #000}
+.t.cur{box-shadow:inset 0 0 0 2px var(--warn)}
+.t.del img{opacity:.45}
+#detail{width:380px;flex:none;border-left:1px solid var(--line);overflow:auto;display:none;padding:4px 6px}
+#detail.on{display:block}
+#detail img{max-width:100%;max-height:55vh;display:block;margin:0 auto 4px;background:var(--bg3)}
+#detail dl{display:grid;grid-template-columns:auto 1fr;gap:0 8px;margin:0}
+#detail dt{color:var(--dim)}#detail dd{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#detail textarea{width:100%;min-height:42px;resize:vertical}
+#detail pre{margin:2px 0;white-space:pre-wrap;word-break:break-all;background:var(--bg2);padding:2px 4px;max-height:200px;overflow:auto}
+.pane{padding:4px 8px;overflow:auto;flex:1}
+.pane h3{margin:8px 0 2px;font-size:12px;color:var(--acc);font-weight:700}
+.pane h3:first-child{margin-top:0}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:0 16px}
+#status{padding:1px 8px;border-top:1px solid var(--line);background:var(--bg2);flex:none;display:flex;gap:12px;white-space:nowrap;overflow:hidden}
+#status .sp{flex:1}
+#login{margin:40px auto;width:420px;border:1px solid var(--line);padding:8px 10px;background:var(--bg2)}
+#login input{width:100%;margin:2px 0}
+.pane table{width:auto;min-width:50%}
+code{background:var(--bg3);padding:0 3px}
+.hide{display:none!important}
+td.wrap{white-space:normal;word-break:break-all;max-width:520px}
+</style>
+</head>
+<body>
+<div id="top">
+  <b>snapz</b>
+  <span class="tab" data-tab="photos">photos</span>
+  <span class="tab" data-tab="feeds">feeds</span>
+  <span class="tab" data-tab="records">records</span>
+  <span class="tab" data-tab="tokens">tokens</span>
+  <span class="sp"></span>
+  <span id="who" class="dim"></span>
+  <button id="logout" class="hide">logout</button>
+</div>
+<div id="main"></div>
+<div id="status"><span id="st-msg" class="dim">…</span><span class="sp"></span><span id="st-keys" class="dim"></span><span id="st-time" class="dim"></span></div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------------------- util
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const pad = n => String(n).padStart(2, "0");
+function fmtTs(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function age(iso) {
+  if (!iso) return "";
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 90) return `${Math.round(s)}s`;
+  if (s < 5400) return `${Math.round(s / 60)}m`;
+  if (s < 129600) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+function fmtBytes(n) {
+  if (n == null) return "";
+  if (n < 1024) return `${n}B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)}K`;
+  if (n < 1073741824) return `${(n / 1048576).toFixed(1)}M`;
+  return `${(n / 1073741824).toFixed(2)}G`;
+}
+function say(msg, cls = "dim") { const el = $("#st-msg"); el.textContent = msg; el.className = cls; }
+
+class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
+async function api(method, path, body, opts = {}) {
+  const init = { method, headers: {}, credentials: "same-origin", signal: AbortSignal.timeout(opts.timeout ?? 15000) };
+  if (opts.raw) { init.body = opts.raw; init.headers["Content-Type"] = opts.raw.type || "application/octet-stream"; }
+  else if (body !== undefined) { init.body = JSON.stringify(body); init.headers["Content-Type"] = "application/json"; }
+  const r = await fetch(path, init);
+  if (r.status === 401 && !opts.noLogin) { showLogin(); throw new HttpError(401, "not signed in"); }
+  const text = await r.text();
+  if (!r.ok) throw new HttpError(r.status, `${r.status} ${text.slice(0, 200)}`);
+  return text ? JSON.parse(text) : null;
+}
+async function run(label, fn) {
+  try { say(label + "…"); const v = await fn(); say(label + " ok", "ok"); return v; }
+  catch (e) { say(`${label} failed: ${e.message}`, "bad"); throw e; }
+}
+
+// ---------------------------------------------------------------------------- state
+const S = {
+  tab: "photos", me: null,
+  collections: [], coll: null,          // coll: slug | null (=all) | "~trash"
+  photos: [], next: null, loading: false, sel: new Set(), cur: -1, anchor: -1,
+  view: localStorage.snapzView || "grid", tile: +(localStorage.snapzTile || 112), barcode: "",
+  recNs: null,
+};
+const main = $("#main");
+let poller = null; // the active tab's poll loop, if any
+
+// One self-scheduling poll loop at a time: in-flight guard, hard timeout (in api()), parked while hidden.
+function startPoll(fn, intervalMs) {
+  stopPoll();
+  const p = { live: true, inflight: false, timer: null };
+  p.tick = async () => {
+    if (!p.live || p.inflight || document.hidden) return;
+    p.inflight = true;
+    try { await fn(); $("#st-time").textContent = "upd " + fmtTs(new Date().toISOString()).slice(11); $("#st-time").className = "dim"; }
+    catch (e) { $("#st-time").className = "bad"; $("#st-time").textContent = "stale: " + e.message.slice(0, 60); }
+    finally { p.inflight = false; if (p.live && !document.hidden) p.timer = setTimeout(p.tick, intervalMs); }
+  };
+  p.vis = () => { if (!document.hidden) { clearTimeout(p.timer); p.tick(); } };
+  document.addEventListener("visibilitychange", p.vis);
+  poller = p;
+  p.tick();
+}
+function stopPoll() {
+  if (!poller) return;
+  poller.live = false; clearTimeout(poller.timer);
+  document.removeEventListener("visibilitychange", poller.vis);
+  poller = null;
+  $("#st-time").textContent = "";
+}
+
+// ---------------------------------------------------------------------------- login
+async function showLogin() {
+  stopPoll();
+  let info = { oidc: false };
+  try { info = await api("GET", "/auth/info", undefined, { noLogin: true }); } catch (e) { /* keep default */ }
+  const back = encodeURIComponent("/" + location.hash);
+  main.innerHTML = `<div id="login">
+    <div><b class="acc">snapz</b> <span class="dim">— sign in</span></div>
+    ${info.oidc ? `<p><a href="/auth/login?return_to=${back}"><button>sign in with SSO</button></a></p>` : `<p class="dim">SSO is not configured on this server.</p>`}
+    <form id="tl"><div class="dim">or paste an API token</div>
+    <input id="tl-tok" type="password" autocomplete="off" placeholder="snapz_…">
+    <button>use token</button> <span id="tl-err" class="bad"></span></form></div>`;
+  $("#who").textContent = ""; $("#logout").classList.add("hide");
+  $("#tl").onsubmit = async ev => {
+    ev.preventDefault();
+    try { await api("POST", "/auth/token-login", { token: $("#tl-tok").value }, { noLogin: true }); boot(); }
+    catch (e) { $("#tl-err").textContent = e.status === 401 ? "bad token" : e.message; }
+  };
+}
+$("#logout").onclick = async () => { await api("POST", "/auth/logout", undefined, { noLogin: true }); showLogin(); };
+
+// ---------------------------------------------------------------------------- photos tab
+const collLabel = () => S.coll === "~trash" ? "trash" : S.coll ?? "all";
+const inTrash = () => S.coll === "~trash";
+
+function photosShell() {
+  main.innerHTML = `
+    <div id="side"></div>
+    <div id="center">
+      <div id="bar">
+        <b id="b-title"></b><span id="b-count" class="dim"></span>
+        <span id="b-sel" class="acc"></span>
+        <select id="b-dest" title="destination collection"></select>
+        <button id="b-move" title="m">move</button><button id="b-copy" title="c">copy</button>
+        <button id="b-del" class="danger" title="Delete / Backspace">delete</button>
+        <button id="b-restore" class="hide">restore</button>
+        <button id="b-none" title="Esc">clear</button><button id="b-all" title="a">all</button>
+        <span class="sp"></span>
+        <input id="b-bc" placeholder="barcode =" size="15" value="${esc(S.barcode)}">
+        <button id="b-view" title="v">${S.view === "grid" ? "table" : "grid"}</button>
+        <button id="b-sm" title="-">−</button><button id="b-lg" title="+">+</button>
+        <button id="b-up">upload</button><input id="b-file" type="file" accept="image/*" multiple class="hide">
+        <button id="b-purge" class="danger hide" title="hard-delete everything in the trash and its unreferenced blobs">empty trash</button>
+      </div>
+      <div id="content"></div>
+    </div>
+    <div id="detail"></div>`;
+  $("#b-move").onclick = () => batch("move");
+  $("#b-copy").onclick = () => batch("copy");
+  $("#b-del").onclick = () => batch("delete");
+  $("#b-restore").onclick = () => batch("restore");
+  $("#b-none").onclick = () => { S.sel.clear(); renderPhotos(); };
+  $("#b-all").onclick = () => { S.photos.forEach(p => S.sel.add(p.token)); renderPhotos(); };
+  $("#b-view").onclick = toggleView;
+  $("#b-sm").onclick = () => setTile(S.tile - 24);
+  $("#b-lg").onclick = () => setTile(S.tile + 24);
+  $("#b-up").onclick = () => $("#b-file").click();
+  $("#b-file").onchange = ev => { uploadFiles([...ev.target.files]); ev.target.value = ""; };
+  $("#b-bc").onchange = ev => { S.barcode = ev.target.value.trim(); loadPhotos(true); };
+  $("#b-purge").onclick = async () => {
+    if (!confirm("Permanently delete everything in the trash? This cannot be undone.")) return;
+    const r = await run("purge", () => api("POST", "/api/admin/purge?older_than_days=0"));
+    say(`purged ${r.photos_purged} photos, ${r.blobs_deleted} blobs`, "ok");
+    refreshAll();
+  };
+  const content = $("#content");
+  content.onscroll = () => { if (content.scrollTop + content.clientHeight > content.scrollHeight - 600) loadPhotos(false); };
+  content.ondragover = ev => { ev.preventDefault(); content.classList.add("drop"); };
+  content.ondragleave = () => content.classList.remove("drop");
+  content.ondrop = ev => { ev.preventDefault(); content.classList.remove("drop"); uploadFiles([...ev.dataTransfer.files]); };
+  content.onclick = ev => {
+    const el = ev.target.closest("[data-i]");
+    if (el) pick(+el.dataset.i, ev);
+  };
+  setTile(S.tile);
+}
+function setTile(px) {
+  S.tile = Math.min(400, Math.max(64, px)); localStorage.snapzTile = S.tile;
+  $("#content")?.style.setProperty("--tile", S.tile + "px");
+}
+function toggleView() { S.view = S.view === "grid" ? "table" : "grid"; localStorage.snapzView = S.view; $("#b-view").textContent = S.view === "grid" ? "table" : "grid"; renderPhotos(); }
+
+async function loadCollections() {
+  S.collections = (await api("GET", "/api/collections")).collections;
+  renderSide();
+}
+function renderSide() {
+  const side = $("#side"); if (!side) return;
+  const tot = S.collections.reduce((a, c) => ({ n: a.n + c.photo_count, b: a.b + c.bytes }), { n: 0, b: 0 });
+  const row = (key, icon, name, n, bytes, last, extra = "") =>
+    `<tr data-c="${esc(key)}" class="${(S.coll ?? "") === key ? "on" : ""}"><td>${esc(icon || "·")}</td><td class="name" title="${esc(name)}${extra ? " — " + esc(extra) : ""}">${esc(name)}</td>
+     <td class="n">${n ?? ""}</td><td class="n dim">${fmtBytes(bytes)}</td><td class="n dim">${age(last)}</td></tr>`;
+  side.innerHTML = `<table><thead><tr><th></th><th>collection</th><th class="n">n</th><th class="n">size</th><th class="n">last</th></tr></thead><tbody>
+    ${row("", "∗", "all", tot.n, tot.b, S.collections.map(c => c.last_photo_at).filter(Boolean).sort().pop())}
+    ${S.collections.map(c => row(c.slug, c.icon, c.slug, c.photo_count, c.bytes, c.last_photo_at, c.description || c.name)).join("")}
+    ${row("~trash", "␡", "trash", null, null, null)}
+    </tbody></table>
+    <div style="padding:3px 6px;display:flex;gap:4px;flex-wrap:wrap">
+      <button id="c-new">+ collection</button>
+      <button id="c-edit" ${S.coll && !inTrash() ? "" : "disabled"}>edit</button>
+      <button id="c-del" class="danger" ${S.coll && !inTrash() ? "" : "disabled"}>delete</button>
+    </div>`;
+  side.querySelectorAll("tr[data-c]").forEach(tr => tr.onclick = () => selectColl(tr.dataset.c || null));
+  $("#c-new").onclick = async () => {
+    const name = prompt("New collection name (slug is derived: lowercase, dashes)"); if (!name) return;
+    const icon = prompt("Icon (one emoji, optional)") || undefined;
+    const c = await run("create collection", () => api("POST", "/api/collections", { name, icon }));
+    await loadCollections(); selectColl(c.slug);
+  };
+  $("#c-edit").onclick = async () => {
+    const c = S.collections.find(x => x.slug === S.coll); if (!c) return;
+    const name = prompt("Name", c.name); if (name == null) return;
+    const description = prompt("Description", c.description || ""); if (description == null) return;
+    const icon = prompt("Icon", c.icon || ""); if (icon == null) return;
+    await run("update collection", () => api("PATCH", `/api/collections/${encodeURIComponent(c.slug)}`, { name, description, icon }));
+    loadCollections();
+  };
+  $("#c-del").onclick = async () => {
+    const c = S.collections.find(x => x.slug === S.coll); if (!c) return;
+    if (!confirm(`Delete collection '${c.slug}'` + (c.photo_count ? ` and move its ${c.photo_count} photos to the trash?` : "?"))) return;
+    await run("delete collection", () => api("DELETE", `/api/collections/${encodeURIComponent(c.slug)}?force=true`));
+    S.coll = null; refreshAll();
+  };
+  const dest = $("#b-dest");
+  if (dest) {
+    const keep = dest.value;
+    dest.innerHTML = S.collections.map(c => `<option value="${esc(c.slug)}">→ ${esc(c.slug)}</option>`).join("");
+    if (keep && S.collections.some(c => c.slug === keep)) dest.value = keep;
+  }
+}
+function selectColl(slug) {
+  S.coll = slug; S.sel.clear(); S.cur = -1; S.anchor = -1;
+  location.hash = slug ? encodeURIComponent(slug) : "";
+  renderSide(); loadPhotos(true);
+}
+
+async function loadPhotos(reset) {
+  if (S.loading) return;
+  if (!reset && !S.next) return;
+  S.loading = true;
+  try {
+    const q = new URLSearchParams({ limit: "300" });
+    if (inTrash()) q.set("deleted", "true"); else if (S.coll) q.set("collection", S.coll);
+    if (S.barcode) q.set("barcode", S.barcode);
+    if (!reset && S.next) q.set("before", S.next);
+    const page = await api("GET", "/api/photos?" + q);
+    S.photos = reset ? page.photos : S.photos.concat(page.photos);
+    S.next = page.next_before ?? null;
+    if (reset) { $("#content").scrollTop = 0; closeDetail(); }
+    renderPhotos();
+    say(`${collLabel()}: ${S.photos.length}${S.next ? "+" : ""} photos`);
+  } catch (e) { if (e.status !== 401) say("load failed: " + e.message, "bad"); }
+  finally { S.loading = false; }
+}
+function renderPhotos() {
+  const content = $("#content"); if (!content) return;
+  $("#b-title").textContent = collLabel();
+  $("#b-count").textContent = ` ${S.photos.length}${S.next ? "+" : ""}`;
+  $("#b-sel").textContent = S.sel.size ? `${S.sel.size} sel` : "";
+  const none = S.sel.size === 0;
+  for (const id of ["b-move", "b-copy", "b-del", "b-restore", "b-none"]) $("#" + id).disabled = none;
+  $("#b-restore").classList.toggle("hide", !inTrash());
+  $("#b-purge").classList.toggle("hide", !inTrash());
+  $("#b-del").classList.toggle("hide", inTrash());
+  $("#b-copy").classList.toggle("hide", inTrash());
+  $("#b-up").disabled = !S.coll || inTrash();
+  if (!S.photos.length) { content.innerHTML = `<div class="dim" style="padding:8px">no photos${S.coll && !inTrash() ? " — drop image files here or use upload" : ""}</div>`; return; }
+  const showColl = !S.coll || inTrash();
+  if (S.view === "grid") {
+    content.innerHTML = `<div id="grid">` + S.photos.map((p, i) => `
+      <div class="t${S.sel.has(p.token) ? " sel" : ""}${i === S.cur ? " cur" : ""}${p.deleted_at ? " del" : ""}" data-i="${i}">
+        <img loading="lazy" src="${esc(p.thumb_url)}" alt="">
+        ${p.barcodes.length ? `<span class="bc">${esc(p.barcodes.join(" "))}</span>` : ""}
+        ${p.note && !S.sel.has(p.token) ? `<span class="nt" title="${esc(p.note)}">n</span>` : ""}
+        <span class="cap">${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
+      </div>`).join("") + `</div>`;
+  } else {
+    content.innerHTML = `<table><thead><tr><th></th><th>taken</th><th class="n">age</th>${showColl ? "<th>collection</th>" : ""}<th>token</th><th class="n">w×h</th><th class="n">size</th><th>barcodes</th><th>note</th><th class="n">fsi</th></tr></thead><tbody>` +
+      S.photos.map((p, i) => `<tr data-i="${i}" class="${S.sel.has(p.token) ? "sel" : ""}${i === S.cur ? " cur" : ""}" style="cursor:pointer">
+        <td style="padding:0"><img loading="lazy" src="${esc(p.thumb_url)}" alt="" style="height:28px;width:28px;object-fit:cover;display:block"></td>
+        <td>${fmtTs(p.taken_at)}</td><td class="n dim">${age(p.taken_at)}</td>${showColl ? `<td>${esc(p.collection)}</td>` : ""}
+        <td class="dim">${esc(p.token)}</td><td class="n">${p.width ?? "?"}×${p.height ?? "?"}</td><td class="n">${fmtBytes(p.bytes)}</td>
+        <td class="ok">${esc(p.barcodes.join(" "))}</td><td style="max-width:320px;overflow:hidden;text-overflow:ellipsis">${esc(p.note)}</td>
+        <td class="n ${p.feed_sync_id == null ? "warn" : "dim"}">${p.feed_sync_id ?? "pend"}</td></tr>`).join("") + `</tbody></table>`;
+  }
+}
+// click = focus + open detail; cmd/ctrl-click = toggle; shift-click = range
+function pick(i, ev) {
+  const p = S.photos[i]; if (!p) return;
+  if (ev && ev.shiftKey && S.anchor >= 0) {
+    const [a, b] = [Math.min(S.anchor, i), Math.max(S.anchor, i)];
+    for (let j = a; j <= b; j++) S.sel.add(S.photos[j].token);
+  } else if (ev && (ev.metaKey || ev.ctrlKey)) {
+    S.sel.has(p.token) ? S.sel.delete(p.token) : S.sel.add(p.token); S.anchor = i;
+  } else { S.anchor = i; }
+  S.cur = i;
+  renderPhotos(); showDetail(p);
+}
+function showDetail(p) {
+  const d = $("#detail"); d.classList.add("on");
+  const rows = [
+    ["token", p.token], ["collection", p.collection], ["taken", `${fmtTs(p.taken_at)} (${age(p.taken_at)})`],
+    ["uploaded", fmtTs(p.created_at)], ["updated", fmtTs(p.updated_at)],
+    p.deleted_at ? ["deleted", fmtTs(p.deleted_at)] : null,
+    ["dims", `${p.width ?? "?"}×${p.height ?? "?"}`], ["size", `${fmtBytes(p.bytes)} ${p.content_type}`],
+    ["sha256", p.sha256], ["feed_sync_id", p.feed_sync_id ?? "pending"],
+    p.barcodes.length ? ["barcodes", p.barcodes.join(" ")] : null,
+  ].filter(Boolean);
+  d.innerHTML = `<div style="display:flex;gap:4px;margin-bottom:3px"><b class="acc" style="flex:1">${esc(p.token)}</b>
+      <a href="${esc(p.url)}" target="_blank"><button>open</button></a><a href="${esc(p.url)}" download="${esc(p.collection)}-${esc(p.token)}"><button>download</button></a><button id="d-close">×</button></div>
+    <a href="${esc(p.url)}" target="_blank"><img src="${esc(p.url)}" alt=""></a>
+    <dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>
+    <div class="dim" style="margin-top:3px">note</div>
+    <textarea id="d-note" ${p.deleted_at ? "disabled" : ""}>${esc(p.note)}</textarea>
+    <button id="d-save" ${p.deleted_at ? "disabled" : ""}>save note</button>
+    <div class="dim" style="margin-top:3px">meta</div><pre>${esc(JSON.stringify(p.meta, null, 1))}</pre>`;
+  $("#d-close").onclick = closeDetail;
+  $("#d-save").onclick = async () => {
+    const np = await run("save note", () => api("PATCH", `/api/photos/${p.token}`, { note: $("#d-note").value }));
+    const i = S.photos.findIndex(x => x.token === p.token); if (i >= 0) S.photos[i] = np;
+    renderPhotos();
+  };
+}
+function closeDetail() { $("#detail")?.classList.remove("on"); }
+
+async function batch(op) {
+  // With nothing selected, keyboard ops act on the focused photo.
+  const tokens = S.sel.size ? [...S.sel] : (S.cur >= 0 ? [S.photos[S.cur].token] : []);
+  if (!tokens.length) return;
+  const body = { op, tokens };
+  if (op === "move" || op === "copy") {
+    body.collection = $("#b-dest").value;
+    if (!body.collection) return say("no destination collection", "warn");
+    if (op === "move" && body.collection === S.coll) return say("already in " + S.coll, "warn");
+  }
+  if (op === "delete" && tokens.length > 20 && !confirm(`Move ${tokens.length} photos to the trash?`)) return;
+  await run(`${op} ${tokens.length}${body.collection ? " → " + body.collection : ""}`, () => api("POST", "/api/photos/batch", body));
+  S.sel.clear();
+  refreshAll();
+}
+async function refreshAll() { await Promise.all([loadCollections(), loadPhotos(true)]); }
+
+async function uploadFiles(files) {
+  files = files.filter(f => f.type.startsWith("image/") || /\.(jpe?g|png|heic|webp|gif)$/i.test(f.name));
+  if (!files.length) return;
+  if (!S.coll || inTrash()) return say("pick a collection to upload into", "warn");
+  let ok = 0, failed = 0;
+  for (const f of files) {
+    say(`uploading ${ok + failed + 1}/${files.length} ${f.name}…`);
+    const q = new URLSearchParams({ collection: S.coll, taken_at: String(f.lastModified || Date.now()), meta: JSON.stringify({ source: "web", filename: f.name }) });
+    try { await api("POST", "/api/photos?" + q, undefined, { raw: f, timeout: 120000 }); ok++; } catch (e) { failed++; console.warn(f.name, e); }
+  }
+  say(`uploaded ${ok}/${files.length}` + (failed ? `, ${failed} failed` : ""), failed ? "bad" : "ok");
+  refreshAll();
+}
+
+function photoKeys(ev) {
+  if (ev.target.matches("input,textarea,select") || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  const n = S.photos.length;
+  let perRow = 1;
+  if (S.view === "grid") { const g = $("#grid"); if (g) perRow = getComputedStyle(g).gridTemplateColumns.split(" ").length; }
+  const go = i => { if (!n) return; i = Math.max(0, Math.min(n - 1, i)); pick(i, ev.shiftKey ? { shiftKey: true } : null); $(`[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" }); };
+  const k = ev.key;
+  if (k === "ArrowRight" || k === "l") go(S.cur + 1);
+  else if (k === "ArrowLeft" || k === "h") go(S.cur - 1);
+  else if (k === "ArrowDown" || k === "j") go(S.cur + perRow);
+  else if (k === "ArrowUp" || k === "k") go(S.cur - perRow);
+  else if (k === "x" || k === " ") { const p = S.photos[S.cur]; if (p) { S.sel.has(p.token) ? S.sel.delete(p.token) : S.sel.add(p.token); S.anchor = S.cur; renderPhotos(); } }
+  else if (k === "a") $("#b-all").click();
+  else if (k === "Escape") { if ($("#detail").classList.contains("on")) closeDetail(); else { S.sel.clear(); renderPhotos(); } }
+  else if (k === "Delete" || k === "Backspace") { if (!inTrash()) batch("delete"); }
+  else if (k === "m") batch("move");
+  else if (k === "c") { if (!inTrash()) batch("copy"); }
+  else if (k === "r") { if (inTrash()) batch("restore"); else refreshAll(); }
+  else if (k === "v") toggleView();
+  else if (k === "+" || k === "=") setTile(S.tile + 24);
+  else if (k === "-") setTile(S.tile - 24);
+  else return;
+  ev.preventDefault();
+}
+
+// ---------------------------------------------------------------------------- feeds tab
+async function feedsTab() {
+  main.innerHTML = `<div class="pane"><div class="cols"><div><h3>feeds</h3><div id="f-feeds"></div></div><div><h3>consumers</h3><div id="f-cursors"></div></div></div>
+    <h3>tail <span class="dim" style="font-weight:400">— newest 40 entries per feed, by feed_sync_id</span></h3><div id="f-tail"></div>
+    <h3>consume</h3><pre class="dim" style="margin:0">curl -H "Authorization: Bearer $SNAPZ_TOKEN" "${esc(location.origin)}/_feeds/fetch/photos?after=0&limit=100&collection=pantry"
+→ {"feed":"photos","entries":[…],"cursor":N}   # poll again with after=N; scripts/snapz.py wraps this loop</pre></div>`;
+  startPoll(async () => {
+    const st = await api("GET", "/_feeds/status");
+    const seq = Object.fromEntries(st.feeds.map(f => [f.feed, f.sequence]));
+    $("#f-feeds").innerHTML = `<table><thead><tr><th>feed</th><th class="n">sequence</th><th class="n">rows</th><th class="n">pending</th><th class="n">unpub</th></tr></thead><tbody>` +
+      st.feeds.map(f => `<tr><td>${esc(f.feed)}</td><td class="n">${f.sequence}</td><td class="n">${f.rows}</td><td class="n ${f.pending ? "warn" : "dim"}">${f.pending}</td><td class="n dim">${f.unpublished}</td></tr>`).join("") + `</tbody></table>`;
+    $("#f-cursors").innerHTML = st.cursors.length ? `<table><thead><tr><th>consumer</th><th>feed</th><th class="n">shard</th><th class="n">cursor</th><th class="n">lag</th><th>updated</th><th class="n">age</th><th></th></tr></thead><tbody>` +
+      st.cursors.map(c => `<tr><td>${esc(c.consumer)}</td><td>${esc(c.feed)}</td><td class="n dim">${c.shard}/${c.shard_count}</td><td class="n">${c.cursor}</td>
+        <td class="n ${c.lag > 100 ? "bad" : c.lag > 0 ? "warn" : "ok"}">${c.lag ?? ""}</td><td>${fmtTs(c.updated_at)}</td><td class="n dim">${age(c.updated_at)}</td>
+        <td><button data-rewind="${esc(c.consumer)}" data-feed="${esc(c.feed)}" data-shard="${c.shard}" data-sc="${c.shard_count}" title="set cursor to 0: replay the whole feed">rewind</button></td></tr>`).join("") + `</tbody></table>`
+      : `<span class="dim">no consumers have stored a cursor yet</span>`;
+    const tails = await Promise.all(st.feeds.map(f => api("GET", `/_feeds/fetch/${f.feed}?after=${Math.max(0, f.sequence - 40)}&limit=40`)));
+    const rows = tails.flatMap(t => t.entries.map(e => ({ feed: t.feed, e }))).sort((a, b) => (b.e.updated_at || "").localeCompare(a.e.updated_at || "")).slice(0, 80);
+    $("#f-tail").innerHTML = `<table><thead><tr><th>feed</th><th class="n">fsi</th><th>updated</th><th class="n">age</th><th>key</th><th>state</th><th>summary</th></tr></thead><tbody>` +
+      rows.map(({ feed, e }) => {
+        const key = feed === "photos" ? `${e.collection}/${e.token}` : feed === "records" ? `${e.ns}/${e.k}` : e.slug;
+        const sum = feed === "photos" ? [e.barcodes.join(" "), e.note].filter(Boolean).join(" · ") : feed === "records" ? JSON.stringify(e.v) : `${e.name} (${e.photo_count})`;
+        return `<tr><td>${esc(feed)}</td><td class="n">${e.feed_sync_id}</td><td>${fmtTs(e.updated_at)}</td><td class="n dim">${age(e.updated_at)}</td><td>${esc(key)}</td>
+          <td class="${e.deleted_at ? "bad" : "ok"}">${e.deleted_at ? "DEL" : "live"}</td><td class="wrap dim">${esc((sum || "").slice(0, 300))}</td></tr>`;
+      }).join("") + `</tbody></table>`;
+    $("#f-cursors").querySelectorAll("[data-rewind]").forEach(b => b.onclick = async () => {
+      if (!confirm(`Rewind '${b.dataset.rewind}' on ${b.dataset.feed} to 0? It will reprocess every entry.`)) return;
+      await run("rewind", () => api("PUT", `/_feeds/cursors/${encodeURIComponent(b.dataset.rewind)}`, { feed: b.dataset.feed, cursor: 0, shard: +b.dataset.shard, shard_count: +b.dataset.sc }));
+    });
+    void seq;
+  }, 3000);
+}
+
+// ---------------------------------------------------------------------------- records tab
+async function recordsTab() {
+  main.innerHTML = `<div id="side"></div><div class="pane" id="r-main"></div>`;
+  const load = async () => {
+    const nss = (await api("GET", "/api/records")).namespaces;
+    if (!S.recNs || !nss.some(n => n.ns === S.recNs)) S.recNs = nss[0]?.ns ?? null;
+    $("#side").innerHTML = `<table><thead><tr><th>namespace</th><th class="n">n</th><th class="n">upd</th></tr></thead><tbody>` +
+      nss.map(n => `<tr data-ns="${esc(n.ns)}" class="${n.ns === S.recNs ? "on" : ""}"><td>${esc(n.ns)}</td><td class="n">${n.count}</td><td class="n dim">${age(n.updated_at)}</td></tr>`).join("") + `</tbody></table>` +
+      (nss.length ? "" : `<div class="dim" style="padding:4px 6px">no records yet — transforms write here (PUT /api/records/{ns}/{k})</div>`);
+    $("#side").querySelectorAll("tr[data-ns]").forEach(tr => tr.onclick = () => { S.recNs = tr.dataset.ns; load(); });
+    if (!S.recNs) { $("#r-main").innerHTML = ""; return; }
+    const recs = (await api("GET", `/api/records/${encodeURIComponent(S.recNs)}?limit=2000`)).records;
+    // Object-valued records become columns: one column per top-level key seen in the namespace.
+    const keys = [...new Set(recs.flatMap(r => r.v && typeof r.v === "object" && !Array.isArray(r.v) ? Object.keys(r.v) : []))].slice(0, 12);
+    const cell = v => v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v);
+    $("#r-main").innerHTML = `<h3>${esc(S.recNs)} <span class="dim" style="font-weight:400">${recs.length} records</span></h3>
+      <table><thead><tr><th>k</th>${keys.length ? keys.map(k => `<th${recs.every(r => typeof (r.v ?? {})[k] !== "string") ? ' class="n"' : ""}>${esc(k)}</th>`).join("") : "<th>v</th>"}<th>updated</th><th class="n">age</th><th class="n">fsi</th><th></th></tr></thead><tbody>` +
+      recs.map(r => `<tr><td>${esc(r.k)}</td>${keys.length ? keys.map(k => `<td class="${typeof (r.v ?? {})[k] === "number" ? "n" : ""}" style="max-width:340px;overflow:hidden;text-overflow:ellipsis" title="${esc(cell((r.v ?? {})[k]))}">${esc(cell((r.v ?? {})[k]))}</td>`).join("") : `<td class="wrap">${esc(cell(r.v))}</td>`}
+        <td>${fmtTs(r.updated_at)}</td><td class="n dim">${age(r.updated_at)}</td><td class="n ${r.feed_sync_id == null ? "warn" : "dim"}">${r.feed_sync_id ?? "pend"}</td>
+        <td><button class="danger" data-del="${esc(r.k)}">del</button></td></tr>`).join("") + `</tbody></table>`;
+    $("#r-main").querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
+      await run("delete record", () => api("DELETE", `/api/records/${encodeURIComponent(S.recNs)}/${encodeURIComponent(b.dataset.del)}`)); load();
+    });
+  };
+  startPoll(load, 5000);
+}
+
+// ---------------------------------------------------------------------------- tokens tab
+async function tokensTab() {
+  main.innerHTML = `<div class="pane"><h3>credentials</h3><div id="k-list"></div>
+    <h3>mint a script token</h3><form id="k-new"><input id="k-name" placeholder="name, e.g. pantry-orders" size="32"> <button>create</button></form><div id="k-out"></div></div>`;
+  const load = async () => {
+    const toks = (await api("GET", "/api/tokens")).tokens;
+    $("#k-list").innerHTML = `<table><thead><tr><th class="n">id</th><th>kind</th><th>name</th><th>principal</th><th>created</th><th>last used</th><th class="n">age</th><th>expires</th><th></th></tr></thead><tbody>` +
+      toks.map(t => `<tr><td class="n dim">${t.id}</td><td class="${t.kind === "script" ? "acc" : t.kind === "device" ? "ok" : "dim"}">${esc(t.kind)}</td><td>${esc(t.name)}</td><td>${esc(t.principal)}</td>
+        <td>${fmtTs(t.created_at)}</td><td>${fmtTs(t.last_used_at) || '<span class="dim">never</span>'}</td><td class="n dim">${age(t.last_used_at)}</td><td class="dim">${fmtTs(t.expires_at) || "—"}</td>
+        <td><button class="danger" data-rev="${t.id}">revoke</button></td></tr>`).join("") + `</tbody></table>`;
+    $("#k-list").querySelectorAll("[data-rev]").forEach(b => b.onclick = async () => {
+      if (!confirm("Revoke this credential? Anything using it stops working immediately.")) return;
+      await run("revoke", () => api("DELETE", `/api/tokens/${b.dataset.rev}`)); load();
+    });
+  };
+  $("#k-new").onsubmit = async ev => {
+    ev.preventDefault();
+    const name = $("#k-name").value.trim(); if (!name) return;
+    const t = await run("create token", () => api("POST", "/api/tokens", { name }));
+    $("#k-out").innerHTML = `<p class="warn">Copy it now — only its hash is stored, it can't be shown again.</p><pre style="user-select:all">${esc(t.token)}</pre>
+      <pre class="dim">export SNAPZ_URL=${esc(location.origin)}\nexport SNAPZ_TOKEN=${esc(t.token)}\ncurl -H "Authorization: Bearer $SNAPZ_TOKEN" $SNAPZ_URL/api/collections</pre>`;
+    $("#k-name").value = ""; load();
+  };
+  load();
+}
+
+// ---------------------------------------------------------------------------- shell
+function setTab(tab) {
+  S.tab = tab; stopPoll();
+  document.querySelectorAll("#top .tab").forEach(t => t.classList.toggle("on", t.dataset.tab === tab));
+  $("#st-keys").textContent = tab === "photos" ? "←↑↓→ move · x sel · ⇧click range · ⌘click toggle · m move · c copy · ⌫ del · v view · +/- size · esc" : "";
+  if (tab === "photos") { photosShell(); refreshAll(); }
+  else if (tab === "feeds") feedsTab();
+  else if (tab === "records") recordsTab();
+  else tokensTab();
+}
+document.querySelectorAll("#top .tab").forEach(t => t.onclick = () => { if (S.me) setTab(t.dataset.tab); });
+document.addEventListener("keydown", ev => { if (S.me && S.tab === "photos") photoKeys(ev); });
+
+async function boot() {
+  try { S.me = await api("GET", "/api/me"); } catch (e) { if (e.status !== 401) say("server unreachable: " + e.message, "bad"); return; }
+  $("#who").textContent = S.me.principal; $("#logout").classList.remove("hide");
+  const h = decodeURIComponent(location.hash.slice(1));
+  S.coll = h || null;
+  setTab("photos");
+}
+boot();
+</script>
+</body>
+</html>
