@@ -13,7 +13,6 @@ import java.sql.Connection
 import java.sql.ResultSet
 import java.time.Clock
 import java.time.Instant
-import java.time.ZoneOffset
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -140,22 +139,34 @@ class TransformStore @Inject constructor(
 
   // ---- chains
 
-  fun chain(collection: String): List<ChainLinkDto> = db.tx { c -> chain(c, collections.idOf(c, collection)) }
+  fun chain(vaultId: Long, collection: String): List<ChainLinkDto> = db.tx { c -> chain(c, collections.idOf(c, vaultId, collection)) }
 
   private fun chain(c: Connection, collectionId: Long) =
     c.select("SELECT position, transform, params FROM collection_transforms WHERE collection_id = ? ORDER BY position", listOf(collectionId)) {
       ChainLinkDto(it.getInt(1), it.getString(2), it.getString(3)?.let(json::parseObject))
     }
 
-  /** Replaces the whole chain. Photos already in the collection are not re-run; new arrivals are. */
-  fun setChain(collection: String, links: List<Pair<String, Map<String, Any?>?>>): List<ChainLinkDto> = db.tx { c ->
-    val cid = collections.idOf(c, collection)
+  /** Replaces the whole chain. Photos already in the collection are not re-run (see [backfill]); new arrivals are. */
+  fun setChain(vaultId: Long, collection: String, links: List<Pair<String, Map<String, Any?>?>>): List<ChainLinkDto> = db.tx { c ->
+    val cid = collections.idOf(c, vaultId, collection)
     links.forEach { requireTransform(c, it.first) }
     c.exec("DELETE FROM collection_transforms WHERE collection_id = ?", listOf(cid))
     links.forEachIndexed { i, (name, params) ->
       c.exec("INSERT INTO collection_transforms (collection_id, position, transform, params) VALUES (?,?,?,?)", listOf(cid, i, name, params?.let(json::write)))
     }
     chain(c, cid)
+  }
+
+  /**
+   * Start the chain for photos that were already in the collection when it was set. By default
+   * only photos this collection's chain has never touched; [all] restarts it for every live photo.
+   * Returns how many chains were started.
+   */
+  fun backfill(vaultId: Long, collection: String, all: Boolean): Int = db.tx { c ->
+    val cid = collections.idOf(c, vaultId, collection)
+    val untouched = if (all) "" else "AND NOT EXISTS (SELECT 1 FROM transform_intents i WHERE i.photo_id = p.id AND i.collection_id = p.collection_id AND i.origin = 'chain')"
+    c.select("SELECT p.id FROM photos p WHERE p.collection_id = ? AND p.deleted_at_ms IS NULL $untouched ORDER BY p.id", listOf(cid)) { it.getLong(1) }
+      .count { lineage.advanceChain(c, it, cid, null) != null }
   }
 
   // ---- intents + results
@@ -219,6 +230,14 @@ class TransformStore @Inject constructor(
     }
   }
 
+  /** Slug of the vault an intent's photo lives in; null once the photo is purged. */
+  fun vaultOfIntent(token: String): String? = db.tx { c ->
+    c.select(
+      "SELECT vt.slug FROM transform_intents i JOIN photos p ON p.id = i.photo_id JOIN collections c ON c.id = p.collection_id JOIN vaults vt ON vt.id = c.vault_id WHERE i.token = ?",
+      listOf(token),
+    ) { it.getString(1) }.firstOrNull()
+  }
+
   fun intent(token: String): IntentDto = db.tx { c -> intents(c, "i.token = ?", listOf(token)).firstOrNull() } ?: throw NotFoundException("no intent '$token'")
 
   /** Ad-hoc request, outside any chain. */
@@ -231,9 +250,10 @@ class TransformStore @Inject constructor(
   }
 
   /** Intents with no result yet, oldest first. [builtinOnly] is what the in-process worker asks for. */
-  fun pending(transform: String?, builtinOnly: Boolean, limit: Int): List<IntentDto> = db.tx { c ->
+  fun pending(transform: String?, builtinOnly: Boolean, limit: Int, vaultId: Long? = null): List<IntentDto> = db.tx { c ->
     val conds = mutableListOf("NOT EXISTS (SELECT 1 FROM transform_results r WHERE r.intent_id = i.id)")
     val args = mutableListOf<Any?>()
+    if (vaultId != null) { conds += "c.vault_id = ?"; args += vaultId }
     if (transform != null) { conds += "i.transform = ?"; args += transform }
     if (builtinOnly) conds += "i.transform IN (SELECT name FROM transforms WHERE builtin = 1)"
     intents(c, conds.joinToString(" AND ") + " ORDER BY i.id LIMIT ${limit.coerceIn(1, 500)}", args)
@@ -319,21 +339,24 @@ class TransformStore @Inject constructor(
     return photos.get(photoToken)
   }
 
-  fun intentFeed(after: Long, limit: Int, shard: Int?, shardCount: Int?, transform: String?): List<IntentDto> = db.tx { c ->
+  /** [vaultId] filters by where the photo lives now; intents of purged photos belong to no vault. */
+  fun intentFeed(after: Long, limit: Int, shard: Int?, shardCount: Int?, vaultId: Long?, transform: String?): List<IntentDto> = db.tx { c ->
     val (cond, shardArgs) = shardCond("i", shard, shardCount)
     val args = mutableListOf<Any?>(after)
     args.addAll(shardArgs)
     var t = ""
-    if (transform != null) { t = "AND i.transform = ?"; args += transform }
+    if (vaultId != null) { t += " AND c.vault_id = ?"; args += vaultId }
+    if (transform != null) { t += " AND i.transform = ?"; args += transform }
     intents(c, "i.feed_sync_id > ? AND i.shard >= 0 $cond $t ORDER BY i.feed_sync_id LIMIT ?", args + limit)
   }
 
-  fun resultFeed(after: Long, limit: Int, shard: Int?, shardCount: Int?, transform: String?): List<ResultDto> = db.tx { c ->
+  fun resultFeed(after: Long, limit: Int, shard: Int?, shardCount: Int?, vaultId: Long?, transform: String?): List<ResultDto> = db.tx { c ->
     val (cond, shardArgs) = shardCond("r", shard, shardCount)
     val args = mutableListOf<Any?>(after)
     args.addAll(shardArgs)
     var t = ""
-    if (transform != null) { t = "AND r.transform = ?"; args += transform }
+    if (vaultId != null) { t += " AND p.collection_id IN (SELECT id FROM collections WHERE vault_id = ?)"; args += vaultId }
+    if (transform != null) { t += " AND r.transform = ?"; args += transform }
     results(c, "r.feed_sync_id > ? AND r.shard >= 0 $cond $t", args + limit, "ORDER BY r.feed_sync_id LIMIT ?").map { it.second }
   }
 }
@@ -342,7 +365,10 @@ class TransformStore @Inject constructor(
 // Where does this photo belong?
 // ---------------------------------------------------------------------------------------------
 
-data class Suggestion(val collection: String, val p: Double)
+data class ActionSuggestion(val action: String, val p: Double)
+
+/** [actions]: the collection's verbs ranked for this photo; null when it has none. */
+data class Suggestion(val collection: String, val p: Double, val actions: List<ActionSuggestion>? = null)
 data class InboxItem(val photo: PhotoDto, val suggestions: List<Suggestion>, val features: Map<String, String>)
 
 /**
@@ -350,7 +376,7 @@ data class InboxItem(val photo: PhotoDto, val suggestions: List<Suggestion>, val
  * feature is categorical and cheap:
  *
  *   barcode   yes / no
- *   hour      UTC hour in 3h buckets (a stand-in for "breakfast vs. office hours")
+ *   hour      local hour (config `timezone`) in 3h buckets: "breakfast vs. office hours"
  *   weekend   yes / no
  *   shape     portrait / landscape / square
  *   source    meta.source (ios / web / cli / …)
@@ -359,7 +385,8 @@ data class InboxItem(val photo: PhotoDto, val suggestions: List<Suggestion>, val
  *
  * Counts get add-one smoothing; the prior is the collection's share of all filed photos. The
  * inbox itself and trashed photos are never training data. With nothing filed yet, every
- * collection is equally likely.
+ * collection is equally likely. Each vault is its own model: its collections are the classes and
+ * only its photos are evidence.
  */
 @Singleton
 class Suggester @Inject constructor(
@@ -367,7 +394,38 @@ class Suggester @Inject constructor(
   private val config: SnapzConfig,
   private val json: Json,
 ) {
-  private class Row(val id: Long, val collection: String, val takenMs: Long, val features: MutableMap<String, String>)
+  private class Row(val id: Long, val collection: String, val takenMs: Long, val features: MutableMap<String, String>, val action: String?)
+
+  /** Naive Bayes with add-one smoothing over categorical features. */
+  private class Model(train: List<Pair<String, Map<String, String>>>, private val classes: List<String>) {
+    private val n = train.size
+    private val perClass = train.groupingBy { it.first }.eachCount()
+    private val counts = HashMap<Triple<String, String, String>, Int>() // (class, feature, value) -> n
+    private val values = HashMap<String, MutableSet<String>>()          // feature -> distinct values seen
+
+    init {
+      for ((k, fs) in train) for ((f, v) in fs) {
+        counts.merge(Triple(k, f, v), 1, Int::plus)
+        values.getOrPut(f) { mutableSetOf() }.add(v)
+      }
+    }
+
+    /** (class, probability), most likely first. */
+    fun rank(features: Map<String, String>): List<Pair<String, Double>> {
+      val logp = classes.associateWith { k ->
+        val nk = perClass[k] ?: 0
+        var lp = ln((nk + 1.0) / (n + classes.size))
+        for ((f, v) in features) {
+          val distinct = (values[f]?.size ?: 0) + if (values[f]?.contains(v) == true) 0 else 1
+          lp += ln(((counts[Triple(k, f, v)] ?: 0) + 1.0) / (nk + distinct))
+        }
+        lp
+      }
+      val max = logp.values.max()
+      val z = logp.values.sumOf { Math.exp(it - max) }
+      return logp.map { (k, lp) -> k to Math.round(Math.exp(lp - max) / z * 1000) / 1000.0 }.sortedWith(compareByDescending<Pair<String, Double>> { it.second }.thenBy { it.first })
+    }
+  }
 
   private fun shape(w: Int?, h: Int?) = when {
     w == null || h == null -> "unknown"
@@ -376,15 +434,19 @@ class Suggester @Inject constructor(
     else -> "square"
   }
 
-  private fun load(c: Connection): List<Row> = c.select(
+  private val zone = java.time.ZoneId.of(config.snapz.timezone)
+
+  private fun load(c: Connection, vaultId: Long): List<Row> = c.select(
     """
     SELECT p.id, c.slug, p.taken_at_ms, p.barcodes, p.width, p.height, p.meta
     FROM photos p JOIN collections c ON c.id = p.collection_id
-    WHERE p.deleted_at_ms IS NULL AND c.deleted_at_ms IS NULL ORDER BY p.taken_at_ms, p.id
+    WHERE c.vault_id = ? AND p.deleted_at_ms IS NULL AND c.deleted_at_ms IS NULL ORDER BY p.taken_at_ms, p.id
     """.trimIndent(),
+    listOf(vaultId),
   ) { rs ->
     val t = rs.getLong("taken_at_ms")
-    val at = Instant.ofEpochMilli(t).atZone(ZoneOffset.UTC)
+    val at = Instant.ofEpochMilli(t).atZone(zone)
+    val meta = try { json.parseObject(rs.getString("meta")) } catch (e: Exception) { mapOf() }
     Row(
       rs.getLong("id"), rs.getString("slug"), t,
       mutableMapOf(
@@ -392,15 +454,20 @@ class Suggester @Inject constructor(
         "hour" to "h%02d".format(at.hour / 3 * 3),
         "weekend" to if (at.dayOfWeek.value >= 6) "yes" else "no",
         "shape" to shape(rs.intOrNull("width"), rs.intOrNull("height")),
-        "source" to ((try { json.parseObject(rs.getString("meta"))["source"] } catch (e: Exception) { null }) as? String ?: "unknown"),
+        "source" to (meta["source"] as? String ?: "unknown"),
       ),
+      meta["action"] as? String,
     )
   }
 
-  /** Ranked destinations for each requested photo id (all inbox photos when null). */
-  fun suggest(c: Connection, photoIds: Set<Long>?): Map<Long, Pair<List<Suggestion>, Map<String, String>>> {
+  /**
+   * Ranked destinations within [vaultId] for each requested photo id (all of its inbox photos when
+   * null). A destination with an action set also ranks its verbs, by the same model trained on
+   * how photos in that collection were filed.
+   */
+  fun suggest(c: Connection, vaultId: Long, photoIds: Set<Long>?): Map<Long, Pair<List<Suggestion>, Map<String, String>>> {
     val inbox = config.snapz.inbox_slug
-    val rows = load(c)
+    val rows = load(c, vaultId)
     // prev: nearest earlier *filed* photo within the window.
     var lastFiled: Row? = null
     for (r in rows) {
@@ -408,29 +475,18 @@ class Suggester @Inject constructor(
       if (r.collection != inbox) lastFiled = r
     }
     val train = rows.filter { it.collection != inbox }
-    val classes = c.select("SELECT slug FROM collections WHERE deleted_at_ms IS NULL AND slug <> ? ORDER BY slug", listOf(inbox)) { it.getString(1) }
-    if (classes.isEmpty()) return mapOf()
-    val perClass = train.groupingBy { it.collection }.eachCount()
-    val counts = HashMap<Triple<String, String, String>, Int>() // (class, feature, value) -> n
-    val values = HashMap<String, MutableSet<String>>()          // feature -> distinct values seen
-    for (r in train) for ((f, v) in r.features) {
-      counts.merge(Triple(r.collection, f, v), 1, Int::plus)
-      values.getOrPut(f) { mutableSetOf() }.add(v)
+    val classes = c.select("SELECT slug, actions FROM collections WHERE vault_id = ? AND deleted_at_ms IS NULL AND slug <> ? ORDER BY slug", listOf(vaultId, inbox)) {
+      it.getString(1) to it.getString(2)
     }
+    if (classes.isEmpty()) return mapOf()
+    val model = Model(train.map { it.collection to it.features }, classes.map { it.first })
+    val actionModels = classes.mapNotNull { (slug, text) ->
+      val names = (text?.let { runCatching { json.parse(it) as? List<*> }.getOrNull() }).orEmpty().mapNotNull { (it as? Map<*, *>)?.get("name")?.toString() }
+      if (names.isEmpty()) null else slug to Model(train.filter { it.collection == slug && it.action in names }.map { it.action!! to it.features }, names)
+    }.toMap()
     val targets = rows.filter { if (photoIds != null) it.id in photoIds else it.collection == inbox }
     return targets.associate { r ->
-      val logp = classes.associateWith { k ->
-        val nk = perClass[k] ?: 0
-        var lp = ln((nk + 1.0) / (train.size + classes.size))
-        for ((f, v) in r.features) {
-          val distinct = (values[f]?.size ?: 0) + if (values[f]?.contains(v) == true) 0 else 1
-          lp += ln(((counts[Triple(k, f, v)] ?: 0) + 1.0) / (nk + distinct))
-        }
-        lp
-      }
-      val max = logp.values.max()
-      val z = logp.values.sumOf { Math.exp(it - max) }
-      r.id to (logp.map { (k, lp) -> Suggestion(k, Math.round(Math.exp(lp - max) / z * 1000) / 1000.0) }.sortedWith(compareByDescending<Suggestion> { it.p }.thenBy { it.collection }) to r.features.toMap())
+      r.id to (model.rank(r.features).map { (k, p) -> Suggestion(k, p, actionModels[k]?.rank(r.features)?.map { ActionSuggestion(it.first, it.second) }) } to r.features.toMap())
     }
   }
 
@@ -462,7 +518,10 @@ class Builtins @Inject constructor(
 ) {
   val all: List<Builtin> = listOf(
     Builtin("suggest-collection", "extract", "Ranks collections for a photo by naive Bayes over how past photos were filed (barcode, hour, weekend, shape, source, burst). Feeds inbox triage.") { _, photo ->
-      val (suggestions, features) = db.tx { c -> suggester.suggest(c, setOf(photos.idOf(c, photo.token).first)) }.values.firstOrNull() ?: (listOf<Suggestion>() to mapOf())
+      val (suggestions, features) = db.tx { c ->
+        val id = photos.idOf(c, photo.token).first
+        photos.vaultIdOf(c, id)?.let { suggester.suggest(c, it, setOf(id)) }.orEmpty()
+      }.values.firstOrNull() ?: (listOf<Suggestion>() to mapOf())
       TransformOutcome(data = mapOf("suggestions" to suggestions.map { mapOf("collection" to it.collection, "p" to it.p) }, "features" to features))
     },
     Builtin("barcodes", "extract", "Decodes barcodes server-side (ZXing) and merges them into meta.barcodes with boxes. For uploads that didn't come through the phone's decoder.") { intent, photo ->
@@ -574,13 +633,13 @@ class Builtins @Inject constructor(
   }
 }
 
-/** Seeds the library (and the inbox), then works off pending intents for built-in transforms. */
+/** Seeds the library (and the default vault, and inboxes), then works off pending intents for built-in transforms. */
 @Singleton
 class TransformRunner @Inject constructor(
   private val store: TransformStore,
   private val builtins: Builtins,
   private val photos: PhotoStore,
-  private val collections: CollectionStore,
+  private val vaults: VaultStore,
   private val blobs: BlobStore,
   private val config: SnapzConfig,
 ) : AbstractIdleService() {
@@ -605,11 +664,7 @@ class TransformRunner @Inject constructor(
 
   fun seed() {
     builtins.all.forEach { store.register(it.name, it.kind, it.description, builtin = true) }
-    val inbox = config.snapz.inbox_slug
-    if (config.snapz.auto_create_inbox && collections.list().none { it.slug == inbox }) {
-      collections.create(inbox, "Inbox", "Snap first, file later: photos here are ranked for triage.", "📥")
-      store.setChain(inbox, listOf("suggest-collection" to null))
-    }
+    vaults.seed()
   }
 
   /** Runs every pending built-in intent, including ones queued by the results it writes. */

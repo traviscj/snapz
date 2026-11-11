@@ -22,8 +22,12 @@ data class SnapzSettings(
   val transform_interval_ms: Long = 500,
   /** Where "snap first, file later" photos land; GET /api/inbox ranks destinations for them. */
   val inbox_slug: String = "inbox",
-  /** Create the inbox (with the suggest-collection transform attached) at startup if missing. */
+  /** Give every vault an inbox (with the suggest-collection transform attached). */
   val auto_create_inbox: Boolean = true,
+  /** The vault a request lands in when it names none (no X-Snapz-Vault header / ?vault=). Created at startup. */
+  val default_vault: String = "personal",
+  /** Zone for the time-of-day features of inbox ranking ("breakfast" is local, not UTC). */
+  val timezone: String = "UTC",
   /** Data shards assigned at write time; consumer shards map onto these by modulus. */
   val feed_shards: Int = 16,
   val thumb_px: Int = 400,
@@ -49,8 +53,14 @@ data class OidcConfig(
   override fun toString() = "OidcConfig(issuer=$issuer, client_id=$client_id, client_secret=████)"
 }
 
-data class BootstrapToken(val token: String, val principal: String) {
-  override fun toString() = "BootstrapToken(principal=$principal)"
+data class BootstrapToken(
+  val token: String,
+  val principal: String,
+  /** Pin the token to one vault (slug). null = every vault, plus admin routes. */
+  val vault: String? = null,
+  val read_only: Boolean = false,
+) {
+  override fun toString() = "BootstrapToken(principal=$principal, vault=$vault, read_only=$read_only)"
 }
 
 @Qualifier

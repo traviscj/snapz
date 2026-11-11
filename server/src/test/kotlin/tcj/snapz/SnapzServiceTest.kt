@@ -99,7 +99,7 @@ class SnapzServiceTest {
   fun setUp() {
     db.tx { c ->
       for (t in listOf(
-        "photos", "collections", "records", "api_tokens", "sequences", "feed_cursors",
+        "photos", "collections", "records", "vaults", "api_tokens", "sequences", "feed_cursors",
         "photo_versions", "transforms", "collection_transforms", "transform_intents", "transform_results",
       )) c.exec("DELETE FROM $t")
     }
@@ -110,7 +110,7 @@ class SnapzServiceTest {
 
   private fun url(path: String) = jetty.httpServerUrl.resolve(path)!!
 
-  private fun call(method: String, path: String, body: Any? = null, token: String? = "test-token", cookie: String? = null, raw: ByteArray? = null): Response {
+  private fun call(method: String, path: String, body: Any? = null, token: String? = "test-token", cookie: String? = null, raw: ByteArray? = null, vault: String? = null): Response {
     val rb = when {
       raw != null -> raw.toRequestBody("application/octet-stream".toMediaType())
       body is String -> body.toRequestBody(jsonType)
@@ -121,6 +121,7 @@ class SnapzServiceTest {
     val req = Request.Builder().url(url(path)).method(method, rb)
     token?.let { req.header("Authorization", "Bearer $it") }
     cookie?.let { req.header("Cookie", it) }
+    vault?.let { req.header("X-Snapz-Vault", it) }
     return http.newCall(req.build()).execute()
   }
 
@@ -131,7 +132,7 @@ class SnapzServiceTest {
     return json.parseObject(text)
   }
 
-  private fun api(method: String, path: String, body: Any? = null) = obj(call(method, path, body))
+  private fun api(method: String, path: String, body: Any? = null, vault: String? = null) = obj(call(method, path, body, vault = vault))
 
   @Suppress("UNCHECKED_CAST")
   private fun Map<String, Any?>.list(key: String) = this[key] as List<Map<String, Any?>>
@@ -145,6 +146,9 @@ class SnapzServiceTest {
   private fun upload(collection: String, bytes: ByteArray, query: String = "") = obj(call("POST", "/api/photos?collection=$collection$query", raw = bytes))
 
   private fun enc(s: String) = java.net.URLEncoder.encode(s, Charsets.UTF_8)
+
+  @Suppress("UNCHECKED_CAST")
+  private fun meta(photo: Map<String, Any?>) = photo["meta"] as Map<String, Any?>
 
   // -------------------------------------------------------------------------------- tests
 
@@ -289,7 +293,7 @@ class SnapzServiceTest {
 
     // nothing is visible until published
     assertThat(api("GET", "/_feeds/fetch/photos").list("entries")).isEmpty()
-    assertThat(api("POST", "/_feeds/publish")["published"]).isEqualTo(5L)
+    assertThat(api("POST", "/_feeds/publish")["published"]).isEqualTo(6L)   // 3 photos, 2 collections, the default vault
 
     val page1 = api("GET", "/_feeds/fetch/photos?limit=2")
     assertThat(page1.list("entries").map { it["token"] }).isEqualTo(listOf(t1, t2))
@@ -668,6 +672,173 @@ class SnapzServiceTest {
     // filing = a move; it leaves the inbox and enters the destination
     api("PATCH", "/api/photos/${scanned["token"]}", mapOf("collection" to "pantry"))
     assertThat(api("GET", "/api/inbox").list("photos").map { (it["photo"] as Map<*, *>)["token"] }).doesNotContain(scanned["token"])
+  }
+
+  // -------------------------------------------------------------------------------- vaults
+
+  @Test
+  fun `vaults namespace collections, photos, records and feeds`() {
+    assertThat(api("GET", "/api/vaults").list("vaults").map { it["slug"] }).containsExactly("personal")
+    val work = api("POST", "/api/vaults", mapOf("name" to "Work", "icon" to "💼"))
+    assertThat(work).containsEntry("slug", "work").containsEntry("is_default", false)
+    assertThat(call("POST", "/api/vaults", mapOf("name" to "Work")).code).isEqualTo(409)
+
+    // the same slug in two vaults is two collections; no vault named = the default one
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    api("POST", "/api/collections", mapOf("name" to "pantry"), vault = "work")
+    val mine = upload("pantry", jpeg(color = Color.RED))
+    val theirs = obj(call("POST", "/api/photos?collection=pantry&vault=work", raw = jpeg(color = Color.BLUE)))
+    assertThat(mine["vault"]).isEqualTo("personal")
+    assertThat(theirs["vault"]).isEqualTo("work")
+    assertThat(api("GET", "/api/photos").list("photos").map { it["token"] }).containsExactly(mine["token"])
+    assertThat(api("GET", "/api/photos", vault = "work").list("photos").map { it["token"] }).containsExactly(theirs["token"])
+    assertThat(api("GET", "/api/collections", vault = "work").list("collections").single()).containsEntry("photo_count", 1L).containsEntry("vault", "work")
+    assertThat(call("GET", "/api/collections", vault = "nope").code).isEqualTo(404)
+
+    // records: same (ns, k), different vaults
+    obj(call("PUT", "/api/records/order_items/x", "1"))
+    obj(call("PUT", "/api/records/order_items/x", "2", vault = "work"))
+    assertThat(api("GET", "/api/records/order_items/x")["v"]).isEqualTo(1L)
+    assertThat(api("GET", "/api/records/order_items/x", vault = "work")["v"]).isEqualTo(2L)
+
+    // feeds: everything by default (each entry says where it lives), one vault when named
+    publisher.publishAll()
+    assertThat(api("GET", "/_feeds/fetch/photos").list("entries").map { it["vault"] }).containsExactlyInAnyOrder("personal", "work")
+    assertThat(api("GET", "/_feeds/fetch/photos", vault = "work").list("entries").map { it["token"] }).containsExactly(theirs["token"])
+    assertThat(api("GET", "/_feeds/fetch/records", vault = "work").list("entries").map { it["v"] }).containsExactly(2L)
+    assertThat(api("GET", "/_feeds/fetch/vaults").list("entries").map { it["slug"] }).contains("work")
+
+    // a photo is addressed by token wherever it is; moving it to a collection moves it into the request's vault
+    val moved = api("PATCH", "/api/photos/${mine["token"]}", mapOf("collection" to "pantry"), vault = "work")
+    assertThat(moved["vault"]).isEqualTo("work")
+    assertThat(api("GET", "/api/vaults").list("vaults").first { it["slug"] == "work" }).containsEntry("photo_count", 2L).containsEntry("collection_count", 1L)
+
+    // deleting: not the default, not a non-empty one without force
+    assertThat(call("DELETE", "/api/vaults/personal").code).isEqualTo(409)
+    assertThat(call("DELETE", "/api/vaults/work").code).isEqualTo(409)
+    api("DELETE", "/api/vaults/work?force=true")
+    assertThat(api("GET", "/api/vaults").list("vaults").map { it["slug"] }).containsExactly("personal")
+    assertThat(api("GET", "/api/photos/${theirs["token"]}")["deleted_at"]).isNotNull()
+    api("POST", "/api/vaults", mapOf("name" to "Work"))                               // the slug is free again
+  }
+
+  @Test
+  fun `a token pinned to a vault sees only that vault and no admin routes`() {
+    api("POST", "/api/vaults", mapOf("name" to "work"))
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    api("POST", "/api/collections", mapOf("name" to "desk"), vault = "work")
+    val home = upload("pantry", jpeg(color = Color.RED))
+    val pinned = api("POST", "/api/tokens", mapOf("name" to "work-bot", "vault" to "work"))["token"] as String
+    assertThat(api("GET", "/api/tokens").list("tokens").single()).containsEntry("vault", "work").containsEntry("read_only", false)
+
+    val me = obj(call("GET", "/api/me", token = pinned))
+    assertThat(me).containsEntry("vault", "work").containsEntry("admin", false)
+    // naming nothing lands in its vault, not the default one
+    assertThat(obj(call("GET", "/api/collections", token = pinned)).list("collections").map { it["slug"] }).containsExactly("desk")
+    assertThat(obj(call("GET", "/api/vaults", token = pinned)).list("vaults").map { it["slug"] }).containsExactly("work")
+    assertThat(call("GET", "/api/collections", token = pinned, vault = "personal").code).isEqualTo(403)
+    // photos elsewhere don't exist for it, by token or as bytes
+    assertThat(call("GET", "/api/photos/${home["token"]}", token = pinned).code).isEqualTo(404)
+    assertThat(call("GET", "/blobs/${home["token"]}", token = pinned).code).isEqualTo(404)
+    assertThat(call("POST", "/api/photos/batch", mapOf("op" to "move", "tokens" to listOf(home["token"]), "collection" to "desk"), token = pinned).code).isEqualTo(404)
+    val own = obj(call("POST", "/api/photos?collection=desk", token = pinned, raw = jpeg(color = Color.GREEN)))
+    assertThat(call("GET", "/blobs/${own["token"]}", token = pinned).code).isEqualTo(200)
+    // its feed is its vault
+    publisher.publishAll()
+    assertThat(obj(call("GET", "/_feeds/fetch/photos", token = pinned)).list("entries").map { it["token"] }).containsExactly(own["token"])
+    // admin routes are off
+    for ((m, path) in listOf("GET" to "/api/tokens", "POST" to "/api/vaults", "POST" to "/api/admin/purge")) {
+      assertThat(call(m, path, if (m == "POST") mapOf("name" to "x") else null, token = pinned).code).withFailMessage { "$m $path" }.isEqualTo(403)
+    }
+    // a browser session started from it inherits the pin
+    val cookie = call("POST", "/auth/token-login", mapOf("token" to pinned), token = null).header("Set-Cookie")!!.substringBefore(';')
+    assertThat(obj(call("GET", "/api/me", token = null, cookie = cookie))).containsEntry("vault", "work")
+    // and the credential dies with the vault
+    api("DELETE", "/api/vaults/work?force=true")
+    assertThat(call("GET", "/api/me", token = pinned).code).isEqualTo(401)
+  }
+
+  @Test
+  fun `read-only and expiring tokens`() {
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    val ro = api("POST", "/api/tokens", mapOf("name" to "dashboard", "read_only" to true, "ttl_days" to 7))
+    val token = ro["token"] as String
+    val listed = api("GET", "/api/tokens").list("tokens").single()
+    assertThat(listed).containsEntry("read_only", true)
+    assertThat(listed["expires_at"]).isNotNull()
+    assertThat(obj(call("GET", "/api/me", token = token))).containsEntry("read_only", true).containsEntry("admin", false)
+    assertThat(call("GET", "/api/collections", token = token).code).isEqualTo(200)
+    assertThat(call("POST", "/api/collections", mapOf("name" to "x"), token = token).code).isEqualTo(403)
+    assertThat(call("POST", "/api/photos?collection=pantry", token = token, raw = jpeg()).code).isEqualTo(403)
+    assertThat(call("DELETE", "/api/collections/pantry", token = token).code).isEqualTo(403)
+    // the one write a feed consumer needs
+    assertThat(call("PUT", "/_feeds/cursors/dash", mapOf("feed" to "photos", "cursor" to 3), token = token).code).isEqualTo(200)
+    assertThat(call("POST", "/api/tokens", mapOf("name" to "x", "ttl_days" to 0)).code).isEqualTo(400)
+    db.tx { c -> c.exec("UPDATE api_tokens SET expires_at_ms = 1") }
+    assertThat(call("GET", "/api/me", token = token).code).isEqualTo(401)
+  }
+
+  @Test
+  fun `a chain can be backfilled over photos that were already there`() {
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    val a = upload("pantry", jpeg(color = Color.RED))
+    upload("pantry", jpeg(color = Color.BLUE))
+    setChain("pantry", "upright-2k")
+    assertThat(runner.runPending()).isEqualTo(0)                                       // setting a chain runs nothing
+    assertThat(api("POST", "/api/collections/pantry/transforms/run")["started"]).isEqualTo(2L)
+    assertThat(runner.runPending()).isEqualTo(2)
+    assertThat(api("GET", "/api/photos/${a["token"]}/history").list("versions")).hasSize(2)
+    assertThat(api("POST", "/api/collections/pantry/transforms/run")["started"]).isEqualTo(0L)   // only untouched photos
+    assertThat(api("POST", "/api/collections/pantry/transforms/run?all=true")["started"]).isEqualTo(2L)
+  }
+
+  @Test
+  fun `a collection's action set is the verbs a photo can be filed with`() {
+    for (n in listOf("pantry", "food", "inbox")) api("POST", "/api/collections", mapOf("name" to n))
+    val actions = listOf(mapOf("name" to "consume", "label" to "USE", "qty" to true), mapOf("name" to "out"), mapOf("name" to "purchase", "qty" to true))
+    val c = api("PUT", "/api/collections/pantry/actions", mapOf("actions" to actions))
+    assertThat(c.list("actions").map { it["name"] }).containsExactly("consume", "out", "purchase")
+    assertThat(c.list("actions")[0]).containsEntry("label", "USE").containsEntry("qty", true)
+    assertThat(api("GET", "/api/collections/food").list("actions")).isEmpty()
+    assertThat(call("PUT", "/api/collections/pantry/actions", mapOf("actions" to listOf(mapOf("name" to "Not OK")))).code).isEqualTo(400)
+
+    // filing = collection + verb; a verb outside the destination's set is refused
+    val p = upload("inbox", jpeg(color = Color.RED))
+    assertThat(call("PATCH", "/api/photos/${p["token"]}", mapOf("collection" to "pantry", "action" to "eat")).code).isEqualTo(400)
+    assertThat(call("PATCH", "/api/photos/${p["token"]}", mapOf("collection" to "food", "action" to "consume")).code).isEqualTo(400)
+    val filed = api("PATCH", "/api/photos/${p["token"]}", mapOf("collection" to "pantry", "action" to "consume", "qty" to 2))
+    assertThat(meta(filed)).containsEntry("action", "consume").containsEntry("qty", 2L)
+    // changing the verb in place; one without a quantity drops qty; "" clears
+    assertThat(meta(api("PATCH", "/api/photos/${p["token"]}", mapOf("action" to "out")))).containsEntry("action", "out").doesNotContainKey("qty")
+    assertThat(meta(api("PATCH", "/api/photos/${p["token"]}", mapOf("action" to "")))).doesNotContainKey("action")
+    // batch move files several at once; leaving the collection drops the verb
+    val q = upload("inbox", jpeg(color = Color.BLUE))
+    val moved = api("POST", "/api/photos/batch", mapOf("op" to "move", "tokens" to listOf(p["token"], q["token"]), "collection" to "pantry", "action" to "purchase", "qty" to 3))
+    assertThat(moved.list("photos").map { (it["meta"] as Map<*, *>)["action"] }).containsExactly("purchase", "purchase")
+    assertThat(meta(api("PATCH", "/api/photos/${q["token"]}", mapOf("collection" to "food")))).doesNotContainKey("action").doesNotContainKey("qty")
+
+    // the inbox ranks a destination's verbs too
+    val r = upload("inbox", jpeg(color = Color.GREEN))
+    @Suppress("UNCHECKED_CAST")
+    val sugg = api("GET", "/api/inbox").list("photos").single { (it["photo"] as Map<*, *>)["token"] == r["token"] }["suggestions"] as List<Map<String, Any?>>
+    @Suppress("UNCHECKED_CAST")
+    val ranked = sugg.first { it["collection"] == "pantry" }["actions"] as List<Map<String, Any?>>
+    assertThat(ranked.map { it["action"] }).containsExactlyInAnyOrder("consume", "out", "purchase")
+    assertThat(ranked.first()["action"]).isEqualTo("purchase")                       // the only verb pantry photos carry so far
+    assertThat(sugg.first { it["collection"] == "food" }).doesNotContainKey("actions")
+  }
+
+  @Test
+  fun `each vault has its own inbox and its own ranking`() {
+    api("POST", "/api/vaults", mapOf("name" to "work"))
+    for (n in listOf("pantry", "inbox")) api("POST", "/api/collections", mapOf("name" to n))
+    for (n in listOf("receipts", "inbox")) api("POST", "/api/collections", mapOf("name" to n), vault = "work")
+    upload("inbox", jpeg(color = Color.RED))
+    val w = obj(call("POST", "/api/photos?collection=inbox", raw = jpeg(color = Color.BLUE), vault = "work"))
+    val inbox = api("GET", "/api/inbox", vault = "work").list("photos")
+    assertThat(inbox.map { (it["photo"] as Map<*, *>)["token"] }).containsExactly(w["token"])
+    @Suppress("UNCHECKED_CAST")
+    assertThat((inbox.single()["suggestions"] as List<Map<String, Any?>>).map { it["collection"] }).containsExactly("receipts")
   }
 
   @Test

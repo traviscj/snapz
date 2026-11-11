@@ -22,6 +22,7 @@ import misk.scope.ActionScoped
 import misk.security.authz.Authenticated
 import misk.security.authz.MiskCallerAuthenticator
 import misk.security.authz.Unauthenticated
+import misk.web.DispatchMechanism
 import misk.web.Get
 import misk.web.HttpCall
 import misk.web.Post
@@ -37,6 +38,7 @@ import okhttp3.Headers
 /** The one capability: this is a single-tenant app, a caller is either in or out. */
 const val USER = "snapz_user"
 const val SESSION_COOKIE = "snapz_session"
+const val READ_ONLY = "read_only"
 
 /** `Authorization: Bearer <token>` (scripts, iOS) or the session cookie (web). */
 fun HttpCall.presentedToken(): String? {
@@ -50,9 +52,21 @@ class SnapzAuthenticator @Inject constructor(
   private val tokens: TokenStore,
 ) : MiskCallerAuthenticator {
   override fun getAuthenticatedCaller(): MiskCaller? {
-    val token = httpCall.get().presentedToken() ?: return null
+    val call = httpCall.get()
+    val token = call.presentedToken() ?: return null
     val resolved = tokens.resolve(token) ?: return null
-    return MiskCaller(user = resolved.principal, capabilities = setOf(USER))
+    // Read-only: reads, plus the one write a stateless feed consumer needs (its own cursor).
+    val mayCall = !resolved.readOnly || call.dispatchMechanism == DispatchMechanism.GET ||
+      (call.dispatchMechanism == DispatchMechanism.PUT && call.url.encodedPath.startsWith("/_feeds/cursors/"))
+    return MiskCaller(
+      user = resolved.principal,
+      capabilities = buildSet {
+        if (mayCall) add(USER)
+        if (resolved.vault == null && !resolved.readOnly) add(ADMIN)
+        resolved.vault?.let { add(vaultCapability(it)) }
+        if (resolved.readOnly) add(READ_ONLY)
+      },
+    )
   }
 }
 
@@ -183,8 +197,8 @@ class Sessions @Inject constructor(private val config: SnapzConfig, private val 
   private val ttlMs get() = Duration.ofDays(config.snapz.session_ttl_days).toMillis()
 
   /** Set-Cookie value for a fresh web session. */
-  fun start(principal: String, name: String): String {
-    val (_, token) = tokens.create("session", name, principal, ttlMs)
+  fun start(principal: String, name: String, vault: String? = null, readOnly: Boolean = false): String {
+    val (_, token) = tokens.create("session", name, principal, ttlMs, vault, readOnly)
     return cookie(token, ttlMs / 1000)
   }
 
@@ -287,8 +301,8 @@ class TokenLoginAction @Inject constructor(
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
   fun login(@RequestBody req: TokenLoginReq): MeDto {
     val resolved = tokens.resolve(req.token.trim()) ?: throw UnauthenticatedException("bad token")
-    httpCall.get().setResponseHeader("Set-Cookie", sessions.start(resolved.principal, "web (token login)"))
-    return MeDto(resolved.principal, true)
+    httpCall.get().setResponseHeader("Set-Cookie", sessions.start(resolved.principal, "web (token login)", resolved.vault, resolved.readOnly))
+    return MeDto(resolved.principal, true, resolved.vault, resolved.readOnly, resolved.vault == null && !resolved.readOnly)
   }
 }
 
@@ -309,7 +323,8 @@ class LogoutAction @Inject constructor(
   }
 }
 
-data class MeDto(val principal: String, val authenticated: Boolean)
+/** [vault]: slug this credential is pinned to, if any. [admin]: may manage vaults and tokens. */
+data class MeDto(val principal: String, val authenticated: Boolean, val vault: String? = null, val read_only: Boolean = false, val admin: Boolean = true)
 
 /** Auth-mode probe for clients: is OIDC available, and (if a credential was sent) who am I. */
 data class AuthInfoDto(val oidc: Boolean, val principal: String?)
@@ -331,5 +346,8 @@ class MeAction @Inject constructor(
   @Get("/api/me")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
-  fun me() = MeDto(caller.get()?.principal ?: "?", true)
+  fun me(): MeDto {
+    val caps = caller.get()?.capabilities.orEmpty()
+    return MeDto(caller.get()?.principal ?: "?", true, caps.firstOrNull { it.startsWith("vault:") }?.removePrefix("vault:"), READ_ONLY in caps, ADMIN in caps)
+  }
 }

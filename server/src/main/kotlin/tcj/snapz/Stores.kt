@@ -14,11 +14,20 @@ import misk.exceptions.NotFoundException
 // Wire DTOs (JSON, snake_case). Nulls are omitted on the wire.
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * One verb a photo filed in a collection can carry (photo meta `action`, plus `qty` when [qty]).
+ * The server stores and validates the names; what they mean is up to whoever consumes the feed.
+ */
+data class ActionDto(val name: String, val label: String?, val qty: Boolean = false)
+
 data class CollectionDto(
+  val vault: String,
   val slug: String,
   val name: String,
   val description: String?,
   val icon: String?,
+  /** The collection's action set, in display order. Empty = photos here carry no verb. */
+  val actions: List<ActionDto>,
   val photo_count: Long,
   val bytes: Long,
   val last_photo_at: String?,
@@ -30,6 +39,7 @@ data class CollectionDto(
 
 data class PhotoDto(
   val token: String,
+  val vault: String,
   val collection: String,
   val sha256: String,
   val content_type: String,
@@ -53,6 +63,7 @@ data class PhotoDto(
 )
 
 data class RecordDto(
+  val vault: String,
   val ns: String,
   val k: String,
   val v: Any?,
@@ -70,9 +81,13 @@ data class TokenDto(
   val created_at: String,
   val last_used_at: String?,
   val expires_at: String?,
+  /** Slug of the vault this credential is pinned to; null = all vaults + admin routes. */
+  val vault: String?,
+  val read_only: Boolean,
 )
 
-private val SLUG = Regex("^[a-z0-9][a-z0-9_-]{0,62}$")
+private val ACTION_NAME = Regex("^[a-z0-9][a-z0-9_-]{0,31}$")
+internal val SLUG = Regex("^[a-z0-9][a-z0-9_-]{0,62}$")
 
 fun slugify(name: String): String =
   name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').take(63).ifEmpty { throw BadRequestException("can't derive a slug from '$name'") }
@@ -84,19 +99,41 @@ class CollectionStore @Inject constructor(
   private val db: Db,
   private val clock: Clock,
   private val config: SnapzConfig,
+  private val json: Json,
 ) {
+  private fun parseActions(text: String?): List<ActionDto> = if (text.isNullOrBlank()) listOf() else (json.parse(text) as? List<*>).orEmpty().mapNotNull {
+    val m = it as? Map<*, *> ?: return@mapNotNull null
+    ActionDto(m["name"]?.toString() ?: return@mapNotNull null, m["label"]?.toString(), m["qty"] == true)
+  }
+
+  fun actionsOf(c: Connection, collectionId: Long): List<ActionDto> =
+    parseActions(c.select("SELECT actions FROM collections WHERE id = ?", listOf(collectionId)) { it.getString(1) }.firstOrNull())
+
+  /** Replace the collection's action set. Photos already carrying a verb that was dropped keep it. */
+  fun setActions(vaultId: Long, slug: String, actions: List<ActionDto>): CollectionDto = db.tx { c ->
+    val id = idOf(c, vaultId, slug)
+    if (actions.size > 12) throw BadRequestException("at most 12 actions per collection")
+    actions.forEach { if (!ACTION_NAME.matches(it.name)) throw BadRequestException("bad action name '${it.name}': want ${ACTION_NAME.pattern}") }
+    if (actions.map { it.name }.distinct().size != actions.size) throw BadRequestException("duplicate action name")
+    val text = if (actions.isEmpty()) null else json.write(actions.map { a -> listOfNotNull("name" to a.name, a.label?.takeIf { it.isNotBlank() }?.let { "label" to it }, "qty" to a.qty).toMap() })
+    c.exec("UPDATE collections SET actions = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE id = ?", listOf(text, clock.millis(), id))
+    get(c, vaultId, slug)
+  }
+
   private val select = """
-    SELECT c.*, COALESCE(s.n, 0) AS photo_count, COALESCE(s.bytes, 0) AS photo_bytes, s.last_taken
-    FROM collections c
+    SELECT c.*, vt.slug AS vault, COALESCE(s.n, 0) AS photo_count, COALESCE(s.bytes, 0) AS photo_bytes, s.last_taken
+    FROM collections c JOIN vaults vt ON vt.id = c.vault_id
     LEFT JOIN (SELECT collection_id, COUNT(*) n, SUM(bytes) bytes, MAX(taken_at_ms) last_taken
                FROM photos WHERE deleted_at_ms IS NULL GROUP BY collection_id) s ON s.collection_id = c.id
   """.trimIndent()
 
   private fun dto(rs: ResultSet) = CollectionDto(
+    vault = rs.getString("vault"),
     slug = rs.getString("slug"),
     name = rs.getString("name"),
     description = rs.getString("description"),
     icon = rs.getString("icon"),
+    actions = parseActions(rs.getString("actions")),
     photo_count = rs.getLong("photo_count"),
     bytes = rs.getLong("photo_bytes"),
     last_photo_at = isoOrNull(rs.longOrNull("last_taken")),
@@ -106,57 +143,57 @@ class CollectionStore @Inject constructor(
     feed_sync_id = rs.longOrNull("feed_sync_id"),
   )
 
-  fun list(): List<CollectionDto> = db.tx { c ->
-    c.select("$select WHERE c.deleted_at_ms IS NULL ORDER BY c.name", map = ::dto)
+  fun list(vaultId: Long): List<CollectionDto> = db.tx { c ->
+    c.select("$select WHERE c.vault_id = ? AND c.deleted_at_ms IS NULL ORDER BY c.name", listOf(vaultId), ::dto)
   }
 
-  fun get(slug: String): CollectionDto = db.tx { c -> get(c, slug) }
+  fun get(vaultId: Long, slug: String): CollectionDto = db.tx { c -> get(c, vaultId, slug) }
 
-  private fun get(c: Connection, slug: String): CollectionDto =
-    c.select("$select WHERE c.slug = ? AND c.deleted_at_ms IS NULL", listOf(slug), ::dto).firstOrNull()
+  private fun get(c: Connection, vaultId: Long, slug: String): CollectionDto =
+    c.select("$select WHERE c.vault_id = ? AND c.slug = ? AND c.deleted_at_ms IS NULL", listOf(vaultId, slug), ::dto).firstOrNull()
       ?: throw NotFoundException("no collection '$slug'")
 
-  /** Live collection id for a slug, or 404. */
-  fun idOf(c: Connection, slug: String): Long =
-    c.select("SELECT id FROM collections WHERE slug = ? AND deleted_at_ms IS NULL", listOf(slug)) { it.getLong(1) }.firstOrNull()
+  /** Live collection id for a slug in a vault, or 404. */
+  fun idOf(c: Connection, vaultId: Long, slug: String): Long =
+    c.select("SELECT id FROM collections WHERE vault_id = ? AND slug = ? AND deleted_at_ms IS NULL", listOf(vaultId, slug)) { it.getLong(1) }.firstOrNull()
       ?: throw NotFoundException("no collection '$slug'")
 
-  fun create(slug: String?, name: String, description: String?, icon: String?): CollectionDto {
+  fun create(vaultId: Long, slug: String?, name: String, description: String?, icon: String?): CollectionDto {
     val s = slug?.takeIf { it.isNotBlank() } ?: slugify(name)
     if (!SLUG.matches(s)) throw BadRequestException("bad slug '$s': want ${SLUG.pattern}")
     val now = clock.millis()
     return db.tx { c ->
       try {
         c.insert(
-          "INSERT INTO collections (slug, name, description, icon, created_at_ms, updated_at_ms, shard) VALUES (?,?,?,?,?,?,?)",
-          listOf(s, name, description, icon, now, now, shardOf(s, config.snapz.feed_shards)),
+          "INSERT INTO collections (vault_id, slug, name, description, icon, created_at_ms, updated_at_ms, shard) VALUES (?,?,?,?,?,?,?,?)",
+          listOf(vaultId, s, name, description, icon, now, now, shardOf(s, config.snapz.feed_shards)),
         )
       } catch (e: SQLIntegrityConstraintViolationException) {
         throw ConflictException("collection '$s' already exists")
       }
-      get(c, s)
+      get(c, vaultId, s)
     }
   }
 
-  fun update(slug: String, name: String?, description: String?, icon: String?): CollectionDto = db.tx { c ->
-    val id = idOf(c, slug)
+  fun update(vaultId: Long, slug: String, name: String?, description: String?, icon: String?): CollectionDto = db.tx { c ->
+    val id = idOf(c, vaultId, slug)
     val sets = mutableListOf("updated_at_ms = ?", "feed_sync_id = NULL")
     val args = mutableListOf<Any?>(clock.millis())
     name?.let { sets += "name = ?"; args += it }
     description?.let { sets += "description = ?"; args += it }
     icon?.let { sets += "icon = ?"; args += it }
     c.exec("UPDATE collections SET ${sets.joinToString()} WHERE id = ?", args + id)
-    get(c, slug)
+    get(c, vaultId, slug)
   }
 
   /**
    * Soft delete. Refuses a non-empty collection unless [force], which also trashes its photos.
    * The slug is mangled so the name can be reused; the tombstone still flows through the feed.
    */
-  fun delete(slug: String, force: Boolean) {
+  fun delete(vaultId: Long, slug: String, force: Boolean) {
     val now = clock.millis()
     db.tx { c ->
-      val id = idOf(c, slug)
+      val id = idOf(c, vaultId, slug)
       val n = c.select("SELECT COUNT(*) FROM photos WHERE collection_id = ? AND deleted_at_ms IS NULL", listOf(id)) { it.getLong(1) }.first()
       if (n > 0 && !force) throw ConflictException("collection '$slug' has $n photos; pass force=true to trash them too")
       c.exec("UPDATE photos SET deleted_at_ms = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE collection_id = ? AND deleted_at_ms IS NULL", listOf(now, now, id))
@@ -164,9 +201,10 @@ class CollectionStore @Inject constructor(
     }
   }
 
-  fun feed(after: Long, limit: Int, shard: Int?, shardCount: Int?): List<CollectionDto> = db.tx { c ->
+  fun feed(after: Long, limit: Int, shard: Int?, shardCount: Int?, vaultId: Long?): List<CollectionDto> = db.tx { c ->
     val (cond, args) = shardCond("c", shard, shardCount)
-    c.select("$select WHERE c.feed_sync_id > ? AND c.shard >= 0 $cond ORDER BY c.feed_sync_id LIMIT ?", listOf<Any?>(after) + args + limit, ::dto)
+    val only = if (vaultId != null) "AND c.vault_id = ?" else ""
+    c.select("$select WHERE c.feed_sync_id > ? AND c.shard >= 0 $cond $only ORDER BY c.feed_sync_id LIMIT ?", listOf<Any?>(after) + args + listOfNotNull(vaultId) + limit, ::dto)
   }
 }
 
@@ -266,16 +304,18 @@ class PhotoStore @Inject constructor(
   private val lineage: Lineage,
 ) {
   private val select = """
-    SELECT p.id, p.token, c.slug AS collection, p.sha256, p.content_type, p.bytes, p.width, p.height, p.taken_at_ms,
+    SELECT p.id, p.token, vt.slug AS vault, c.slug AS collection, p.sha256, p.content_type, p.bytes, p.width, p.height, p.taken_at_ms,
            p.note, p.meta, p.barcodes, p.client_id, p.created_at_ms, p.updated_at_ms, p.deleted_at_ms, p.feed_sync_id,
            v.token AS version_token
-    FROM photos p JOIN collections c ON c.id = p.collection_id LEFT JOIN photo_versions v ON v.id = p.current_version_id
+    FROM photos p JOIN collections c ON c.id = p.collection_id JOIN vaults vt ON vt.id = c.vault_id
+    LEFT JOIN photo_versions v ON v.id = p.current_version_id
   """.trimIndent()
 
   private fun dto(rs: ResultSet): PhotoDto {
     val token = rs.getString("token")
     return PhotoDto(
       token = token,
+      vault = rs.getString("vault"),
       collection = rs.getString("collection"),
       sha256 = rs.getString("sha256"),
       content_type = rs.getString("content_type"),
@@ -321,12 +361,12 @@ class PhotoStore @Inject constructor(
    * Newest first by (taken_at, id). [before] is the opaque `next_before` of the previous page.
    * [deleted]: false = live only, true = trash only.
    */
-  fun list(collection: String?, before: String?, limit: Int, barcode: String?, deleted: Boolean): PhotoPage = db.tx { c ->
-    val conds = mutableListOf(if (deleted) "p.deleted_at_ms IS NOT NULL" else "p.deleted_at_ms IS NULL")
-    val args = mutableListOf<Any?>()
+  fun list(vaultId: Long, collection: String?, before: String?, limit: Int, barcode: String?, deleted: Boolean): PhotoPage = db.tx { c ->
+    val conds = mutableListOf(if (deleted) "p.deleted_at_ms IS NOT NULL" else "p.deleted_at_ms IS NULL", "c.vault_id = ?")
+    val args = mutableListOf<Any?>(vaultId)
     if (collection != null) {
       conds += "p.collection_id = ?"
-      args += collections.idOf(c, collection)
+      args += collections.idOf(c, vaultId, collection)
     }
     if (!barcode.isNullOrBlank()) {
       conds += "p.barcodes LIKE ?"
@@ -352,13 +392,13 @@ class PhotoStore @Inject constructor(
    * Insert a photo row for an already-stored blob. [clientId] is the uploader's idempotency key:
    * a retry of an upload that actually landed returns the existing row instead of a duplicate.
    */
-  fun create(collection: String, blob: BlobInfo, takenAtMs: Long?, note: String?, meta: Map<String, Any?>, clientId: String?): Pair<PhotoDto, Boolean> {
+  fun create(vaultId: Long, collection: String, blob: BlobInfo, takenAtMs: Long?, note: String?, meta: Map<String, Any?>, clientId: String?): Pair<PhotoDto, Boolean> {
     val now = clock.millis()
     fun existing(c: Connection) = clientId?.let { c.select("$select WHERE p.client_id = ?", listOf(it), ::dto).firstOrNull() }
     return try {
       db.tx { c ->
         existing(c)?.let { return@tx it to false }
-        val cid = collections.idOf(c, collection)
+        val cid = collections.idOf(c, vaultId, collection)
         val token = randomToken()
         val id = c.insert(
           """
@@ -383,8 +423,33 @@ class PhotoStore @Inject constructor(
     }
   }
 
-  /** Null arguments are left unchanged; [collection] moves the photo. */
-  fun update(token: String, note: String?, meta: Map<String, Any?>?, takenAtMs: Long?, collection: String?): PhotoDto = db.tx { c ->
+  /**
+   * A photo's verb belongs to the collection it is filed in, so it is set as part of filing:
+   * leaving a collection ([moved]) drops `meta.action`/`meta.qty`, and a given [action] must be one
+   * of the destination's. "" clears it without moving.
+   */
+  private fun applyAction(c: Connection, photoId: Long, collectionId: Long, moved: Boolean, action: String?, qty: Int?) {
+    if (!moved && action == null) return
+    val patch = LinkedHashMap<String, Any?>()
+    val cur = c.select("SELECT meta FROM photos WHERE id = ? FOR UPDATE", listOf(photoId)) { it.getString(1) }.firstOrNull() ?: return
+    val meta = LinkedHashMap(json.parseObject(cur)).apply { remove("action"); remove("qty") }
+    if (!action.isNullOrEmpty()) {
+      val allowed = collections.actionsOf(c, collectionId)
+      val a = allowed.firstOrNull { it.name == action }
+        ?: throw BadRequestException("this collection has no action '$action' (have: ${allowed.joinToString { it.name }.ifEmpty { "none" }})")
+      patch["action"] = a.name
+      if (a.qty) patch["qty"] = (qty ?: 1).also { if (it < 0) throw BadRequestException("qty must be >= 0") }
+    }
+    meta.putAll(patch)
+    val text = json.write(meta)
+    if (text != json.write(json.parseObject(cur))) c.exec("UPDATE photos SET meta = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE id = ?", listOf(text, clock.millis(), photoId))
+  }
+
+  /** Null arguments are left unchanged; [collection] (a slug in [vaultId]) moves the photo, [action] sets its verb there. */
+  fun update(
+    token: String, note: String?, meta: Map<String, Any?>?, takenAtMs: Long?, vaultId: Long, collection: String?,
+    action: String? = null, qty: Int? = null,
+  ): PhotoDto = db.tx { c ->
     get(c, token, includeDeleted = false)
     val sets = mutableListOf("updated_at_ms = ?", "feed_sync_id = NULL")
     val args = mutableListOf<Any?>(clock.millis())
@@ -392,12 +457,22 @@ class PhotoStore @Inject constructor(
     meta?.let { sets += "meta = ?"; args += json.write(it); sets += "barcodes = ?"; args += barcodeColumn(it) }
     takenAtMs?.let { sets += "taken_at_ms = ?"; args += it }
     val before = idOf(c, token)
-    val dest = collection?.let { collections.idOf(c, it) }
+    val dest = collection?.let { collections.idOf(c, vaultId, it) }
     dest?.let { sets += "collection_id = ?"; args += it }
     c.exec("UPDATE photos SET ${sets.joinToString()} WHERE token = ?", args + token)
-    if (dest != null && dest != before.second) lineage.advanceChain(c, before.first, dest, null)
+    val moved = dest != null && dest != before.second
+    applyAction(c, before.first, dest ?: before.second, moved, action, qty)
+    if (moved) lineage.advanceChain(c, before.first, dest!!, null)
     get(c, token)
   }
+
+  /** Slug of the vault a photo lives in (trashed photos included). */
+  fun vaultOf(token: String): String = db.tx { c ->
+    c.select("SELECT vt.slug FROM photos p JOIN collections c ON c.id = p.collection_id JOIN vaults vt ON vt.id = c.vault_id WHERE p.token = ?", listOf(token)) { it.getString(1) }.firstOrNull()
+  } ?: throw NotFoundException("no photo '$token'")
+
+  fun vaultIdOf(c: Connection, photoId: Long): Long? =
+    c.select("SELECT c.vault_id FROM photos p JOIN collections c ON c.id = p.collection_id WHERE p.id = ?", listOf(photoId)) { it.getLong(1) }.firstOrNull()
 
   /** (photo id, collection id) for a token. */
   fun idOf(c: Connection, token: String): Pair<Long, Long> =
@@ -414,11 +489,11 @@ class PhotoStore @Inject constructor(
   }
 
   /** New row, same blob. Copies are independent from then on (notes, meta, deletion). */
-  fun copy(token: String, collection: String): PhotoDto = db.tx { c -> copy(c, token, collection) }
+  fun copy(token: String, vaultId: Long, collection: String): PhotoDto = db.tx { c -> copy(c, token, vaultId, collection) }
 
-  private fun copy(c: Connection, token: String, collection: String): PhotoDto {
+  private fun copy(c: Connection, token: String, vaultId: Long, collection: String): PhotoDto {
     get(c, token, includeDeleted = false)
-    val cid = collections.idOf(c, collection)
+    val cid = collections.idOf(c, vaultId, collection)
     val now = clock.millis()
     val newToken = randomToken()
     c.exec(
@@ -432,6 +507,7 @@ class PhotoStore @Inject constructor(
     )
     // The copy starts its own history at whatever the source currently looks like.
     val newId = idOf(c, newToken).first
+    applyAction(c, newId, cid, moved = idOf(c, token).second != cid, action = null, qty = null)
     lineage.currentVersion(c, newId)
     lineage.advanceChain(c, newId, cid, null)
     return get(c, newToken)
@@ -455,19 +531,20 @@ class PhotoStore @Inject constructor(
   }
 
   /** All-or-nothing: one transaction for the whole selection. */
-  fun batch(op: String, tokens: List<String>, collection: String?): List<PhotoDto> {
+  fun batch(op: String, tokens: List<String>, vaultId: Long, collection: String?, action: String? = null, qty: Int? = null): List<PhotoDto> {
     if (tokens.size > 2000) throw BadRequestException("at most 2000 tokens per batch")
     return db.tx { c ->
       tokens.distinct().map { t ->
         when (op) {
           "delete" -> setDeleted(c, t, true)
           "restore" -> setDeleted(c, t, false)
-          "copy" -> copy(c, t, collection ?: throw BadRequestException("copy needs 'collection'"))
+          "copy" -> copy(c, t, vaultId, collection ?: throw BadRequestException("copy needs 'collection'"))
           "move" -> {
-            val cid = collections.idOf(c, collection ?: throw BadRequestException("move needs 'collection'"))
+            val cid = collections.idOf(c, vaultId, collection ?: throw BadRequestException("move needs 'collection'"))
             val (pid, from) = idOf(c, t)
             // Moving out of the trash is allowed: it's how photos of a deleted collection are rescued.
             c.exec("UPDATE photos SET collection_id = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE token = ?", listOf(cid, clock.millis(), t))
+            applyAction(c, pid, cid, moved = from != cid, action, qty)
             if (from != cid) lineage.advanceChain(c, pid, cid, null)
             get(c, t)
           }
@@ -511,14 +588,19 @@ class PhotoStore @Inject constructor(
     n to orphans
   }
 
-  fun feed(after: Long, limit: Int, shard: Int?, shardCount: Int?, collection: String?): List<PhotoDto> = db.tx { c ->
+  /** [vaultId] null = every vault. [collection] is a slug in [collectionVaultId]. */
+  fun feed(after: Long, limit: Int, shard: Int?, shardCount: Int?, vaultId: Long?, collectionVaultId: Long, collection: String?): List<PhotoDto> = db.tx { c ->
     val (cond, shardArgs) = shardCond("p", shard, shardCount)
     val args = mutableListOf<Any?>(after)
     args.addAll(shardArgs)
     var collCond = ""
+    if (vaultId != null) {
+      collCond += " AND c.vault_id = ?"
+      args += vaultId
+    }
     if (collection != null) {
-      collCond = "AND p.collection_id = ?"
-      args += collections.idOf(c, collection)
+      collCond += " AND p.collection_id = ?"
+      args += collections.idOf(c, collectionVaultId, collection)
     }
     c.select("$select WHERE p.feed_sync_id > ? AND p.shard >= 0 $cond $collCond ORDER BY p.feed_sync_id LIMIT ?", args + limit, ::dto)
   }
@@ -540,7 +622,10 @@ class RecordStore @Inject constructor(
   private val config: SnapzConfig,
   private val json: Json,
 ) {
+  private val select = "SELECT r.*, vt.slug AS vault FROM records r JOIN vaults vt ON vt.id = r.vault_id"
+
   private fun dto(rs: ResultSet) = RecordDto(
+    vault = rs.getString("vault"),
     ns = rs.getString("ns"),
     k = rs.getString("k"),
     v = json.parse(rs.getString("v")),
@@ -550,67 +635,72 @@ class RecordStore @Inject constructor(
     feed_sync_id = rs.longOrNull("feed_sync_id"),
   )
 
-  fun namespaces(): List<NamespaceDto> = db.tx { c ->
-    c.select("SELECT ns, COUNT(*) n, MAX(updated_at_ms) u FROM records WHERE deleted_at_ms IS NULL GROUP BY ns ORDER BY ns") {
+  fun namespaces(vaultId: Long): List<NamespaceDto> = db.tx { c ->
+    c.select("SELECT ns, COUNT(*) n, MAX(updated_at_ms) u FROM records WHERE vault_id = ? AND deleted_at_ms IS NULL GROUP BY ns ORDER BY ns", listOf(vaultId)) {
       NamespaceDto(it.getString("ns"), it.getLong("n"), isoOrNull(it.longOrNull("u")))
     }
   }
 
-  fun scan(ns: String, prefix: String?, limit: Int): List<RecordDto> = db.tx { c ->
+  fun scan(vaultId: Long, ns: String, prefix: String?, limit: Int): List<RecordDto> = db.tx { c ->
     val like = (prefix ?: "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-    c.select("SELECT * FROM records WHERE ns = ? AND k LIKE ? AND deleted_at_ms IS NULL ORDER BY k LIMIT ?", listOf(ns, like, limit.coerceIn(1, 5000)), ::dto)
+    c.select("$select WHERE r.vault_id = ? AND r.ns = ? AND r.k LIKE ? AND r.deleted_at_ms IS NULL ORDER BY r.k LIMIT ?", listOf(vaultId, ns, like, limit.coerceIn(1, 5000)), ::dto)
   }
 
-  fun get(ns: String, k: String): RecordDto = db.tx { c -> find(c, ns, k) }?.takeIf { it.deleted_at == null } ?: throw NotFoundException("no record $ns/$k")
+  fun get(vaultId: Long, ns: String, k: String): RecordDto = db.tx { c -> find(c, vaultId, ns, k) }?.takeIf { it.deleted_at == null } ?: throw NotFoundException("no record $ns/$k")
 
-  private fun find(c: Connection, ns: String, k: String) = c.select("SELECT * FROM records WHERE ns = ? AND k = ?", listOf(ns, k), ::dto).firstOrNull()
+  private fun find(c: Connection, vaultId: Long, ns: String, k: String) =
+    c.select("$select WHERE r.vault_id = ? AND r.ns = ? AND r.k = ?", listOf(vaultId, ns, k), ::dto).firstOrNull()
 
   /**
    * Upsert. A value-identical put is a no-op (no feed republish), so a transform that re-derives
    * the same output after a replay doesn't ripple downstream.
    */
-  fun put(ns: String, k: String, v: Any?): RecordDto {
+  fun put(vaultId: Long, ns: String, k: String, v: Any?): RecordDto {
     if (ns.isBlank() || ns.length > 128 || k.isBlank() || k.length > 255) throw BadRequestException("bad ns/k")
     val text = json.write(v)
     val now = clock.millis()
     return db.tx { c ->
-      val cur = c.select("SELECT v, deleted_at_ms FROM records WHERE ns = ? AND k = ? FOR UPDATE", listOf(ns, k)) { it.getString(1) to it.longOrNull("deleted_at_ms") }.firstOrNull()
+      val cur = c.select("SELECT v, deleted_at_ms FROM records WHERE vault_id = ? AND ns = ? AND k = ? FOR UPDATE", listOf(vaultId, ns, k)) { it.getString(1) to it.longOrNull("deleted_at_ms") }.firstOrNull()
       when {
         cur == null -> c.exec(
-          "INSERT INTO records (ns, k, v, created_at_ms, updated_at_ms, shard) VALUES (?,?,?,?,?,?)",
-          listOf(ns, k, text, now, now, shardOf("$ns:$k", config.snapz.feed_shards)),
+          "INSERT INTO records (vault_id, ns, k, v, created_at_ms, updated_at_ms, shard) VALUES (?,?,?,?,?,?,?)",
+          listOf(vaultId, ns, k, text, now, now, shardOf("$ns:$k", config.snapz.feed_shards)),
         )
         cur.first != text || cur.second != null ->
-          c.exec("UPDATE records SET v = ?, updated_at_ms = ?, deleted_at_ms = NULL, feed_sync_id = NULL WHERE ns = ? AND k = ?", listOf(text, now, ns, k))
+          c.exec("UPDATE records SET v = ?, updated_at_ms = ?, deleted_at_ms = NULL, feed_sync_id = NULL WHERE vault_id = ? AND ns = ? AND k = ?", listOf(text, now, vaultId, ns, k))
       }
-      find(c, ns, k)!!
+      find(c, vaultId, ns, k)!!
     }
   }
 
-  fun delete(ns: String, k: String) {
+  fun delete(vaultId: Long, ns: String, k: String) {
     val now = clock.millis()
     val n = db.tx { c ->
-      c.exec("UPDATE records SET deleted_at_ms = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE ns = ? AND k = ? AND deleted_at_ms IS NULL", listOf(now, now, ns, k))
+      c.exec("UPDATE records SET deleted_at_ms = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE vault_id = ? AND ns = ? AND k = ? AND deleted_at_ms IS NULL", listOf(now, now, vaultId, ns, k))
     }
     if (n == 0) throw NotFoundException("no record $ns/$k")
   }
 
-  fun feed(after: Long, limit: Int, shard: Int?, shardCount: Int?, ns: String?): List<RecordDto> = db.tx { c ->
+  fun feed(after: Long, limit: Int, shard: Int?, shardCount: Int?, vaultId: Long?, ns: String?): List<RecordDto> = db.tx { c ->
     val (cond, shardArgs) = shardCond("r", shard, shardCount)
     val args = mutableListOf<Any?>(after)
     args.addAll(shardArgs)
     var nsCond = ""
+    if (vaultId != null) {
+      nsCond += " AND r.vault_id = ?"
+      args += vaultId
+    }
     if (ns != null) {
-      nsCond = "AND r.ns = ?"
+      nsCond += " AND r.ns = ?"
       args += ns
     }
-    c.select("SELECT r.* FROM records r WHERE r.feed_sync_id > ? AND r.shard >= 0 $cond $nsCond ORDER BY r.feed_sync_id LIMIT ?", args + limit, ::dto)
+    c.select("$select WHERE r.feed_sync_id > ? AND r.shard >= 0 $cond $nsCond ORDER BY r.feed_sync_id LIMIT ?", args + limit, ::dto)
   }
 }
 
 // ---------------------------------------------------------------------------------------------
 
-data class ResolvedToken(val id: Long?, val kind: String, val principal: String)
+data class ResolvedToken(val id: Long?, val kind: String, val principal: String, val vault: String? = null, val readOnly: Boolean = false)
 
 /** Bearer credentials: web sessions, per-device tokens (iOS), and named script tokens. Only SHA-256 hashes are stored. */
 @Singleton
@@ -619,13 +709,15 @@ class TokenStore @Inject constructor(
   private val clock: Clock,
   private val config: SnapzConfig,
 ) {
-  fun create(kind: String, name: String, principal: String, ttlMs: Long? = null): Pair<Long, String> {
+  /** [vault] pins the credential to one vault (and off the admin routes); [readOnly] limits it to GETs. */
+  fun create(kind: String, name: String, principal: String, ttlMs: Long? = null, vault: String? = null, readOnly: Boolean = false): Pair<Long, String> {
     val plain = "snapz_" + randomSecret()
     val now = clock.millis()
     val id = db.tx { c ->
+      val vaultId = vault?.let { v -> c.select("SELECT id FROM vaults WHERE slug = ? AND deleted_at_ms IS NULL", listOf(v)) { it.getLong(1) }.firstOrNull() ?: throw NotFoundException("no vault '$v'") }
       c.insert(
-        "INSERT INTO api_tokens (kind, name, token_hash, principal, created_at_ms, expires_at_ms) VALUES (?,?,?,?,?,?)",
-        listOf(kind, name.take(255), sha256Hex(plain.toByteArray()), principal, now, ttlMs?.let { now + it }),
+        "INSERT INTO api_tokens (kind, name, token_hash, principal, created_at_ms, expires_at_ms, vault_id, read_only) VALUES (?,?,?,?,?,?,?,?)",
+        listOf(kind, name.take(255), sha256Hex(plain.toByteArray()), principal, now, ttlMs?.let { now + it }, vaultId, readOnly),
       )
     }
     return id to plain
@@ -633,16 +725,26 @@ class TokenStore @Inject constructor(
 
   fun resolve(plain: String): ResolvedToken? {
     for (b in config.snapz.bootstrap_tokens) {
-      if (java.security.MessageDigest.isEqual(b.token.toByteArray(), plain.toByteArray())) return ResolvedToken(null, "bootstrap", b.principal)
+      if (java.security.MessageDigest.isEqual(b.token.toByteArray(), plain.toByteArray())) return ResolvedToken(null, "bootstrap", b.principal, b.vault, b.read_only)
     }
     if (!plain.startsWith("snapz_")) return null
     val now = clock.millis()
     return db.tx { c ->
       val row = c.select(
-        "SELECT id, kind, principal, last_used_at_ms FROM api_tokens WHERE token_hash = ? AND revoked_at_ms IS NULL AND (expires_at_ms IS NULL OR expires_at_ms > ?)",
+        """
+        SELECT t.id, t.kind, t.principal, t.last_used_at_ms, t.read_only, t.vault_id, v.slug AS vault
+        FROM api_tokens t LEFT JOIN vaults v ON v.id = t.vault_id AND v.deleted_at_ms IS NULL
+        WHERE t.token_hash = ? AND t.revoked_at_ms IS NULL AND (t.expires_at_ms IS NULL OR t.expires_at_ms > ?)
+        """.trimIndent(),
         listOf(sha256Hex(plain.toByteArray()), now),
-      ) { rs -> Triple(ResolvedToken(rs.getLong("id"), rs.getString("kind"), rs.getString("principal")), rs.longOrNull("last_used_at_ms"), 0) }.firstOrNull()
-        ?: return@tx null
+      ) { rs ->
+        Triple(
+          ResolvedToken(rs.getLong("id"), rs.getString("kind"), rs.getString("principal"), rs.getString("vault"), rs.getBoolean("read_only")),
+          rs.longOrNull("last_used_at_ms"),
+          // Pinned to a vault that has since been deleted: the credential dies with it.
+          rs.longOrNull("vault_id") != null && rs.getString("vault") == null,
+        )
+      }.firstOrNull()?.takeUnless { it.third } ?: return@tx null
       // Coarse last-used tracking: at most one write per token per minute.
       if (row.second == null || now - row.second!! > 60_000) c.exec("UPDATE api_tokens SET last_used_at_ms = ? WHERE id = ?", listOf(now, row.first.id))
       row.first
@@ -650,7 +752,10 @@ class TokenStore @Inject constructor(
   }
 
   fun list(): List<TokenDto> = db.tx { c ->
-    c.select("SELECT * FROM api_tokens WHERE revoked_at_ms IS NULL AND (expires_at_ms IS NULL OR expires_at_ms > ?) ORDER BY kind, id", listOf(clock.millis())) { rs ->
+    c.select(
+      "SELECT t.*, v.slug AS vault FROM api_tokens t LEFT JOIN vaults v ON v.id = t.vault_id WHERE t.revoked_at_ms IS NULL AND (t.expires_at_ms IS NULL OR t.expires_at_ms > ?) ORDER BY t.kind, t.id",
+      listOf(clock.millis()),
+    ) { rs ->
       TokenDto(
         id = rs.getLong("id"),
         kind = rs.getString("kind"),
@@ -659,6 +764,8 @@ class TokenStore @Inject constructor(
         created_at = iso(rs.getLong("created_at_ms")),
         last_used_at = isoOrNull(rs.longOrNull("last_used_at_ms")),
         expires_at = isoOrNull(rs.longOrNull("expires_at_ms")),
+        vault = rs.getString("vault"),
+        read_only = rs.getBoolean("read_only"),
       )
     }
   }

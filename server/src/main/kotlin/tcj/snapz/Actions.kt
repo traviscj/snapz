@@ -48,12 +48,13 @@ private fun String.unescaped(): String = try {
 
 data class CollectionReq(val slug: String?, val name: String?, val description: String?, val icon: String?)
 data class CollectionList(val collections: List<CollectionDto>)
+data class ActionsReq(val actions: List<ActionDto>)
 
-class CollectionActions @Inject constructor(private val store: CollectionStore) : WebAction {
+class CollectionActions @Inject constructor(private val store: CollectionStore, private val ctx: VaultContext) : WebAction {
   @Get("/api/collections")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun list() = CollectionList(store.list())
+  fun list() = CollectionList(store.list(ctx.current().id))
 
   @Post("/api/collections")
   @Authenticated(capabilities = [USER])
@@ -61,34 +62,44 @@ class CollectionActions @Inject constructor(private val store: CollectionStore) 
   @ResponseContentType(JSON)
   fun create(@RequestBody req: CollectionReq): CollectionDto {
     val name = req.name?.takeIf { it.isNotBlank() } ?: req.slug ?: throw BadRequestException("name is required")
-    return store.create(req.slug, name, req.description, req.icon)
+    return store.create(ctx.current().id, req.slug, name, req.description, req.icon)
   }
 
   @Get("/api/collections/{slug}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun get(@PathParam slug: String) = store.get(slug)
+  fun get(@PathParam slug: String) = store.get(ctx.current().id, slug)
 
   @Patch("/api/collections/{slug}")
   @Authenticated(capabilities = [USER])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
-  fun update(@PathParam slug: String, @RequestBody req: CollectionReq) = store.update(slug, req.name, req.description, req.icon)
+  fun update(@PathParam slug: String, @RequestBody req: CollectionReq) = store.update(ctx.current().id, slug, req.name, req.description, req.icon)
+
+  /**
+   * Replace the collection's action set: the verbs a photo filed here can carry. Whatever reads
+   * the feed and gives them meaning (e.g. pantry_orders.py) is the natural caller.
+   */
+  @Put("/api/collections/{slug}/actions")
+  @Authenticated(capabilities = [USER])
+  @RequestContentType(JSON)
+  @ResponseContentType(JSON)
+  fun setActions(@PathParam slug: String, @RequestBody req: ActionsReq) = store.setActions(ctx.current().id, slug, req.actions)
 
   @Delete("/api/collections/{slug}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
   fun delete(@PathParam slug: String, @QueryParam force: Boolean?): Ok {
-    store.delete(slug, force == true)
+    store.delete(ctx.current().id, slug, force == true)
     return Ok()
   }
 }
 
 // ------------------------------------------------------------------------------------ photos
 
-data class PhotoPatch(val note: String?, val meta: Map<String, Any?>?, val taken_at: String?, val collection: String?)
+data class PhotoPatch(val note: String?, val meta: Map<String, Any?>?, val taken_at: String?, val collection: String?, val action: String?, val qty: Int?)
 data class CopyReq(val collection: String)
-data class BatchReq(val op: String, val tokens: List<String>, val collection: String?)
+data class BatchReq(val op: String, val tokens: List<String>, val collection: String?, val action: String?, val qty: Int?)
 data class BatchResp(val photos: List<PhotoDto>)
 data class PurgeResp(val photos_purged: Int, val blobs_deleted: Int)
 
@@ -97,7 +108,7 @@ class PhotoActions @Inject constructor(
   private val blobs: BlobStore,
   private val json: Json,
   private val config: SnapzConfig,
-  private val publisher: FeedPublisher,
+  private val ctx: VaultContext,
 ) : WebAction {
   @Get("/api/photos")
   @Authenticated(capabilities = [USER])
@@ -108,7 +119,7 @@ class PhotoActions @Inject constructor(
     @QueryParam limit: Int?,
     @QueryParam barcode: String?,
     @QueryParam deleted: Boolean?,
-  ) = store.list(collection, before, limit ?: 200, barcode, deleted == true)
+  ) = store.list(ctx.current().id, collection, before, limit ?: 200, barcode, deleted == true)
 
   /**
    * Upload: the request body IS the image bytes (any Content-Type; the format is sniffed).
@@ -133,47 +144,47 @@ class PhotoActions @Inject constructor(
     val takenMs = taken_at?.let(::parseTime)
     // Existence check before touching disk; create() re-resolves inside its transaction.
     val blob = blobs.put(body.toByteArray())
-    val (photo, _) = store.create(collection, blob, takenMs, note, metaObj, client_id)
+    val (photo, _) = store.create(ctx.current().id, collection, blob, takenMs, note, metaObj, client_id)
     return photo
   }
 
   @Get("/api/photos/{token}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun get(@PathParam token: String) = store.get(token)
+  fun get(@PathParam token: String) = store.get(ctx.photo(token))
 
   @Patch("/api/photos/{token}")
   @Authenticated(capabilities = [USER])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
   fun update(@PathParam token: String, @RequestBody req: PhotoPatch) =
-    store.update(token, req.note, req.meta?.let { Json.normalize(it) as Map<String, Any?> }, req.taken_at?.let(::parseTime), req.collection)
+    store.update(ctx.photo(token), req.note, req.meta?.let { Json.normalize(it) as Map<String, Any?> }, req.taken_at?.let(::parseTime), ctx.current().id, req.collection, req.action, req.qty)
 
   @Post("/api/photos/{token}/copy")
   @Authenticated(capabilities = [USER])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
-  fun copy(@PathParam token: String, @RequestBody req: CopyReq) = store.copy(token, req.collection)
+  fun copy(@PathParam token: String, @RequestBody req: CopyReq) = store.copy(ctx.photo(token), ctx.current().id, req.collection)
 
   @Post("/api/photos/{token}/restore")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun restore(@PathParam token: String) = store.restore(token)
+  fun restore(@PathParam token: String) = store.restore(ctx.photo(token))
 
   @Delete("/api/photos/{token}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun delete(@PathParam token: String) = store.delete(token)
+  fun delete(@PathParam token: String) = store.delete(ctx.photo(token))
 
   @Post("/api/photos/batch")
   @Authenticated(capabilities = [USER])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
-  fun batch(@RequestBody req: BatchReq) = BatchResp(store.batch(req.op, req.tokens, req.collection))
+  fun batch(@RequestBody req: BatchReq) = BatchResp(store.batch(req.op, ctx.photos(req.tokens), ctx.current().id, req.collection, req.action, req.qty))
 
-  /** Empties trash older than N days (default 30) and deletes blobs nothing references any more. */
+  /** Empties trash older than N days (default 30), in every vault, and deletes blobs nothing references any more. */
   @Post("/api/admin/purge")
-  @Authenticated(capabilities = [USER])
+  @Authenticated(capabilities = [ADMIN])
   @ResponseContentType(JSON)
   fun purge(@QueryParam older_than_days: Int?): PurgeResp {
     val days = older_than_days ?: 30
@@ -188,6 +199,7 @@ class BlobAction @Inject constructor(
   private val store: PhotoStore,
   private val blobs: BlobStore,
   private val httpCall: @JvmSuppressWildcards ActionScoped<HttpCall>,
+  private val ctx: VaultContext,
 ) : WebAction {
   /**
    * Image bytes. `size=thumb` serves the derived JPEG (falls back to the original when none can
@@ -197,7 +209,7 @@ class BlobAction @Inject constructor(
   @Get("/blobs/{token}")
   @Authenticated(capabilities = [USER])
   fun get(@PathParam token: String, @QueryParam size: String?, @QueryParam version: String?, @QueryParam v: String?): Response<ResponseBody> {
-    val (sha, contentType) = store.blobRef(token, version)
+    val (sha, contentType) = store.blobRef(ctx.photo(token), version)
     val thumb = if (size == "thumb") blobs.thumbOrNull(sha) else null
     val file = thumb ?: blobs.original(sha)
     if (!file.exists()) throw NotFoundException("blob for '$token' is missing on disk")
@@ -231,33 +243,33 @@ class BlobAction @Inject constructor(
 data class NamespaceList(val namespaces: List<NamespaceDto>)
 data class RecordList(val records: List<RecordDto>)
 
-class RecordActions @Inject constructor(private val store: RecordStore, private val json: Json) : WebAction {
+class RecordActions @Inject constructor(private val store: RecordStore, private val json: Json, private val ctx: VaultContext) : WebAction {
   @Get("/api/records")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun namespaces() = NamespaceList(store.namespaces())
+  fun namespaces() = NamespaceList(store.namespaces(ctx.current().id))
 
   @Get("/api/records/{ns}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun scan(@PathParam ns: String, @QueryParam prefix: String?, @QueryParam limit: Int?) = RecordList(store.scan(ns.unescaped(), prefix, limit ?: 500))
+  fun scan(@PathParam ns: String, @QueryParam prefix: String?, @QueryParam limit: Int?) = RecordList(store.scan(ctx.current().id, ns.unescaped(), prefix, limit ?: 500))
 
   @Get("/api/records/{ns}/{k}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun get(@PathParam ns: String, @PathParam k: String) = store.get(ns.unescaped(), k.unescaped())
+  fun get(@PathParam ns: String, @PathParam k: String) = store.get(ctx.current().id, ns.unescaped(), k.unescaped())
 
   /** Body is the JSON value itself (object, array, string, number...). */
   @Put("/api/records/{ns}/{k}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun put(@PathParam ns: String, @PathParam k: String, @RequestBody body: String) = store.put(ns.unescaped(), k.unescaped(), json.parse(body))
+  fun put(@PathParam ns: String, @PathParam k: String, @RequestBody body: String) = store.put(ctx.current().id, ns.unescaped(), k.unescaped(), json.parse(body))
 
   @Delete("/api/records/{ns}/{k}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
   fun delete(@PathParam ns: String, @PathParam k: String): Ok {
-    store.delete(ns.unescaped(), k.unescaped())
+    store.delete(ctx.current().id, ns.unescaped(), k.unescaped())
     return Ok()
   }
 }
@@ -268,11 +280,12 @@ data class PublishingReq(val enabled: Boolean)
 data class CursorReq(val feed: String, val cursor: Long, val shard: Int?, val shard_count: Int?)
 data class CursorResp(val consumer: String, val feed: String, val shard: Int, val cursor: Long)
 
-class FeedActions @Inject constructor(private val feeds: FeedService, private val publisher: FeedPublisher) : WebAction {
+class FeedActions @Inject constructor(private val feeds: FeedService, private val publisher: FeedPublisher, private val ctx: VaultContext) : WebAction {
   /**
    * The feed endpoint (feedz-compatible reply shape): {"entries": [...], "cursor": N}.
    * Poll with after=<cursor>. Optional filters: collection= (photos), ns= (records),
-   * transform= (intents, results).
+   * transform= (intents, results). With a vault named (header, ?vault=, or a pinned token) the
+   * feed carries that vault only; otherwise every vault, each entry saying which.
    */
   @Get("/_feeds/fetch/{feed}")
   @Authenticated(capabilities = [USER])
@@ -286,7 +299,7 @@ class FeedActions @Inject constructor(private val feeds: FeedService, private va
     @QueryParam collection: String?,
     @QueryParam ns: String?,
     @QueryParam transform: String?,
-  ) = feeds.fetch(feed, after ?: 0, limit ?: 100, shard, shard_count, collection, ns, transform)
+  ) = feeds.fetch(feed, after ?: 0, limit ?: 100, shard, shard_count, ctx.explicit(), ctx.current(), collection, ns, transform)
 
   @Get("/_feeds/status")
   @Authenticated(capabilities = [USER])
@@ -329,7 +342,7 @@ class FeedActions @Inject constructor(private val feeds: FeedService, private va
 
   /** The per-feed publish switch. Off = mutations accumulate as pending; consumers see nothing new. */
   @Put("/_feeds/publishing/{feed}")
-  @Authenticated(capabilities = [USER])
+  @Authenticated(capabilities = [ADMIN])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
   fun setPublishing(@PathParam feed: String, @RequestBody req: PublishingReq): Ok {
@@ -340,7 +353,7 @@ class FeedActions @Inject constructor(private val feeds: FeedService, private va
 
 // ------------------------------------------------------------------------------------ tokens
 
-data class TokenReq(val name: String)
+data class TokenReq(val name: String, val vault: String?, val read_only: Boolean?, val ttl_days: Int?)
 data class TokenCreated(val id: Long, val name: String, val token: String)
 data class TokenList(val tokens: List<TokenDto>)
 
@@ -349,23 +362,30 @@ class TokenActions @Inject constructor(
   private val caller: @JvmSuppressWildcards ActionScoped<misk.MiskCaller?>,
 ) : WebAction {
   @Get("/api/tokens")
-  @Authenticated(capabilities = [USER])
+  @Authenticated(capabilities = [ADMIN])
   @ResponseContentType(JSON)
   fun list() = TokenList(tokens.list())
 
-  /** Mint a script token. The plaintext is in this response and nowhere else, ever. */
+  /**
+   * Mint a script token. The plaintext is in this response and nowhere else, ever. `vault` pins
+   * it to one vault, `read_only` to GETs (plus saving its own feed cursors), `ttl_days` expires it.
+   */
   @Post("/api/tokens")
-  @Authenticated(capabilities = [USER])
+  @Authenticated(capabilities = [ADMIN])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
   fun create(@RequestBody req: TokenReq): TokenCreated {
     if (req.name.isBlank()) throw BadRequestException("name is required")
-    val (id, plain) = tokens.create("script", req.name.trim(), caller.get()?.principal ?: "?")
+    if (req.ttl_days != null && req.ttl_days <= 0) throw BadRequestException("ttl_days must be positive")
+    val (id, plain) = tokens.create(
+      "script", req.name.trim(), caller.get()?.principal ?: "?",
+      ttlMs = req.ttl_days?.let { Duration.ofDays(it.toLong()).toMillis() }, vault = req.vault?.takeIf { it.isNotBlank() }, readOnly = req.read_only == true,
+    )
     return TokenCreated(id, req.name.trim(), plain)
   }
 
   @Delete("/api/tokens/{id}")
-  @Authenticated(capabilities = [USER])
+  @Authenticated(capabilities = [ADMIN])
   @ResponseContentType(JSON)
   fun revoke(@PathParam id: Long): Ok {
     if (!tokens.revoke(id)) throw NotFoundException("no live token $id")
@@ -392,7 +412,15 @@ class TransformActions @Inject constructor(
   private val json: Json,
   private val runner: TransformRunner,
   private val caller: @JvmSuppressWildcards ActionScoped<misk.MiskCaller?>,
+  private val ctx: VaultContext,
 ) : WebAction {
+  /** Intents are named by token; a pinned caller only reaches the ones on its vault's photos. */
+  private fun own(intent: String): String {
+    val pin = ctx.pinned() ?: return intent
+    if (store.vaultOfIntent(intent) != pin) throw NotFoundException("no intent '$intent'")
+    return intent
+  }
+
   @Get("/api/transforms")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
@@ -411,7 +439,7 @@ class TransformActions @Inject constructor(
   @Get("/api/collections/{slug}/transforms")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun chain(@PathParam slug: String) = ChainResp(slug, store.chain(slug))
+  fun chain(@PathParam slug: String) = ChainResp(slug, store.chain(ctx.current().id, slug))
 
   /** Replace a collection's chain. Applies to photos that enter the collection from now on. */
   @Put("/api/collections/{slug}/transforms")
@@ -419,13 +447,22 @@ class TransformActions @Inject constructor(
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
   fun setChain(@PathParam slug: String, @RequestBody req: ChainReq) =
-    ChainResp(slug, store.setChain(slug, req.transforms.map { it.transform to it.params?.let { p -> Json.normalize(p) as Map<String, Any?> } }))
+    ChainResp(slug, store.setChain(ctx.current().id, slug, req.transforms.map { it.transform to it.params?.let { p -> Json.normalize(p) as Map<String, Any?> } }))
+
+  /**
+   * Start the chain for photos already in the collection: those it has never run on, or with
+   * all=true every live photo (a re-run after editing the chain).
+   */
+  @Post("/api/collections/{slug}/transforms/run")
+  @Authenticated(capabilities = [USER])
+  @ResponseContentType(JSON)
+  fun backfill(@PathParam slug: String, @QueryParam all: Boolean?) = mapOf("started" to store.backfill(ctx.current().id, slug, all == true))
 
   /** Versions (the tree), plus every intent and its results: the photo's processing history. */
   @Get("/api/photos/{token}/history")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun history(@PathParam token: String) = store.history(token)
+  fun history(@PathParam token: String) = store.history(ctx.photo(token))
 
   /** Ask for one transform on one photo, outside any chain. */
   @Post("/api/photos/{token}/intents")
@@ -433,24 +470,24 @@ class TransformActions @Inject constructor(
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
   fun request(@PathParam token: String, @RequestBody req: IntentReq): IntentDto =
-    store.request(token, req.transform, req.params?.let { Json.normalize(it) as Map<String, Any?> }, caller.get()?.principal)
+    store.request(ctx.photo(token), req.transform, req.params?.let { Json.normalize(it) as Map<String, Any?> }, caller.get()?.principal)
 
   /** Make a version current (e.g. step back to the original). */
   @Put("/api/photos/{token}/current")
   @Authenticated(capabilities = [USER])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
-  fun setCurrent(@PathParam token: String, @RequestBody req: CurrentReq) = store.setCurrent(token, req.version)
+  fun setCurrent(@PathParam token: String, @RequestBody req: CurrentReq) = store.setCurrent(ctx.photo(token), req.version)
 
   @Get("/api/intents")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun pending(@QueryParam transform: String?, @QueryParam limit: Int?) = IntentList(store.pending(transform, builtinOnly = false, limit = limit ?: 100))
+  fun pending(@QueryParam transform: String?, @QueryParam limit: Int?) = IntentList(store.pending(transform, builtinOnly = false, limit = limit ?: 100, vaultId = ctx.explicit()?.id))
 
   @Get("/api/intents/{token}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun intent(@PathParam token: String) = store.intent(token)
+  fun intent(@PathParam token: String) = store.intent(own(token))
 
   /** A worker's answer for an extract transform (or a failure / skip / halt of any kind). */
   @Post("/api/intents/{token}/results")
@@ -458,7 +495,7 @@ class TransformActions @Inject constructor(
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
   fun result(@PathParam token: String, @RequestBody req: ResultReq): IntentDto =
-    store.addResult(token, req.status ?: "ok", Json.normalize(req.data), req.meta_patch?.let { Json.normalize(it) as Map<String, Any?> }, req.error, req.worker)
+    store.addResult(own(token), req.status ?: "ok", Json.normalize(req.data), req.meta_patch?.let { Json.normalize(it) as Map<String, Any?> }, req.error, req.worker)
 
   /**
    * A worker's answer for a rewrite transform: the body is the new image. It becomes a child of
@@ -476,7 +513,7 @@ class TransformActions @Inject constructor(
     @RequestBody body: ByteString,
   ): IntentDto {
     if (body.size == 0) throw BadRequestException("empty body: send the transformed image bytes")
-    return store.addResult(token, "ok", data?.let(json::parse), null, null, worker, blobs.put(body.toByteArray()), current != false)
+    return store.addResult(own(token), "ok", data?.let(json::parse), null, null, worker, blobs.put(body.toByteArray()), current != false)
   }
 
   /** Run pending built-in intents now instead of waiting for the next tick. */
@@ -491,6 +528,7 @@ class InboxAction @Inject constructor(
   private val photos: PhotoStore,
   private val suggester: Suggester,
   private val config: SnapzConfig,
+  private val ctx: VaultContext,
 ) : WebAction {
   /**
    * Everything waiting to be filed, newest first, each with collections ranked by probability.
@@ -501,12 +539,13 @@ class InboxAction @Inject constructor(
   @ResponseContentType(JSON)
   fun inbox(@QueryParam limit: Int?): InboxResp {
     val slug = config.snapz.inbox_slug
+    val vault = ctx.current()
     val page = try {
-      photos.list(slug, null, limit ?: 200, null, false).photos
+      photos.list(vault.id, slug, null, limit ?: 200, null, false).photos
     } catch (e: NotFoundException) {
       return InboxResp(slug, listOf())
     }
-    val ranked = db.tx { c -> suggester.suggest(c, null).mapKeys { (id, _) -> c.select("SELECT token FROM photos WHERE id = ?", listOf(id)) { it.getString(1) }.first() } }
+    val ranked = db.tx { c -> suggester.suggest(c, vault.id, null).mapKeys { (id, _) -> c.select("SELECT token FROM photos WHERE id = ?", listOf(id)) { it.getString(1) }.first() } }
     return InboxResp(slug, page.map { p -> InboxItem(p, ranked[p.token]?.first ?: listOf(), ranked[p.token]?.second ?: mapOf()) })
   }
 }
@@ -543,6 +582,8 @@ class InfoAction @Inject constructor(private val config: SnapzConfig, private va
         "feed_shards" to s.feed_shards,
         "transform_interval_ms" to s.transform_interval_ms,
         "inbox_slug" to s.inbox_slug,
+        "default_vault" to s.default_vault,
+        "timezone" to s.timezone,
         "ios_redirect_scheme" to s.ios_redirect_scheme,
       ),
       enums = listOf(
@@ -552,22 +593,33 @@ class InfoAction @Inject constructor(private val config: SnapzConfig, private va
           "bearer" to "Authorization: Bearer <token>. Any token kind works.",
           "token-login" to "POST /auth/token-login {token} → session cookie. Web UI fallback when OIDC is off.",
         ),
-        e("token kind", "api_tokens.kind — only SHA-256 hashes are stored.",
+        e("token kind", "api_tokens.kind — only SHA-256 hashes are stored. Any kind can be pinned to a vault and/or read-only.",
           "session" to "Web cookie ($SESSION_COOKIE), expires after session_ttl_days.",
           "device" to "One per signed-in phone; no expiry; revoked on sign-out.",
-          "script" to "Minted by hand (tokens tab / POST /api/tokens); no expiry.",
+          "script" to "Minted by hand (tokens tab / POST /api/tokens); optional vault pin, read-only flag and ttl_days.",
           "bootstrap" to "Defined in config, not in the DB. Dev / break-glass.",
         ),
-        e("capability", "misk capability checked on every /api, /blobs and /_feeds route.", USER to "The only one: single-tenant, a caller is in or out."),
+        e("capability", "misk capability checked on every /api, /blobs and /_feeds route.",
+          USER to "Every valid credential. A read-only one only has it on GETs (and on PUT /_feeds/cursors, so a consumer can save its place).",
+          ADMIN to "Credentials that are neither pinned to a vault nor read-only: vault and token management, purge, feed publish switches.",
+          "vault:<slug>" to "Carried by a pinned credential: it sees that vault only.",
+        ),
+        e("vault selection", "Which vault a request is about.",
+          "$VAULT_HEADER header" to "What the apps and snapz.py send (SNAPZ_VAULT).",
+          "?vault=" to "Same thing for curl.",
+          "(neither)" to "The default vault (${s.default_vault}) for anything addressed by name; feeds carry every vault.",
+          "by token" to "Photos, blobs and intents are addressed by token and found in whichever vault they live. Moving one to a collection moves it into the request's vault.",
+        ),
         e("feed", "GET /_feeds/fetch/{feed}. Each has its own sequence and publish switch.",
           "photos" to "One entry per photo row. Filter: collection=. Deletes arrive with deleted_at set.",
           "collections" to "One entry per collection (with live counts).",
+          "vaults" to "One entry per vault (with live counts).",
           "records" to "Derived (ns, k) JSON documents. Filter: ns=.",
           "intents" to "Requests to run a transform on a photo version. Append-only. Filter: transform=. What workers consume.",
           "results" to "What transforms answered. Append-only. Filter: transform=.",
         ),
         e("batch op", "POST /api/photos/batch {op, tokens, collection?} — all-or-nothing.",
-          "move" to "Change collection_id (works on trashed photos too).",
+          "move" to "Change collection_id (works on trashed photos too). Optional action / qty: the verb it is filed with.",
           "copy" to "New photo row pointing at the same sha256 blob; no bytes are duplicated.",
           "delete" to "Soft delete: sets deleted_at, photo goes to the trash.",
           "restore" to "Clear deleted_at.",
@@ -615,7 +667,7 @@ class InfoAction @Inject constructor(private val config: SnapzConfig, private va
           "error" to "Failed. The chain stops; post another result to retry.",
         ),
         e("suggestion feature", "Inputs to P(collection | photo) for inbox triage (naive Bayes, add-one smoothing).",
-          "barcode" to "yes / no", "hour" to "UTC hour in 3h buckets", "weekend" to "yes / no", "shape" to "portrait / landscape / square",
+          "barcode" to "yes / no", "hour" to "local hour (${s.timezone}) in 3h buckets", "weekend" to "yes / no", "shape" to "portrait / landscape / square",
           "source" to "meta.source", "prev" to "collection of the nearest earlier filed photo within 10 minutes, else none",
         ),
         e("photo meta convention", "meta is free-form JSON; these keys are understood by the UIs.",
@@ -623,6 +675,14 @@ class InfoAction @Inject constructor(private val config: SnapzConfig, private va
           "barcodes" to "[{symbology, value, box?, source?}] — values are denormalized to photo.barcodes and searchable with ?barcode=.",
           "barcodes[].box" to "[x, y, w, h] as fractions of the upright image, origin top-left. Drawn as an overlay.",
           "filename" to "Original file name for web/cli uploads.",
+          "action" to "The verb the photo was filed with — one of its collection's actions. Absent = just a picture.",
+          "qty" to "Units for the action, when the action takes one (default 1).",
+        ),
+        e("collection action", "A collection's action set (PUT /api/collections/{slug}/actions): the verbs a photo filed there can carry. Names are free-form; the server only checks membership. Set when filing (move / PATCH with action, qty); leaving the collection clears it.",
+          "name" to "What lands in meta.action.",
+          "label" to "Optional button text.",
+          "qty" to "true = the action takes a quantity (meta.qty).",
+          "e.g. pantry" to "consume (stock -= qty) / out (stock = 0) / purchase (stock += qty) / count (stock = qty), as registered and interpreted by scripts/pantry_orders.py.",
         ),
         e("blob size", "GET /blobs/{token}?size=", "(none)" to "Original bytes.", "thumb" to "JPEG, longest side thumb_px; falls back to the original when none can be made."),
       ),
@@ -638,4 +698,16 @@ class WebUiAction @Inject constructor(private val resources: ResourceLoader) : W
   @Unauthenticated
   @ResponseContentType(MediaTypes.TEXT_HTML)
   fun index(): String = resources.utf8("classpath:/web/index.html") ?: throw NotFoundException("web ui not bundled")
+
+  @Get("/icon.png")
+  @Unauthenticated
+  fun icon(): Response<ResponseBody> {
+    val bytes = javaClass.getResourceAsStream("/web/icon.png")?.use { it.readBytes() } ?: throw NotFoundException("icon not bundled")
+    val body = object : ResponseBody {
+      override fun writeTo(sink: BufferedSink) {
+        sink.write(bytes)
+      }
+    }
+    return Response(body, Headers.Builder().add("Content-Type", "image/png").add("Cache-Control", "public, max-age=86400").build(), 200)
+  }
 }

@@ -12,7 +12,7 @@ import misk.logging.getLogger
 
 /** feed name -> backing table. Every feed table carries (id, feed_sync_id, shard). */
 val FEEDS = linkedMapOf(
-  "photos" to "photos", "collections" to "collections", "records" to "records",
+  "photos" to "photos", "collections" to "collections", "records" to "records", "vaults" to "vaults",
   "intents" to "transform_intents", "results" to "transform_results",
 )
 
@@ -125,19 +125,23 @@ class FeedService @Inject constructor(
   private val collections: CollectionStore,
   private val records: RecordStore,
   private val transforms: TransformStore,
+  private val vaults: VaultStore,
 ) {
   /**
    * One page of entries with feed_sync_id > [after], ascending. `cursor` in the reply is the
-   * position to pass as the next `after` (unchanged when the page is empty).
+   * position to pass as the next `after` (unchanged when the page is empty). [vault] null = every
+   * vault; a `collection` filter is a slug in [current].
    */
-  fun fetch(feed: String, after: Long, limit: Int, shard: Int?, shardCount: Int?, collection: String?, ns: String?, transform: String? = null): FeedPage {
+  fun fetch(feed: String, after: Long, limit: Int, shard: Int?, shardCount: Int?, vault: Vault?, current: Vault, collection: String?, ns: String?, transform: String? = null): FeedPage {
     val n = limit.coerceIn(1, 1000)
+    val v = vault?.id
     val (entries, last) = when (feed) {
-      "photos" -> photos.feed(after, n, shard, shardCount, collection).let { it to it.lastOrNull()?.feed_sync_id }
-      "collections" -> collections.feed(after, n, shard, shardCount).let { it to it.lastOrNull()?.feed_sync_id }
-      "records" -> records.feed(after, n, shard, shardCount, ns).let { it to it.lastOrNull()?.feed_sync_id }
-      "intents" -> transforms.intentFeed(after, n, shard, shardCount, transform).let { it to it.lastOrNull()?.feed_sync_id }
-      "results" -> transforms.resultFeed(after, n, shard, shardCount, transform).let { it to it.lastOrNull()?.feed_sync_id }
+      "photos" -> photos.feed(after, n, shard, shardCount, v, current.id, collection).let { it to it.lastOrNull()?.feed_sync_id }
+      "collections" -> collections.feed(after, n, shard, shardCount, v).let { it to it.lastOrNull()?.feed_sync_id }
+      "records" -> records.feed(after, n, shard, shardCount, v, ns).let { it to it.lastOrNull()?.feed_sync_id }
+      "vaults" -> vaults.feed(after, n, shard, shardCount, v).let { it to it.lastOrNull()?.feed_sync_id }
+      "intents" -> transforms.intentFeed(after, n, shard, shardCount, v, transform).let { it to it.lastOrNull()?.feed_sync_id }
+      "results" -> transforms.resultFeed(after, n, shard, shardCount, v, transform).let { it to it.lastOrNull()?.feed_sync_id }
       else -> throw NotFoundException("no feed '$feed' (have: ${FEEDS.keys.joinToString()})")
     }
     return FeedPage(feed, entries, last ?: after)
