@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>snapz</title>
+<link rel="icon" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
 <style>
 :root{--bg:#0b0e11;--bg2:#12161b;--bg3:#1a2027;--line:#252c35;--fg:#d7dde3;--dim:#6b7580;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff;--sel:#1f3a5f;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
 @media (prefers-color-scheme: light){:root{--bg:#f6f7f8;--bg2:#eceef1;--bg3:#e1e4e8;--line:#cfd4da;--fg:#1b1f24;--dim:#6a737d;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--acc:#0969da;--sel:#cfe3ff}}
@@ -25,6 +27,8 @@ button.danger:hover:not(:disabled){border-color:var(--bad);color:var(--bad)}
 input:focus,textarea:focus,select:focus{outline:1px solid var(--acc);outline-offset:-1px}
 #top{display:flex;gap:10px;align-items:center;padding:2px 8px;background:var(--bg2);border-bottom:1px solid var(--line);flex:none}
 #top b{color:var(--acc)}
+#top img{height:16px;width:16px;border-radius:3px;display:block}
+#vault{font-weight:700;border-color:var(--acc);max-width:220px}
 #top .tab{cursor:pointer;padding:0 4px;color:var(--dim)}#top .tab.on{color:var(--fg);font-weight:700;border-bottom:1px solid var(--acc)}
 #top .sp{flex:1}
 #main{flex:1;display:flex;min-height:0}
@@ -91,11 +95,13 @@ td.wrap{white-space:normal;word-break:break-all;max-width:520px}
 </head>
 <body>
 <div id="top">
-  <b>snapz</b>
+  <img src="/icon.png" alt=""><b>snapz</b>
+  <select id="vault" class="hide" title="vault: a namespace over collections, photos and records"></select>
   <span class="tab" data-tab="photos">photos</span>
   <span class="tab" data-tab="feeds">feeds</span>
   <span class="tab" data-tab="records">records</span>
   <span class="tab" data-tab="transforms">transforms</span>
+  <span class="tab" data-tab="vaults">vaults</span>
   <span class="tab" data-tab="tokens">tokens</span>
   <span class="tab" data-tab="info">info</span>
   <span class="sp"></span>
@@ -136,6 +142,9 @@ function say(msg, cls = "dim") { const el = $("#st-msg"); el.textContent = msg; 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
 async function api(method, path, body, opts = {}) {
   const init = { method, headers: {}, credentials: "same-origin", signal: AbortSignal.timeout(opts.timeout ?? 15000) };
+  // Names (collections, records, the inbox) resolve in this vault. opts.vault overrides; null = name none.
+  const vault = opts.vault === undefined ? S.vault : opts.vault;
+  if (vault) init.headers["X-Snapz-Vault"] = vault;
   if (opts.raw) { init.body = opts.raw; init.headers["Content-Type"] = opts.raw.type || "application/octet-stream"; }
   else if (body !== undefined) { init.body = JSON.stringify(body); init.headers["Content-Type"] = "application/json"; }
   const r = await fetch(path, init);
@@ -152,12 +161,15 @@ async function run(label, fn) {
 // ---------------------------------------------------------------------------- state
 const S = {
   tab: "photos", me: null,
+  vault: null, vaults: [], defaultVault: null,  // vault: slug of the one being viewed (in the URL)
+  pending: null,                        // a filing waiting for its verb: {collection, vault, tokens, actions:[{name,label,qty,p}]}
+  allColls: {},                         // other vaults' collections, for cross-vault move/copy
   collections: [], coll: null,          // coll: slug | null (=all) | "~trash"
   photos: [], next: null, loading: false, sel: new Set(), cur: -1, anchor: -1,
   view: localStorage.snapzView || "grid", tile: +(localStorage.snapzTile || 112), barcode: "",
   recNs: null,
   openTok: null,                        // photo shown in the detail pane (also in the URL)
-  feedCur: { photos: 0, collections: 0, results: 0 }, // live-refresh positions in the change feeds
+  feedCur: { photos: 0, collections: 0, results: 0, vaults: 0 }, // live-refresh positions in the change feeds
   inbox: null,                          // slug of the inbox collection (from /api/inbox)
   sug: {},                              // photo token -> ranked [{collection, p}] while viewing the inbox
   transforms: [],
@@ -166,12 +178,14 @@ const S = {
 
 // ---------------------------------------------------------------------------- url <-> state
 // Everything needed to get back to what's on screen lives in the hash, so a URL can be pasted:
-//   #/photos/<collection|~all|~trash>[/<photo token>][?view=table&bc=<barcode>]
-//   #/feeds   #/records/<ns>   #/tokens   #/info
-const TABS = ["photos", "feeds", "records", "transforms", "tokens", "info"];
+//   #/@<vault>/photos/<collection|~all|~trash>[/<photo token>][?view=table&bc=<barcode>]
+//   #/@<vault>/records/<ns>   #/feeds   #/vaults   #/tokens   #/info
+// (no @<vault> = the server's default vault)
+const TABS = ["photos", "feeds", "records", "transforms", "vaults", "tokens", "info"];
 function urlFor() {
-  if (S.tab !== "photos") return "#/" + S.tab + (S.tab === "records" && S.recNs ? "/" + encodeURIComponent(S.recNs) : "");
-  let h = "#/photos/" + encodeURIComponent(S.coll ?? "~all");
+  const v = S.vault && S.vault !== S.defaultVault ? "#/@" + encodeURIComponent(S.vault) + "/" : "#/";
+  if (S.tab !== "photos") return v + S.tab + (S.tab === "records" && S.recNs ? "/" + encodeURIComponent(S.recNs) : "");
+  let h = v + "photos/" + encodeURIComponent(S.coll ?? "~all");
   if (S.openTok) h += "/" + encodeURIComponent(S.openTok);
   const q = new URLSearchParams();
   if (S.view === "table") q.set("view", "table");
@@ -190,7 +204,8 @@ function parseUrl() {
   const [path, qs] = raw.split("?");
   const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
   const q = new URLSearchParams(qs || "");
-  const out = { tab: "photos", coll: null, openTok: null, view: q.get("view") === "table" ? "table" : null, barcode: q.get("bc") || "", recNs: null };
+  const vault = parts[0]?.startsWith("@") ? parts.shift().slice(1) : null;
+  const out = { vault, tab: "photos", coll: null, openTok: null, view: q.get("view") === "table" ? "table" : null, barcode: q.get("bc") || "", recNs: null };
   if (TABS.includes(parts[0])) {
     out.tab = parts[0];
     if (out.tab === "photos") { out.coll = !parts[1] || parts[1] === "~all" ? null : parts[1]; out.openTok = parts[2] || null; }
@@ -200,7 +215,11 @@ function parseUrl() {
 }
 function applyUrl() {
   const u = parseUrl();
-  S.coll = u.coll; S.openTok = u.openTok; S.barcode = u.barcode;
+  const want = S.me.vault || u.vault || S.defaultVault;
+  S.vault = S.vaults.some(v => v.slug === want) ? want : (S.vaults[0]?.slug ?? S.defaultVault);
+  if (u.vault && S.vault !== u.vault) say(`no vault '${u.vault}'`, "warn");
+  renderVaultPicker();
+  S.inbox = null; S.coll = u.coll; S.openTok = u.openTok; S.barcode = u.barcode;
   if (u.view) S.view = u.view; else if (location.hash.includes("/photos")) S.view = "grid";
   if (u.recNs) S.recNs = u.recNs;
   S.sel.clear(); S.cur = -1; S.anchor = -1;
@@ -246,7 +265,7 @@ async function showLogin() {
     <form id="tl"><div class="dim">or paste an API token</div>
     <input id="tl-tok" type="password" autocomplete="off" placeholder="snapz_…">
     <button>use token</button> <span id="tl-err" class="bad"></span></form></div>`;
-  $("#who").textContent = ""; $("#logout").classList.add("hide");
+  $("#who").textContent = ""; $("#logout").classList.add("hide"); $("#vault").classList.add("hide"); S.me = null;
   $("#tl").onsubmit = async ev => {
     ev.preventDefault();
     try { await api("POST", "/auth/token-login", { token: $("#tl-tok").value }, { noLogin: true }); boot(); }
@@ -254,6 +273,68 @@ async function showLogin() {
   };
 }
 $("#logout").onclick = async () => { await api("POST", "/auth/logout", undefined, { noLogin: true }); showLogin(); };
+
+// ---------------------------------------------------------------------------- vaults
+async function loadVaults() {
+  const r = await api("GET", "/api/vaults", undefined, { vault: null });
+  S.vaults = r.vaults; S.defaultVault = r.default;
+  renderVaultPicker();
+}
+function renderVaultPicker() {
+  const el = $("#vault");
+  el.classList.toggle("hide", !S.me);
+  el.disabled = S.vaults.length < 2;
+  el.innerHTML = S.vaults.map(v => `<option value="${esc(v.slug)}">${esc(v.icon || "▣")} ${esc(v.slug)} · ${v.photo_count}</option>`).join("");
+  if (S.vault) el.value = S.vault;
+}
+function selectVault(slug) {
+  if (slug === S.vault) return;
+  S.vault = slug; S.coll = null; S.openTok = null; S.recNs = null; S.inbox = null; S.sug = {}; S.sel.clear(); S.cur = -1; S.anchor = -1; S.barcode = "";
+  renderVaultPicker();
+  setTab(S.tab === "vaults" ? "photos" : S.tab);
+}
+$("#vault").onchange = ev => selectVault(ev.target.value);
+
+async function vaultsTab() {
+  const admin = S.me.admin;
+  main.innerHTML = `<div class="pane"><h3>vaults <span class="dim" style="font-weight:400">— a namespace over collections, photos, records and the inbox. The same collection name in two vaults is two collections. Blobs are deduplicated across all of them.</span></h3>
+    <div id="v-list"></div>
+    ${admin ? `<h3>new vault</h3><form id="v-new"><input id="v-name" placeholder="name, e.g. Work" size="24"> <input id="v-icon" placeholder="icon" size="4"> <input id="v-desc" placeholder="description" size="40"> <button>create</button></form>` : `<p class="dim">This credential is pinned to one vault.</p>`}
+    <h3>selecting one</h3><pre class="dim" style="margin:0">X-Snapz-Vault: work          header (what this page and snapz.py send; SNAPZ_VAULT=work)
+…/api/collections?vault=work   or a query parameter
+(neither)                      the default vault for names; feeds carry every vault
+photos, blobs and intents are addressed by token and found wherever they live;
+moving a photo to a collection moves it into the request's vault</pre></div>`;
+  const load = async () => {
+    await loadVaults();
+    $("#v-list").innerHTML = `<table><thead><tr><th></th><th>vault</th><th>name</th><th class="n">colls</th><th class="n">photos</th><th class="n">size</th><th class="n">last</th><th>created</th><th>description</th><th></th></tr></thead><tbody>` +
+      S.vaults.map(v => `<tr class="${v.slug === S.vault ? "sel" : ""}"><td>${esc(v.icon || "▣")}</td><td><a href="#/@${encodeURIComponent(v.slug)}/photos/~all" class="${v.slug === S.vault ? "ok" : ""}">${esc(v.slug)}</a>${v.is_default ? ' <span class="dim">default</span>' : ""}</td>
+        <td>${esc(v.name)}</td><td class="n">${v.collection_count}</td><td class="n">${v.photo_count}</td><td class="n dim">${fmtBytes(v.bytes)}</td><td class="n dim">${age(v.last_photo_at)}</td><td class="dim">${fmtTs(v.created_at)}</td>
+        <td class="wrap dim" style="word-break:normal">${esc(v.description)}</td>
+        <td>${admin ? `<button data-ed="${esc(v.slug)}">edit</button> <button class="danger" data-rm="${esc(v.slug)}" ${v.is_default ? "disabled title='the default vault cannot be deleted'" : ""}>delete</button>` : ""}</td></tr>`).join("") + `</tbody></table>`;
+    $("#v-list").querySelectorAll("[data-ed]").forEach(b => b.onclick = async () => {
+      const v = S.vaults.find(x => x.slug === b.dataset.ed);
+      const name = prompt("Name", v.name); if (name == null) return;
+      const icon = prompt("Icon (one emoji)", v.icon || ""); if (icon == null) return;
+      const description = prompt("Description", v.description || ""); if (description == null) return;
+      await run("update vault", () => api("PATCH", `/api/vaults/${encodeURIComponent(v.slug)}`, { name, icon, description }, { vault: null })); load();
+    });
+    $("#v-list").querySelectorAll("[data-rm]").forEach(b => b.onclick = async () => {
+      const v = S.vaults.find(x => x.slug === b.dataset.rm);
+      if (!confirm(`Delete vault '${v.slug}'` + (v.photo_count ? ` and move its ${v.photo_count} photos to the trash?` : "?") + "\nTokens pinned to it stop working.")) return;
+      await run("delete vault", () => api("DELETE", `/api/vaults/${encodeURIComponent(v.slug)}?force=true`, undefined, { vault: null }));
+      if (S.vault === v.slug) { S.vault = S.defaultVault; syncUrl(); }
+      load();
+    });
+  };
+  if (admin) $("#v-new").onsubmit = async ev => {
+    ev.preventDefault();
+    const name = $("#v-name").value.trim(); if (!name) return;
+    await run("create vault", () => api("POST", "/api/vaults", { name, icon: $("#v-icon").value.trim() || undefined, description: $("#v-desc").value.trim() || undefined }, { vault: null }));
+    ev.target.reset(); load();
+  };
+  startPoll(load, 5000);
+}
 
 // ---------------------------------------------------------------------------- photos tab
 const collLabel = () => S.coll === "~trash" ? "trash" : S.coll ?? "all";
@@ -270,7 +351,9 @@ function photosShell() {
         <button id="b-move" title="m">move</button><button id="b-copy" title="c">copy</button>
         <button id="b-del" class="danger" title="Delete / Backspace">delete</button>
         <button id="b-restore" class="hide">restore</button>
+        <button id="b-act" title="t — set the verb on the selection (this collection's action set)">label</button>
         <button id="b-none" title="Esc">clear</button><button id="b-all" title="a">all</button>
+        <span id="b-pend" class="sug" style="margin:0"></span>
         <span class="sp"></span>
         <input id="b-bc" placeholder="barcode =" size="15" value="${esc(S.barcode)}">
         <button id="b-view" title="v">${S.view === "grid" ? "table" : "grid"}</button>
@@ -285,6 +368,7 @@ function photosShell() {
   $("#b-copy").onclick = () => batch("copy");
   $("#b-del").onclick = () => batch("delete");
   $("#b-restore").onclick = () => batch("restore");
+  $("#b-act").onclick = labelSelection;
   $("#b-none").onclick = () => { S.sel.clear(); renderPhotos(); };
   $("#b-all").onclick = () => { S.photos.forEach(p => S.sel.add(p.token)); renderPhotos(); };
   $("#b-view").onclick = toggleView;
@@ -317,7 +401,10 @@ function setTile(px) {
 function toggleView() { S.view = S.view === "grid" ? "table" : "grid"; localStorage.snapzView = S.view; $("#b-view").textContent = S.view === "grid" ? "table" : "grid"; syncUrl(); renderPhotos(); }
 
 async function loadCollections() {
-  S.collections = (await api("GET", "/api/collections")).collections;
+  const others = S.vaults.filter(v => v.slug !== S.vault);
+  const [mine, ...rest] = await Promise.all([api("GET", "/api/collections"), ...others.map(v => api("GET", "/api/collections", undefined, { vault: v.slug }).catch(() => ({ collections: [] })))]);
+  S.collections = mine.collections;
+  S.allColls = Object.fromEntries(others.map((v, i) => [v.slug, rest[i].collections]));
   renderSide();
 }
 function renderSide() {
@@ -328,7 +415,7 @@ function renderSide() {
      <td class="n">${n ?? ""}</td><td class="n dim">${fmtBytes(bytes)}</td><td class="n dim">${age(last)}</td></tr>`;
   side.innerHTML = `<table><thead><tr><th></th><th>collection</th><th class="n">n</th><th class="n">size</th><th class="n">last</th></tr></thead><tbody>
     ${row("", "∗", "all", tot.n, tot.b, S.collections.map(c => c.last_photo_at).filter(Boolean).sort().pop())}
-    ${S.collections.map(c => row(c.slug, c.icon, c.slug, c.photo_count, c.bytes, c.last_photo_at, c.description || c.name)).join("")}
+    ${S.collections.map(c => row(c.slug, c.icon, c.slug, c.photo_count, c.bytes, c.last_photo_at, [c.description || c.name, c.actions.length ? "actions: " + c.actions.map(a => a.name).join(" / ") : ""].filter(Boolean).join(" — "))).join("")}
     ${row("~trash", "␡", "trash", null, null, null)}
     </tbody></table>
     <div style="padding:3px 6px;display:flex;gap:4px;flex-wrap:wrap">
@@ -348,7 +435,14 @@ function renderSide() {
     const name = prompt("Name", c.name); if (name == null) return;
     const description = prompt("Description", c.description || ""); if (description == null) return;
     const icon = prompt("Icon", c.icon || ""); if (icon == null) return;
+    const before = c.actions.map(a => a.name + (a.qty ? "#" : "")).join(", ");
+    const acts = prompt("Actions: the verbs a photo filed here can carry.\nComma-separated; add # to ones that take a quantity (e.g. consume#, out, purchase#, count#). Blank = none.", before);
+    if (acts == null) return;
     await run("update collection", () => api("PATCH", `/api/collections/${encodeURIComponent(c.slug)}`, { name, description, icon }));
+    if (acts.trim() !== before) {
+      const actions = acts.split(",").map(x => x.trim()).filter(Boolean).map(x => ({ name: x.replace(/#$/, ""), qty: x.endsWith("#"), label: c.actions.find(a => a.name === x.replace(/#$/, ""))?.label }));
+      await run("set actions", () => api("PUT", `/api/collections/${encodeURIComponent(c.slug)}/actions`, { actions }));
+    }
     loadCollections();
   };
   $("#c-del").onclick = async () => {
@@ -360,12 +454,14 @@ function renderSide() {
   const dest = $("#b-dest");
   if (dest) {
     const keep = dest.value;
-    dest.innerHTML = S.collections.map(c => `<option value="${esc(c.slug)}">→ ${esc(c.slug)}</option>`).join("");
-    if (keep && S.collections.some(c => c.slug === keep)) dest.value = keep;
+    // Other vaults' collections are destinations too: value "<vault>\t<slug>".
+    dest.innerHTML = S.collections.map(c => `<option value="${esc(c.slug)}">→ ${esc(c.slug)}</option>`).join("") +
+      Object.entries(S.allColls).map(([v, cs]) => `<optgroup label="vault ${esc(v)}">${cs.map(c => `<option value="${esc(v)}\t${esc(c.slug)}">→ @${esc(v)}/${esc(c.slug)}</option>`).join("")}</optgroup>`).join("");
+    if (keep && [...dest.options].some(o => o.value === keep)) dest.value = keep;
   }
 }
 function selectColl(slug) {
-  S.coll = slug; S.sel.clear(); S.cur = -1; S.anchor = -1; S.openTok = null;
+  S.coll = slug; S.sel.clear(); S.cur = -1; S.anchor = -1; S.openTok = null; S.pending = null;
   syncUrl(true);
   renderSide(); loadPhotos(true);
 }
@@ -396,6 +492,8 @@ function renderPhotos() {
   $("#b-sel").textContent = S.sel.size ? `${S.sel.size} sel` : "";
   const none = S.sel.size === 0;
   for (const id of ["b-move", "b-copy", "b-del", "b-restore", "b-none"]) $("#" + id).disabled = none;
+  $("#b-act").classList.toggle("hide", !actionsOf(S.coll).length);
+  renderPending();
   $("#b-restore").classList.toggle("hide", !inTrash());
   $("#b-purge").classList.toggle("hide", !inTrash());
   $("#b-del").classList.toggle("hide", inTrash());
@@ -410,14 +508,14 @@ function renderPhotos() {
         ${p.barcodes.length ? `<span class="bc">${esc(p.barcodes.join(" "))}</span>` : ""}
         ${p.note && !S.sel.has(p.token) && !S.sug[p.token] ? `<span class="nt" title="${esc(p.note)}">n</span>` : ""}
         ${S.sug[p.token]?.[0] && !S.sel.has(p.token) ? `<span class="sg">${esc(S.sug[p.token][0].collection)} ${pct(S.sug[p.token][0].p)}</span>` : ""}
-        <span class="cap">${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
+        <span class="cap">${p.meta?.action ? `<b class="warn">${esc(p.meta.action)}${p.meta.qty != null ? " " + esc(p.meta.qty) : ""}</b> ` : ""}${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
       </div>`).join("") + `</div>`;
   } else {
-    content.innerHTML = `<table><thead><tr><th></th><th>taken</th><th class="n">age</th>${showColl ? "<th>collection</th>" : ""}<th>token</th><th class="n">w×h</th><th class="n">size</th><th>barcodes</th><th>note</th><th class="n">fsi</th></tr></thead><tbody>` +
+    content.innerHTML = `<table><thead><tr><th></th><th>taken</th><th class="n">age</th>${showColl ? "<th>collection</th>" : ""}<th>action</th><th>token</th><th class="n">w×h</th><th class="n">size</th><th>barcodes</th><th>note</th><th class="n">fsi</th></tr></thead><tbody>` +
       S.photos.map((p, i) => `<tr data-i="${i}" class="${S.sel.has(p.token) ? "sel" : ""}${i === S.cur ? " cur" : ""}${S.fresh.has(p.token) ? " chg" : ""}" style="cursor:pointer">
         <td style="padding:0"><img loading="lazy" src="${esc(p.thumb_url)}" alt="" style="height:28px;width:28px;object-fit:cover;display:block"></td>
         <td>${fmtTs(p.taken_at)}</td><td class="n dim">${age(p.taken_at)}</td>${showColl ? `<td>${esc(p.collection)}</td>` : ""}
-        <td class="dim">${esc(p.token)}</td><td class="n">${p.width ?? "?"}×${p.height ?? "?"}</td><td class="n">${fmtBytes(p.bytes)}</td>
+        <td class="warn">${esc(p.meta?.action ?? "")}${p.meta?.qty != null ? " " + esc(p.meta.qty) : ""}</td><td class="dim">${esc(p.token)}</td><td class="n">${p.width ?? "?"}×${p.height ?? "?"}</td><td class="n">${fmtBytes(p.bytes)}</td>
         <td class="ok">${esc(p.barcodes.join(" "))}</td><td style="max-width:320px;overflow:hidden;text-overflow:ellipsis">${esc(p.note)}</td>
         <td class="n ${p.feed_sync_id == null ? "warn" : "dim"}">${p.feed_sync_id ?? "pend"}</td></tr>`).join("") + `</tbody></table>`;
   }
@@ -457,7 +555,8 @@ function showDetail(p) {
   const d = $("#detail"); d.classList.add("on");
   S.openTok = p.token; syncUrl();
   const rows = [
-    ["token", p.token], ["collection", p.collection], ["taken", `${fmtTs(p.taken_at)} (${age(p.taken_at)})`],
+    ["token", p.token], ["vault", p.vault], ["collection", p.collection],
+    p.meta?.action ? ["action", p.meta.action + (p.meta.qty != null ? " × " + p.meta.qty : "")] : null, ["taken", `${fmtTs(p.taken_at)} (${age(p.taken_at)})`],
     ["uploaded", fmtTs(p.created_at)], ["updated", fmtTs(p.updated_at)],
     p.deleted_at ? ["deleted", fmtTs(p.deleted_at)] : null,
     ["dims", `${p.width ?? "?"}×${p.height ?? "?"}`], ["size", `${fmtBytes(p.bytes)} ${p.content_type}`],
@@ -476,7 +575,7 @@ function showDetail(p) {
     <button id="d-save" ${p.deleted_at ? "disabled" : ""}>save note</button>
     <div class="dim" style="margin-top:3px">meta</div><pre>${esc(JSON.stringify(p.meta, null, 1))}</pre>`;
   $("#d-close").onclick = closeDetail;
-  d.querySelectorAll("[data-file]").forEach(b => b.onclick = () => fileTo(b.dataset.file, [p.token]));
+  d.querySelectorAll("[data-file]").forEach(b => b.onclick = () => startFiling(b.dataset.file, S.sel.size ? [...S.sel] : [p.token]));
   loadHistory(p);
   $("#d-save").onclick = async () => {
     const np = await run("save note", () => api("PATCH", `/api/photos/${p.token}`, { note: $("#d-note").value }));
@@ -513,13 +612,16 @@ async function batch(op) {
   const tokens = S.sel.size ? [...S.sel] : (S.cur >= 0 ? [S.photos[S.cur].token] : []);
   if (!tokens.length) return;
   const body = { op, tokens };
+  let vault;  // undefined = this vault
   if (op === "move" || op === "copy") {
-    body.collection = $("#b-dest").value;
-    if (!body.collection) return say("no destination collection", "warn");
-    if (op === "move" && body.collection === S.coll) return say("already in " + S.coll, "warn");
+    const dest = $("#b-dest").value;
+    if (!dest) return say("no destination collection", "warn");
+    if (dest.includes("\t")) [vault, body.collection] = dest.split("\t"); else body.collection = dest;
+    if (op === "move" && !vault && body.collection === S.coll) return say("already in " + S.coll, "warn");
   }
   if (op === "delete" && tokens.length > 20 && !confirm(`Move ${tokens.length} photos to the trash?`)) return;
-  await run(`${op} ${tokens.length}${body.collection ? " → " + body.collection : ""}`, () => api("POST", "/api/photos/batch", body));
+  if (op === "move" && actionsOf(body.collection, vault).length) return startFiling(body.collection, tokens, vault);
+  await run(`${op} ${tokens.length}${body.collection ? " → " + (vault ? `@${vault}/` : "") + body.collection : ""}`, () => api("POST", "/api/photos/batch", body, { vault }));
   S.sel.clear();
   refreshAll();
 }
@@ -532,10 +634,47 @@ async function loadSuggestions() {
   S.sug = Object.fromEntries(r.photos.map(i => [i.photo.token, i.suggestions]));
 }
 const pct = p => `${Math.round(p * 100)}%`;
+// ---- filing with a verb
+// A collection can have an action set; filing into it is (collection, action). The verb step lives
+// in the toolbar so it works for one photo or a selection: keys 1–9 pick, 0/Enter = none, Esc cancels.
+const actionsOf = (slug, vault) => ((vault ? S.allColls[vault] : S.collections) || []).find(c => c.slug === slug)?.actions || [];
+function startFiling(collection, tokens, vault) {
+  const set = actionsOf(collection, vault);
+  if (!set.length) return fileTo(collection, tokens, vault);
+  // Rank the verbs by the focused photo's suggestion when there is one, else in the set's order.
+  const ranked = S.sug[tokens[0]]?.find(g => g.collection === collection)?.actions;
+  const actions = ranked ? ranked.map(r => ({ ...set.find(a => a.name === r.action), p: r.p })).filter(a => a.name) : set.map(a => ({ ...a }));
+  S.pending = { collection, vault, tokens, actions };
+  renderPending();
+}
+function labelSelection() {
+  const tokens = S.sel.size ? [...S.sel] : (S.cur >= 0 ? [S.photos[S.cur].token] : []);
+  if (!tokens.length) return say("select photos to label", "warn");
+  if (!actionsOf(S.coll).length) return say(`${collLabel()} has no actions (edit the collection to add some)`, "warn");
+  startFiling(S.coll, tokens);
+}
+function renderPending() {
+  const el = $("#b-pend"); if (!el) return;
+  const pd = S.pending;
+  el.innerHTML = pd ? `<b class="warn">${pd.tokens.length} → ${pd.vault ? "@" + esc(pd.vault) + "/" : ""}${esc(pd.collection)} as</b>` +
+    pd.actions.slice(0, 9).map((a, i) => `<button data-act="${i}" title="${a.p != null ? pct(a.p) : ""}">${a.p != null ? `<i style="width:${a.p * 100}%"></i>` : ""}<b>${i + 1} ${esc(a.label || a.name)}${a.qty ? " #" : ""}</b>${a.p != null ? ` <small class="dim">${pct(a.p)}</small>` : ""}</button>`).join("") +
+    `<button data-act="-1"><b>0 none</b></button><button data-act="x">esc</button>` : "";
+  el.querySelectorAll("[data-act]").forEach(b => b.onclick = () => b.dataset.act === "x" ? cancelPending() : choosePending(+b.dataset.act));
+}
+function cancelPending() { S.pending = null; renderPending(); say("cancelled"); }
+async function choosePending(i) {
+  const pd = S.pending; if (!pd) return;
+  const a = i >= 0 ? pd.actions[i] : null; if (i >= 0 && !a) return;
+  let qty;
+  if (a?.qty) { const q = prompt(`${a.name}: quantity`, "1"); if (q == null) return; qty = Math.max(0, parseInt(q, 10) || 1); }
+  S.pending = null; renderPending();
+  await fileTo(pd.collection, pd.tokens, pd.vault, a ? a.name : "", qty);
+}
 // File one photo (or the selection) under a collection, then move focus to the next one.
-async function fileTo(collection, tokens) {
+async function fileTo(collection, tokens, vault, action, qty) {
   const at = S.cur;
-  await run(`file ${tokens.length} → ${collection}`, () => api("POST", "/api/photos/batch", { op: "move", tokens, collection }));
+  await run(`file ${tokens.length} → ${vault ? "@" + vault + "/" : ""}${collection}${action ? " as " + action + (qty != null ? " × " + qty : "") : ""}`,
+    () => api("POST", "/api/photos/batch", { op: "move", tokens, collection, action, qty }, { vault }));
   S.sel.clear(); S.openTok = null;
   await refreshAll();
   if (S.photos.length) pick(Math.min(at < 0 ? 0 : at, S.photos.length - 1), null);
@@ -559,7 +698,9 @@ async function drainFeed(feed) {
   }
 }
 async function liveTick() {
-  const [photos, colls, results] = await Promise.all([drainFeed("photos"), drainFeed("collections"), drainFeed("results")]);
+  const [photos, colls, results, vaults] = await Promise.all([drainFeed("photos"), drainFeed("collections"), drainFeed("results"), drainFeed("vaults")]);
+  if (vaults.length || photos.length) await loadVaults();
+  if (!S.vaults.some(v => v.slug === S.vault)) { say(`vault '${S.vault}' was deleted`, "warn"); return selectVault(S.defaultVault); }
   if (S.openTok && results.some(r => r.photo === S.openTok)) { const p = S.photos.find(x => x.token === S.openTok); if (p) loadHistory(p); }
   if (!photos.length && !colls.length) return;
   if (photos.length && S.coll && S.coll === S.inbox) await loadSuggestions();
@@ -610,7 +751,15 @@ function photoKeys(ev) {
   if (S.view === "grid") { const g = $("#grid"); if (g) perRow = getComputedStyle(g).gridTemplateColumns.split(" ").length; }
   const go = i => { if (!n) return; i = Math.max(0, Math.min(n - 1, i)); pick(i, ev.shiftKey ? { shiftKey: true } : null); $(`[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" }); };
   const k = ev.key;
-  if (k === "ArrowRight" || k === "l") go(S.cur + 1);
+  if (S.pending) {  // the verb step owns the keyboard until it is answered
+    if (/^[1-9]$/.test(k)) choosePending(+k - 1);
+    else if (k === "0" || k === "Enter") choosePending(-1);
+    else if (k === "Escape") cancelPending();
+    else return;
+    ev.preventDefault(); return;
+  }
+  if (k === "t") labelSelection();
+  else if (k === "ArrowRight" || k === "l") go(S.cur + 1);
   else if (k === "ArrowLeft" || k === "h") go(S.cur - 1);
   else if (k === "ArrowDown" || k === "j") go(S.cur + perRow);
   else if (k === "ArrowUp" || k === "k") go(S.cur - perRow);
@@ -623,7 +772,7 @@ function photoKeys(ev) {
   else if (k === "r") { if (inTrash()) batch("restore"); else refreshAll(); }
   else if (/^[1-9]$/.test(k) && S.coll && S.coll === S.inbox) {
     const p = S.photos[S.cur]; const g = p && S.sug[p.token]?.[+k - 1];
-    if (g) fileTo(g.collection, S.sel.size ? [...S.sel] : [p.token]);
+    if (g) startFiling(g.collection, S.sel.size ? [...S.sel] : [p.token]);
   }
   else if (k === "v") toggleView();
   else if (k === "+" || k === "=") setTile(S.tile + 24);
@@ -635,8 +784,8 @@ function photoKeys(ev) {
 // ---------------------------------------------------------------------------- feeds tab
 async function feedsTab() {
   main.innerHTML = `<div class="pane"><div class="cols"><div><h3>feeds</h3><div id="f-feeds"></div></div><div><h3>consumers</h3><div id="f-cursors"></div></div></div>
-    <h3>tail <span class="dim" style="font-weight:400">— newest 40 entries per feed, by feed_sync_id</span></h3><div id="f-tail"></div>
-    <h3>consume</h3><pre class="dim" style="margin:0">curl -H "Authorization: Bearer $SNAPZ_TOKEN" "${esc(location.origin)}/_feeds/fetch/photos?after=0&limit=100&collection=pantry"
+    <h3>tail <span class="dim" style="font-weight:400">— newest 40 entries per feed across every vault, by feed_sync_id</span></h3><div id="f-tail"></div>
+    <h3>consume</h3><pre class="dim" style="margin:0">curl -H "Authorization: Bearer $SNAPZ_TOKEN" "${esc(location.origin)}/_feeds/fetch/photos?after=0&limit=100&vault=${esc(S.vault)}&collection=pantry"
 → {"feed":"photos","entries":[…],"cursor":N}   # poll again with after=N; scripts/snapz.py wraps this loop</pre></div>`;
   startPoll(async () => {
     const st = await api("GET", "/_feeds/status");
@@ -658,12 +807,12 @@ async function feedsTab() {
         <td class="n ${c.lag > 100 ? "bad" : c.lag > 0 ? "warn" : "ok"}">${c.lag ?? ""}</td><td>${fmtTs(c.updated_at)}</td><td class="n dim">${age(c.updated_at)}</td>
         <td><button data-rewind="${esc(c.consumer)}" data-feed="${esc(c.feed)}" data-shard="${c.shard}" data-sc="${c.shard_count}" title="set cursor to 0: replay the whole feed">rewind</button></td></tr>`).join("") + `</tbody></table>`
       : `<span class="dim">no consumers have stored a cursor yet</span>`;
-    const tails = await Promise.all(st.feeds.map(f => api("GET", `/_feeds/fetch/${f.feed}?after=${Math.max(0, f.sequence - 40)}&limit=40`)));
+    const tails = await Promise.all(st.feeds.map(f => api("GET", `/_feeds/fetch/${f.feed}?after=${Math.max(0, f.sequence - 40)}&limit=40`, undefined, { vault: S.me.vault ?? null })));
     const rows = tails.flatMap(t => t.entries.map(e => ({ feed: t.feed, e }))).sort((a, b) => (b.e.updated_at || b.e.created_at || "").localeCompare(a.e.updated_at || a.e.created_at || "")).slice(0, 80);
     $("#f-tail").innerHTML = `<table><thead><tr><th>feed</th><th class="n">fsi</th><th>updated</th><th class="n">age</th><th>key</th><th>state</th><th>summary</th></tr></thead><tbody>` +
       rows.map(({ feed, e }) => {
-        const key = feed === "photos" ? `${e.collection}/${e.token}` : feed === "records" ? `${e.ns}/${e.k}` : feed === "collections" ? e.slug : `${e.transform} · ${e.photo ?? "(purged)"}`;
-        const sum = feed === "photos" ? [e.barcodes.join(" "), e.note].filter(Boolean).join(" · ") : feed === "records" ? JSON.stringify(e.v) : feed === "collections" ? `${e.name} (${e.photo_count})`
+        const key = feed === "photos" ? `@${e.vault}/${e.collection}/${e.token}` : feed === "records" ? `@${e.vault}/${e.ns}/${e.k}` : feed === "collections" ? `@${e.vault}/${e.slug}` : feed === "vaults" ? `@${e.slug}` : `${e.transform} · ${e.photo ?? "(purged)"}`;
+        const sum = feed === "photos" ? [e.meta?.action, e.barcodes.join(" "), e.note].filter(Boolean).join(" · ") : feed === "records" ? JSON.stringify(e.v) : feed === "collections" || feed === "vaults" ? `${e.name} (${e.photo_count})`
           : feed === "intents" ? `${e.origin}${e.chain_position != null ? "#" + e.chain_position : ""} → ${e.state}` : `${e.status}${e.output_version ? " → new version" : ""} ${e.error || (e.data == null ? "" : JSON.stringify(e.data))}`;
         e = { ...e, updated_at: e.updated_at || e.created_at };
         return `<tr><td>${esc(feed)}</td><td class="n">${e.feed_sync_id}</td><td>${fmtTs(e.updated_at)}</td><td class="n dim">${age(e.updated_at)}</td><td>${esc(key)}</td>
@@ -708,12 +857,16 @@ async function recordsTab() {
 // ---------------------------------------------------------------------------- tokens tab
 async function tokensTab() {
   main.innerHTML = `<div class="pane"><h3>credentials</h3><div id="k-list"></div>
-    <h3>mint a script token</h3><form id="k-new"><input id="k-name" placeholder="name, e.g. pantry-orders" size="32"> <button>create</button></form><div id="k-out"></div></div>`;
+    <h3>mint a script token</h3><form id="k-new"><input id="k-name" placeholder="name, e.g. pantry-orders" size="32">
+      <select id="k-vault" title="pin to one vault: it sees only that vault and no admin routes"><option value="">all vaults + admin</option>${S.vaults.map(v => `<option value="${esc(v.slug)}">only @${esc(v.slug)}</option>`).join("")}</select>
+      <label title="GETs only (plus saving its own feed cursors)"><input id="k-ro" type="checkbox"> read-only</label>
+      <input id="k-ttl" type="number" min="1" placeholder="ttl days" size="7" style="width:80px" title="blank = never expires">
+      <button>create</button></form><div id="k-out"></div></div>`;
   const load = async () => {
     const toks = (await api("GET", "/api/tokens")).tokens;
-    $("#k-list").innerHTML = `<table><thead><tr><th class="n">id</th><th>kind</th><th>name</th><th>principal</th><th>created</th><th>last used</th><th class="n">age</th><th>expires</th><th></th></tr></thead><tbody>` +
-      toks.map(t => `<tr><td class="n dim">${t.id}</td><td class="${t.kind === "script" ? "acc" : t.kind === "device" ? "ok" : "dim"}">${esc(t.kind)}</td><td>${esc(t.name)}</td><td>${esc(t.principal)}</td>
-        <td>${fmtTs(t.created_at)}</td><td>${fmtTs(t.last_used_at) || '<span class="dim">never</span>'}</td><td class="n dim">${age(t.last_used_at)}</td><td class="dim">${fmtTs(t.expires_at) || "—"}</td>
+    $("#k-list").innerHTML = `<table><thead><tr><th class="n">id</th><th>kind</th><th>name</th><th>scope</th><th>principal</th><th>created</th><th>last used</th><th class="n">age</th><th>expires</th><th></th></tr></thead><tbody>` +
+      toks.map(t => `<tr><td class="n dim">${t.id}</td><td class="${t.kind === "script" ? "acc" : t.kind === "device" ? "ok" : "dim"}">${esc(t.kind)}</td><td>${esc(t.name)}</td><td class="${t.vault || t.read_only ? "warn" : "dim"}">${t.vault ? "@" + esc(t.vault) : "all"}${t.read_only ? " ro" : ""}</td><td>${esc(t.principal)}</td>
+        <td>${fmtTs(t.created_at)}</td><td>${fmtTs(t.last_used_at) || '<span class="dim">never</span>'}</td><td class="n dim">${age(t.last_used_at)}</td><td class="${t.expires_at && new Date(t.expires_at) - Date.now() < 7 * 864e5 ? "warn" : "dim"}">${fmtTs(t.expires_at) || "—"}</td>
         <td><button class="danger" data-rev="${t.id}">revoke</button></td></tr>`).join("") + `</tbody></table>`;
     $("#k-list").querySelectorAll("[data-rev]").forEach(b => b.onclick = async () => {
       if (!confirm("Revoke this credential? Anything using it stops working immediately.")) return;
@@ -723,7 +876,7 @@ async function tokensTab() {
   $("#k-new").onsubmit = async ev => {
     ev.preventDefault();
     const name = $("#k-name").value.trim(); if (!name) return;
-    const t = await run("create token", () => api("POST", "/api/tokens", { name }));
+    const t = await run("create token", () => api("POST", "/api/tokens", { name, vault: $("#k-vault").value || undefined, read_only: $("#k-ro").checked || undefined, ttl_days: +$("#k-ttl").value || undefined }));
     $("#k-out").innerHTML = `<p class="warn">Copy it now — only its hash is stored, it can't be shown again.</p><pre style="user-select:all">${esc(t.token)}</pre>
       <pre class="dim">export SNAPZ_URL=${esc(location.origin)}\nexport SNAPZ_TOKEN=${esc(t.token)}\ncurl -H "Authorization: Bearer $SNAPZ_TOKEN" $SNAPZ_URL/api/collections</pre>`;
     $("#k-name").value = ""; load();
@@ -735,7 +888,7 @@ async function tokensTab() {
 async function transformsTab() {
   main.innerHTML = `<div class="pane"><div class="cols">
     <div><h3>library <span class="dim" style="font-weight:400">— built-ins run in-process; others are workers consuming the intents feed</span></h3><div id="x-lib"></div></div>
-    <div><h3>collection chains <span class="dim" style="font-weight:400">— run in order on photos entering the collection</span></h3><div id="x-chains"></div></div></div>
+    <div><h3>collection chains <span class="dim" style="font-weight:400">— @${esc(S.vault)} · run in order on photos entering the collection</span></h3><div id="x-chains"></div></div></div>
     <h3>pending intents <span class="dim" style="font-weight:400">— waiting for a worker</span></h3><div id="x-pending"></div></div>`;
   const load = async () => {
     const [lib, colls, pend] = await Promise.all([api("GET", "/api/transforms"), api("GET", "/api/collections"), api("GET", "/api/intents?limit=200")]);
@@ -747,13 +900,20 @@ async function transformsTab() {
         <td class="n dim">${age(t.updated_at)}</td><td class="wrap" style="word-break:normal">${esc(t.description)}</td></tr>`).join("") + `</tbody></table>`;
     $("#x-chains").innerHTML = `<table><thead><tr><th>collection</th><th>chain</th><th></th></tr></thead><tbody>` +
       chains.map(ch => `<tr><td>${esc(ch.collection)}</td><td>${ch.transforms.map((l, i) => `<span class="chip">${i + 1}. ${esc(l.transform)}<a data-rm="${esc(ch.collection)}" data-i="${i}" title="remove">×</a></span>`).join("→ ") || '<span class="dim">—</span>'}</td>
-        <td><select data-add="${esc(ch.collection)}"><option value="">+ add…</option>${lib.transforms.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join("")}</select></td></tr>`).join("") + `</tbody></table>`;
+        <td><select data-add="${esc(ch.collection)}"><option value="">+ add…</option>${lib.transforms.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join("")}</select>
+          <button data-bf="${esc(ch.collection)}" ${ch.transforms.length ? "" : "disabled"} title="start the chain on photos already in the collection that it has never run on (shift-click: re-run on every photo)">backfill</button></td></tr>`).join("") + `</tbody></table>`;
     const put = (coll, names) => run(`set ${coll} chain`, () => api("PUT", `/api/collections/${encodeURIComponent(coll)}/transforms`, { transforms: names.map(n => ({ transform: n })) })).then(() => poller?.tick());
     const namesOf = coll => chains.find(c => c.collection === coll).transforms.map(l => l.transform);
+    $("#x-chains").querySelectorAll("[data-bf]").forEach(b => b.onclick = async ev => {
+      const all = ev.shiftKey;
+      if (all && !confirm(`Re-run the whole chain on every photo in '${b.dataset.bf}'?`)) return;
+      const r = await run(`backfill ${b.dataset.bf}`, () => api("POST", `/api/collections/${encodeURIComponent(b.dataset.bf)}/transforms/run${all ? "?all=true" : ""}`));
+      say(`backfill ${b.dataset.bf}: started ${r.started} chain${r.started === 1 ? "" : "s"}`, "ok"); poller?.tick();
+    });
     $("#x-chains").querySelectorAll("[data-rm]").forEach(a => a.onclick = () => put(a.dataset.rm, namesOf(a.dataset.rm).filter((_, i) => i !== +a.dataset.i)));
     $("#x-chains").querySelectorAll("[data-add]").forEach(sel => sel.onchange = () => { if (sel.value) { const v = sel.value; sel.blur(); put(sel.dataset.add, [...namesOf(sel.dataset.add), v]); } });
     $("#x-pending").innerHTML = pend.intents.length ? `<table><thead><tr><th>transform</th><th>photo</th><th>via</th><th>created</th><th class="n">age</th></tr></thead><tbody>` +
-      pend.intents.map(i => `<tr><td>${esc(i.transform)}</td><td><a href="#/photos/${encodeURIComponent(i.collection || "~all")}/${esc(i.photo)}">${esc(i.collection)}/${esc(i.photo)}</a></td>
+      pend.intents.map(i => `<tr><td>${esc(i.transform)}</td><td><a href="${S.vault !== S.defaultVault ? "#/@" + encodeURIComponent(S.vault) + "/" : "#/"}photos/${encodeURIComponent(i.collection || "~all")}/${esc(i.photo)}">${esc(i.collection)}/${esc(i.photo)}</a></td>
         <td class="dim">${i.origin === "chain" ? `chain#${i.chain_position}` : "manual"}</td><td>${fmtTs(i.created_at)}</td><td class="n ${Date.now() - new Date(i.created_at) > 60000 ? "warn" : "dim"}">${age(i.created_at)}</td></tr>`).join("") + `</tbody></table>`
       : `<span class="dim">none</span>`;
   };
@@ -778,7 +938,7 @@ function setTab(tab, push = true) {
   S.tab = tab; stopPoll();
   syncUrl(push);
   document.querySelectorAll("#top .tab").forEach(t => t.classList.toggle("on", t.dataset.tab === tab));
-  $("#st-keys").textContent = tab === "photos" ? "live · 1–9 file (inbox) · ←↑↓→ move · x sel · ⇧click range · ⌘click toggle · m move · c copy · ⌫ del · v view · +/- size · esc" : "";
+  $("#st-keys").textContent = tab === "photos" ? "live · 1–9 file (inbox) · t label · ←↑↓→ move · x sel · ⇧click range · ⌘click toggle · m move · c copy · ⌫ del · v view · +/- size · esc" : "";
   if (tab === "photos") {
     photosShell();
     // Feed positions first, then the snapshot: anything in between is re-applied, never missed.
@@ -787,6 +947,7 @@ function setTab(tab, push = true) {
   else if (tab === "feeds") feedsTab();
   else if (tab === "records") recordsTab();
   else if (tab === "transforms") transformsTab();
+  else if (tab === "vaults") vaultsTab();
   else if (tab === "info") infoTab();
   else tokensTab();
 }
@@ -795,7 +956,9 @@ document.addEventListener("keydown", ev => { if (S.me && S.tab === "photos") pho
 
 async function boot() {
   try { S.me = await api("GET", "/api/me"); } catch (e) { if (e.status !== 401) say("server unreachable: " + e.message, "bad"); return; }
-  $("#who").textContent = S.me.principal; $("#logout").classList.remove("hide");
+  $("#who").textContent = S.me.principal + (S.me.vault ? ` @${S.me.vault}` : "") + (S.me.read_only ? " ro" : ""); $("#logout").classList.remove("hide");
+  document.querySelector('#top .tab[data-tab="tokens"]').classList.toggle("hide", !S.me.admin);
+  try { await loadVaults(); } catch (e) { say("could not load vaults: " + e.message, "bad"); return; }
   applyUrl();
 }
 boot();
