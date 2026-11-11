@@ -23,6 +23,7 @@ dependencies {
   implementation(libs.miskCore)
   implementation(libs.miskInject)
   implementation(libs.miskJdbc)
+  implementation(libs.miskOidc)
   implementation(libs.miskService)
   implementation(libs.mysql)
   implementation(libs.slf4jSimple)
@@ -30,6 +31,7 @@ dependencies {
   implementation(libs.zxingJavase)
 
   testImplementation(libs.miskTesting)
+  testImplementation(testFixtures(libs.miskOidc))
   testImplementation(platform(libs.junitBom))
   testImplementation(libs.junitApi)
   testRuntimeOnly(libs.junitEngine)

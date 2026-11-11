@@ -34,6 +34,8 @@ import misk.web.ResponseContentType
 import misk.web.actions.WebAction
 import misk.web.mediatype.MediaTypes
 import okhttp3.Headers
+import tcj.oidc.OidcAuthConfig
+import tcj.oidc.OidcVerifier
 
 /** The one capability: this is a single-tenant app, a caller is either in or out. */
 const val USER = "snapz_user"
@@ -50,11 +52,12 @@ fun HttpCall.presentedToken(): String? {
 class SnapzAuthenticator @Inject constructor(
   private val httpCall: @JvmSuppressWildcards ActionScoped<HttpCall>,
   private val tokens: TokenStore,
+  private val oidc: OidcClient,
 ) : MiskCallerAuthenticator {
   override fun getAuthenticatedCaller(): MiskCaller? {
     val call = httpCall.get()
     val token = call.presentedToken() ?: return null
-    val resolved = tokens.resolve(token) ?: return null
+    val resolved = tokens.resolve(token) ?: oidc.bearer(token) ?: return null
     // Read-only: reads, plus the one write a stateless feed consumer needs (its own cursor).
     val mayCall = !resolved.readOnly || call.dispatchMechanism == DispatchMechanism.GET ||
       (call.dispatchMechanism == DispatchMechanism.PUT && call.url.encodedPath.startsWith("/_feeds/cursors/"))
@@ -77,8 +80,26 @@ data class OidcUser(val sub: String, val email: String?, val name: String?, val 
 class OidcClient @Inject constructor(
   private val config: SnapzConfig,
   private val json: Json,
+  clock: Clock,
 ) {
   private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()
+
+  /** Verifies the issuer's JWTs presented as bearer tokens. `email` missing from the token sends it to userinfo. */
+  private val verifier: OidcVerifier? = config.snapz.oidc?.let {
+    OidcVerifier(OidcAuthConfig(issuer = it.issuer, audiences = listOf(it.client_id) + it.bearer_audiences, user_claim = "email"), clock)
+  }
+
+  /**
+   * A JWT from the issuer, for one of our audiences, naming someone on the allowlist: the same
+   * standing as that person's web session (every vault, admin). Anything else is null.
+   */
+  fun bearer(token: String): ResolvedToken? {
+    if (verifier == null || token.count { it == '.' } != 2) return null
+    val id = verifier.verify(token) ?: return null
+    val user = OidcUser(id.subject, id.username, id.claims["name"] as? String, id.groups)
+    if (!allowed(user)) return null
+    return ResolvedToken(null, "oidc", user.email ?: user.sub)
+  }
 
   @Volatile private var discovery: Map<String, Any?>? = null
 

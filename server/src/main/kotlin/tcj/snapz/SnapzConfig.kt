@@ -49,6 +49,11 @@ data class OidcConfig(
   /** Caller must match at least one of allowed_emails / allowed_groups. Both empty = nobody. */
   val allowed_emails: List<String> = listOf(),
   val allowed_groups: List<String> = listOf(),
+  /**
+   * The issuer's own JWTs are accepted as bearer credentials when their `aud` is [client_id] or one
+   * of these client ids (a CLI's device-flow client, say). The same allowlist applies.
+   */
+  val bearer_audiences: List<String> = listOf(),
 ) {
   override fun toString() = "OidcConfig(issuer=$issuer, client_id=$client_id, client_secret=████)"
 }

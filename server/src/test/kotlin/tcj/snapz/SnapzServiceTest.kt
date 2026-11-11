@@ -43,7 +43,7 @@ object FakeIdp {
       ex.responseBody.use { it.write(b) }
     }
     server.createContext("/.well-known/openid-configuration") { ex ->
-      reply(ex, """{"authorization_endpoint":"$issuer/authorize","token_endpoint":"$issuer/token","userinfo_endpoint":"$issuer/userinfo"}""")
+      reply(ex, """{"issuer":"$issuer","jwks_uri":"${tcj.oidc.FakeIdp.issuer}/jwks","authorization_endpoint":"$issuer/authorize","token_endpoint":"$issuer/token","userinfo_endpoint":"$issuer/userinfo"}""")
     }
     server.createContext("/token") { ex ->
       lastTokenForm = String(ex.requestBody.readAllBytes()).split('&').associate {
@@ -70,6 +70,7 @@ class SnapzTestModule : KAbstractModule() {
         oidc = OidcConfig(
           issuer = FakeIdp.issuer, client_id = "snapz", client_secret = "s3cret",
           allowed_emails = listOf("travis@example.com"), allowed_groups = listOf("snapz-users"),
+          bearer_audiences = listOf("snapz-cli"),
         ),
       ),
     )
@@ -91,6 +92,7 @@ class SnapzServiceTest {
   @Inject lateinit var publisher: FeedPublisher
   @Inject lateinit var blobs: BlobStore
   @Inject lateinit var runner: TransformRunner
+  @Inject lateinit var clock: java.time.Clock
 
   private val http = OkHttpClient.Builder().followRedirects(false).build()
   private val jsonType = "application/json".toMediaType()
@@ -470,6 +472,25 @@ class SnapzServiceTest {
     FakeIdp.user = mapOf("sub" to "u3", "email" to "ally@else.com", "groups" to listOf("snapz-users"))
     val (s2, _) = startLogin("")
     assertThat(call("GET", "/auth/callback?code=x&state=$s2", token = null).code).isEqualTo(302)
+  }
+
+  @Test
+  fun `the issuer's own JWT is a bearer credential for people on the allowlist`() {
+    // Signed with the misk-oidc fixture's key, which this test's issuer publishes as its JWKS.
+    fun jwt(vararg claims: Pair<String, Any?>) = tcj.oidc.FakeIdp.token(
+      mapOf("iss" to FakeIdp.issuer, "aud" to "snapz", "sub" to "u1", "exp" to clock.instant().epochSecond + 600, "email" to "travis@example.com") + claims,
+    )
+    val me = obj(call("GET", "/api/me", token = jwt()))
+    assertThat(me["principal"]).isEqualTo("travis@example.com")
+    assertThat(me["admin"]).isEqualTo(true)
+    assertThat(call("GET", "/api/me", token = jwt("aud" to "snapz-cli")).code).describedAs("an extra bearer audience").isEqualTo(200)
+    assertThat(call("GET", "/api/me", token = jwt("email" to "ally@else.com", "groups" to listOf("snapz-users"))).code).describedAs("allowed by group").isEqualTo(200)
+
+    assertThat(call("GET", "/api/me", token = jwt("email" to "someone@else.com")).code).describedAs("not on the allowlist").isEqualTo(401)
+    assertThat(call("GET", "/api/me", token = jwt("aud" to "some-other-client")).code).describedAs("another client's token").isEqualTo(401)
+    assertThat(call("GET", "/api/me", token = jwt("exp" to clock.instant().epochSecond - 3600)).code).describedAs("expired").isEqualTo(401)
+    assertThat(call("GET", "/api/me", token = tcj.oidc.FakeIdp.token(mapOf("iss" to FakeIdp.issuer, "aud" to "snapz", "sub" to "u1", "exp" to clock.instant().epochSecond + 600, "email" to "travis@example.com"), signWith = tcj.oidc.FakeIdp.newKey())).code)
+      .describedAs("signed by someone else").isEqualTo(401)
   }
 
   @Test

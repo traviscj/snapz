@@ -16,6 +16,8 @@ snapz:
     # Register this callback URL with the provider: <public_url>/auth/callback
     allowed_emails: [you@example.net]
     allowed_groups: []
+    # Other client ids whose issuer-signed JWTs are accepted as bearer tokens (client_id always is):
+    # bearer_audiences: []
   # Optional break-glass token for first boot / when SSO is down. Remove once a script token exists.
   # bootstrap_tokens:
   #   - { token: CHANGEME-long-random, principal: bootstrap }
