@@ -37,6 +37,7 @@ targets:
       properties:
         CFBundleDisplayName: Snapz
         SnapzDefaultServer: $(SNAPZ_DEFAULT_SERVER)
+        SnapzLegacyServers: $(SNAPZ_LEGACY_SERVERS)
         SnapzAppGroup: group.$(SNAPZ_BUNDLE_PREFIX).snapz
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

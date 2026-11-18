@@ -1,5 +1,6 @@
 // Checked-in defaults. Put your own values in Local.xcconfig (gitignored; see Local.xcconfig.example).
 SNAPZ_BUNDLE_PREFIX = com.example
 SNAPZ_DEFAULT_SERVER =
+SNAPZ_LEGACY_SERVERS =
 DEVELOPMENT_TEAM =
 #include? "Local.xcconfig"

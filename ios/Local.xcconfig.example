@@ -3,3 +3,6 @@ SNAPZ_BUNDLE_PREFIX = com.yourname
 DEVELOPMENT_TEAM = ABCDE12345
 // Pre-fills the server field on first launch. xcconfig treats // as a comment, hence the $() trick.
 SNAPZ_DEFAULT_SERVER = https:/$()/snapz.example.net
+// Space-separated servers this one replaced: a saved URL matching one moves to the default on
+// launch, keeping the sign-in (the device token moves with the database).
+// SNAPZ_LEGACY_SERVERS = http:/$()/192.168.1.50:8788

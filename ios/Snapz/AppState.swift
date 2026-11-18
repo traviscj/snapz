@@ -23,6 +23,7 @@ final class AppState: ObservableObject {
     init() {
         serverURL = UserDefaults.standard.string(forKey: "serverURL")
             ?? (Bundle.main.object(forInfoDictionaryKey: "SnapzDefaultServer") as? String) ?? ""
+        Self.followMovedServer(&serverURL)
         captureCollection = UserDefaults.standard.string(forKey: "captureCollection")
         vault = UserDefaults.standard.string(forKey: "vault")
         token = Keychain.get("token")
@@ -45,6 +46,17 @@ final class AppState: ObservableObject {
     }
 
     var signedIn: Bool { token != nil }
+
+    /// The server moved (SnapzLegacyServers lists where it used to be): point a saved URL at the new
+    /// home. The token stays: device tokens live in the server's database, which moved with it.
+    private static func followMovedServer(_ url: inout String) {
+        let norm = { (s: String) in s.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased() }
+        guard let target = Bundle.main.object(forInfoDictionaryKey: "SnapzDefaultServer") as? String, !norm(target).isEmpty,
+              let legacy = Bundle.main.object(forInfoDictionaryKey: "SnapzLegacyServers") as? String,
+              legacy.split(separator: " ").map({ norm(String($0)) }).contains(norm(url)) else { return }
+        url = target
+        UserDefaults.standard.set(target, forKey: "serverURL")
+    }
 
     var baseURL: URL? {
         let s = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
