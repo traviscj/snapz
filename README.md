@@ -1,4 +1,4 @@
-# snapz
+# <img src="docs/icon.png" width="36" align="top" alt=""> snapz
 
 ![snapz web UI walkthrough: collections, detections, live refresh, inbox filing, order items, transforms, feeds](docs/demo.gif)
 
@@ -40,13 +40,62 @@ feed so small scripts can turn, say, pantry UPC scans into order items.
 
 | thing | notes |
 |---|---|
+| vault | a namespace over everything below: its own collections, records and inbox (like a password manager's vaults). `slug` is the id; the same collection slug in two vaults is two collections. Blobs stay deduplicated across vaults. |
 | collection | `slug` is the id. Soft-deleted; slug is freed for reuse. |
 | photo | row → blob by sha256 (`<blob_dir>/orig/ab/<sha>`, thumbs alongside). **copy** = new row, same blob; **move** = change collection; **delete** = trash (restorable), `POST /api/admin/purge` hard-deletes + GCs unreferenced blobs. `meta` is free-form JSON; `meta.barcodes[].value` is denormalized to `barcodes`. |
 | version | one stored image of a photo. The upload is the root; each image-rewriting transform adds a child of the version it read. The photo row mirrors the *current* version; `PUT /api/photos/{t}/current` moves it (nothing is deleted). |
 | transform | a named operation: `extract` (returns data, optionally a patch for `photo.meta`) or `rewrite` (returns a new image). Built-ins run in-process; anything else is an external worker. |
 | intent / result | append-only events: "run T on photo P at version V" and what T answered. An intent's state is its latest result (`ok`/`skipped`/`halt`/`error`) or `pending`. |
 | record | generic JSON doc at `(ns, k)` — where transforms write derived state. |
-| token | `session` (web cookie), `device` (iOS), `script` (you mint these). SHA-256 hashes only. |
+| token | `session` (web cookie), `device` (iOS), `script` (you mint these). SHA-256 hashes only. A script token can be pinned to one vault, read-only, and/or expiring. |
+
+### vaults
+
+A request picks its vault with the `X-Snapz-Vault: <slug>` header or `?vault=<slug>`; with neither
+it lands in the default vault (`default_vault`, `personal`), so pre-vault clients keep working.
+
+- Things addressed **by name** (a collection slug, a record `ns/k`, the inbox, a listing) resolve
+  in the request's vault.
+- Things addressed **by token** (photos, blobs, intents) are found wherever they live. Moving or
+  copying a photo "to collection C" puts it in C *of the request's vault*, which is the whole
+  cross-vault API.
+- Feeds carry every vault unless one is named; each entry says which (`vault`).
+- A token minted with `{"vault": "work"}` sees only that vault (404 for anything else, 403 for
+  naming another) and none of the admin routes: vault and token management, purge, feed publish
+  switches. `read_only: true` limits a token to GETs plus saving its own feed cursor;
+  `ttl_days` expires it.
+
+    GET|POST /api/vaults            PATCH|DELETE /api/vaults/{slug}[?force=true]
+
+Deleting a vault is a soft delete that trashes what it holds; the default vault can't be deleted.
+A vault separates what a caller can see. It is not encryption: one database, one blob directory.
+
+### actions
+
+A barcode says which item, not what happened to it. Each collection can have an **action set**:
+the verbs a photo filed there can carry (`meta.action`, plus `meta.qty` for actions that take one).
+
+    PUT   /api/collections/{slug}/actions  {"actions": [{"name": "consume", "label": "USE −", "qty": true}, …]}
+    PATCH /api/photos/{token}              {"collection": "pantry", "action": "consume", "qty": 2}
+    POST  /api/photos/batch                {"op": "move", "tokens": […], "collection": "pantry", "action": "purchase", "qty": 1}
+
+The server only stores the names and checks membership; the consumer of the feed gives them
+meaning and is the natural owner of the list. The verb is part of filing: inbox triage asks for
+it after the collection (ranked like the collections are), a batch move labels a whole selection,
+and leaving the collection clears it. Shooting straight into a collection with actions, the
+capture HUD offers that collection's set as a sticky mode (unloading groceries = 30 × `purchase`).
+
+`scripts/pantry_orders.py` is the example owner. It registers the pantry's set on startup:
+
+| action | meaning there |
+|---|---|
+| *(none)* | "need this" |
+| `consume` | used qty: stock −= qty |
+| `out` | that was the last one: stock = 0 (and "need this") |
+| `purchase` | bought qty: stock += qty |
+| `count` | counted the shelf: stock = qty |
+
+and folds them, in `taken_at` order, into a `stock` records namespace.
 
 ## auth
 
@@ -58,6 +107,10 @@ feed so small scripts can turn, say, pantry UPC scans into order items.
   device token (Keychain).
 - **Scripts**: `Authorization: Bearer snapz_…`, minted in the web UI (tokens tab) or
   `POST /api/tokens {"name": …}`.
+- **Issuer JWTs**: with `snapz.oidc` set, a JWT signed by the issuer whose `aud` is `client_id` (or
+  one of `oidc.bearer_audiences`) also works as `Authorization: Bearer`, for people on the same
+  allowlist. Verified locally against the issuer's JWKS by
+  [misk-oidc](../misk-oidc) (a sibling checkout; not published yet). Not revocable before `exp`.
 
 ## API (JSON, snake_case, ISO-8601 UTC timestamps)
 
@@ -89,7 +142,7 @@ single publisher (every 500 ms) assigns fresh monotonic ids per feed, so consume
 `feed_sync_id > cursor` see each row's latest state at least once. Deletes arrive as entries with
 `deleted_at` set.
 
-    GET /_feeds/fetch/{photos|collections|records|intents|results}?after=N&limit=&collection=&ns=&transform=&shard=&shard_count=
+    GET /_feeds/fetch/{photos|collections|records|vaults|intents|results}?after=N&limit=&collection=&ns=&transform=&shard=&shard_count=
         → {"feed": "photos", "entries": [...], "cursor": N'}        # poll again with after=N'
     GET|PUT|DELETE /_feeds/cursors/{consumer}?feed=                  # server-side cursor storage
     GET /_feeds/status                                               # sequences, pending, consumer lag
@@ -117,7 +170,7 @@ with name/brand/size from Open Food Facts (cached in `products/`). It is a pure 
 live scans, so replays are no-ops and deleting/moving a scan retracts it. Known gap: editing a
 photo's `meta` to *remove* a barcode doesn't retract the old UPC.
 
-    export SNAPZ_URL=http://localhost:8788 SNAPZ_TOKEN=…     # or ~/.config/snapz/env (chmod 600)
+    export SNAPZ_URL=http://localhost:8788 SNAPZ_TOKEN=… [SNAPZ_VAULT=work]   # or ~/.config/snapz/env (chmod 600)
     scripts/pantry_orders.py --follow
     scripts/snapz.py status | ls [coll] | tail photos -f collection=pantry | upload pantry x.jpg --barcode 0016000275287
 
@@ -153,6 +206,14 @@ def gray(intent, image, sz):
     return new_image_bytes
 run()
 ```
+
+Retries are the feed cursor: a worker's cursor only moves past an intent once a result is written,
+so a crash or a raised exception means the same intent comes round again. After `--attempts`
+(default 3) consecutive failures the error is recorded as the result and the feed moves on.
+
+A chain applies to photos entering the collection from then on. For the ones already there:
+
+    POST /api/collections/{slug}/transforms/run[?all=true]     # untouched photos, or all=true: every photo
 
 `scripts/transform_examples.py` has both, implemented with macOS `sips`. Rewrites that change
 geometry should pass `current=False`: detection boxes are fractions of the image they were found in.
