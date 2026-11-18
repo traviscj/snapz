@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """snapz client + feed consumer / transform library. Stdlib only; copy this one file anywhere.
 
-    export SNAPZ_URL=https://snapz.example.net  SNAPZ_TOKEN=snapz_...
-    (or put those two KEY=VALUE lines in ~/.config/snapz/env, chmod 600; the environment wins)
+    export SNAPZ_URL=https://snapz.example.net  SNAPZ_TOKEN=snapz_...  [SNAPZ_VAULT=work]
+    (or put those KEY=VALUE lines in ~/.config/snapz/env, chmod 600; the environment wins)
+
+A vault is a namespace over collections, photos and records. SNAPZ_VAULT (or Snapz(vault=...))
+names the one to work in; without it, names resolve in the server's default vault and feeds carry
+every vault (each entry has a "vault" field). A token pinned to a vault needs neither.
 
 Library:
 
@@ -36,10 +40,15 @@ Image transform workers (see transform_examples.py):
 
 Each worker consumes the `intents` feed for its transform and posts a result. Raise Skip("why")
 when a photo doesn't apply (the chain continues) or Halt("why") to stop the collection's chain.
+The feed cursor is the retry mechanism: it only moves past an intent once a result is written, so
+a worker that crashes (or a transform that raises) sees the same intent again on the next pass.
+After --attempts consecutive failures on one intent the error is written as its result, so a
+poison photo can't hold the feed forever.
 
 CLI:
 
     snapz.py status                      feeds, sequences, consumer lag
+    snapz.py vaults                      vaults and what's in them
     snapz.py ls [COLLECTION]             collections, or photos in one
     snapz.py tail FEED [--follow] [-f key=value ...]      print entries as JSON lines
     snapz.py upload COLLECTION FILE...   [--note N] [--barcode UPC]
@@ -78,8 +87,9 @@ def _config():
 
 
 class Snapz:
-    def __init__(self, url=None, token=None, timeout=30):
+    def __init__(self, url=None, token=None, timeout=30, vault=None):
         cfg = _config()
+        self.vault = vault or os.environ.get("SNAPZ_VAULT") or cfg.get("SNAPZ_VAULT") or None
         self.url = (url or os.environ.get("SNAPZ_URL") or cfg.get("SNAPZ_URL") or "http://localhost:8788").rstrip("/")
         self.token = token or os.environ.get("SNAPZ_TOKEN") or cfg.get("SNAPZ_TOKEN")
         self.timeout = timeout
@@ -91,6 +101,8 @@ class Snapz:
         if query:
             path += "?" + urllib.parse.urlencode({k: v for k, v in query.items() if v is not None})
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        if self.vault:
+            headers["X-Snapz-Vault"] = self.vault
         data = None
         if raw is not None:
             data, headers["Content-Type"] = raw, "application/octet-stream"
@@ -108,12 +120,28 @@ class Snapz:
     def _q(s):
         return urllib.parse.quote(str(s), safe="")
 
+    # ---- vaults
+    def vaults(self):
+        return self.call("GET", "/api/vaults")["vaults"]
+
+    def create_vault(self, name, slug=None, description=None, icon=None):
+        return self.call("POST", "/api/vaults", {"name": name, "slug": slug, "description": description, "icon": icon})
+
+    def in_vault(self, vault):
+        """The same client pointed at another vault."""
+        return Snapz(self.url, self.token, self.timeout, vault)
+
     # ---- collections / photos
     def collections(self):
         return self.call("GET", "/api/collections")["collections"]
 
     def create_collection(self, name, slug=None, description=None, icon=None):
         return self.call("POST", "/api/collections", {"name": name, "slug": slug, "description": description, "icon": icon})
+
+    def set_actions(self, collection, actions):
+        """Replace a collection's action set: [{"name", "label"?, "qty"?: bool}, ...] — the verbs a photo
+        filed there can carry (photo meta "action"/"qty"). Call it from whatever gives them meaning."""
+        return self.call("PUT", f"/api/collections/{self._q(collection)}/actions", {"actions": actions})
 
     def photos(self, collection=None, barcode=None, deleted=False, page=300):
         """All matching photos, newest first (pages transparently)."""
@@ -134,7 +162,7 @@ class Snapz:
             "collection": collection, "taken_at": taken_at, "note": note, "client_id": client_id,
             "meta": json.dumps(meta) if meta else None})
 
-    def update_photo(self, token, **fields):  # note=, meta=, taken_at=, collection= (move)
+    def update_photo(self, token, **fields):  # note=, meta=, taken_at=, collection= (move), action=, qty= (the verb it is filed with)
         return self.call("PATCH", f"/api/photos/{token}", fields)
 
     def delete_photo(self, token):
@@ -173,6 +201,10 @@ class Snapz:
     # ---- transforms
     def register_transform(self, name, kind, description=None):
         self.call("PUT", f"/api/transforms/{self._q(name)}", {"kind": kind, "description": description})
+
+    def backfill(self, collection, all=False):
+        """Start the collection's chain on photos already in it (all=True: re-run on every photo)."""
+        return self.call("POST", f"/api/collections/{self._q(collection)}/transforms/run", query={"all": "true" if all else None})["started"]
 
     def request_transform(self, token, transform, params=None):
         return self.call("POST", f"/api/photos/{token}/intents", {"transform": transform, "params": params})
@@ -285,7 +317,13 @@ def image_transform(name, kind="extract", description=None, current=True):
     return deco
 
 
-def _work(t, sz, worker, dry_run, log):
+class _Retry(Exception):
+    """An intent failed and has attempts left: stop this pass with the cursor still before it."""
+
+
+def _work(t, sz, worker, dry_run, log, attempts=3, failures=None):
+    failures = {} if failures is None else failures  # intent token -> consecutive failures (this process)
+
     def handle(intent):
         # The feed is at-least-once and replayable: answer only what hasn't been answered.
         if intent["state"] != "pending" or not intent.get("input_url"):
@@ -309,9 +347,16 @@ def _work(t, sz, worker, dry_run, log):
         except Halt as e:
             sz.post_result(intent["token"], status="halt", data={"reason": str(e)}, worker=worker)
             log(f"halt {label}: {e}")
-        except Exception as e:  # a failed photo must not wedge the worker; the error is the result
-            sz.post_result(intent["token"], status="error", error=f"{type(e).__name__}: {e}", worker=worker)
+        except Exception as e:
+            n = failures[intent["token"]] = failures.get(intent["token"], 0) + 1
+            if n < attempts:
+                # No result written, so the cursor must not pass this intent: the next pass retries it.
+                log(f"fail {label} ({n}/{attempts}): {e}")
+                raise _Retry(intent["token"]) from e
+            # Out of attempts: the error becomes the result, and the feed moves on.
+            sz.post_result(intent["token"], status="error", error=f"{type(e).__name__}: {e}", worker=worker, data={"attempts": n})
             log(f"ERR  {label}: {e}")
+        failures.pop(intent["token"], None)
     return handle
 
 
@@ -331,6 +376,7 @@ def run(argv=None):
     ap.add_argument("--rewind", action="store_true", help="reset cursors to 0 first: reprocess the whole feed")
     ap.add_argument("--dry-run", action="store_true", help="print what would be emitted; skip sink writes and cursor commits")
     ap.add_argument("--only", metavar="CONSUMER", help="run just this consumer")
+    ap.add_argument("--attempts", type=int, default=3, metavar="N", help="image transforms: failures on one intent before its error is recorded")
     args = ap.parse_args(argv)
     sz = Snapz()
     todo = [t for t in _TRANSFORMS if not args.only or t["consumer"] == args.only]
@@ -354,23 +400,30 @@ def run(argv=None):
                     sz.put_record(t["sink"], k, v)
         return handle
 
+    # Cursors are per vault when one is named, so the same script can run against several.
+    scope = f"@{sz.vault}" if sz.vault else ""
     for t in todo:
         if args.rewind and not args.dry_run:
-            sz.set_cursor(t["consumer"], t["feed"], 0)
+            sz.set_cursor(t["consumer"] + scope, t["feed"], 0)
             log(f"{t['consumer']}: rewound {t['feed']} to 0")
     for t in workers:
         if not args.dry_run:
             sz.register_transform(t["name"], t["kind"], t["description"])
             if args.rewind:
-                sz.set_cursor(f"worker:{t['name']}", "intents", 0)
+                sz.set_cursor(f"worker:{t['name']}{scope}", "intents", 0)
+    handlers = {t["name"]: _work(t, sz, worker_id, args.dry_run, log, args.attempts) for t in workers}
     while True:
-        total = 0
+        total, retry = 0, False
         for t in todo:
-            total += sz.consume(t["feed"], t["consumer"], handler_for(t), commit=not args.dry_run, log=log, **t["filters"])
+            total += sz.consume(t["feed"], t["consumer"] + scope, handler_for(t), commit=not args.dry_run, log=log, **t["filters"])
         for t in workers:
-            total += sz.consume("intents", f"worker:{t['name']}", _work(t, sz, worker_id, args.dry_run, log),
-                                commit=not args.dry_run, transform=t["name"])
-        if not args.follow:
+            try:
+                # batch=1: the cursor commits per intent, so a retry never re-walks answered ones.
+                total += sz.consume("intents", f"worker:{t['name']}{scope}", handlers[t["name"]],
+                                    commit=not args.dry_run, batch=1, transform=t["name"])
+            except _Retry:
+                retry = True
+        if not args.follow and not retry:
             log(f"caught up ({total} entries)")
             return
         time.sleep(args.poll)
@@ -379,9 +432,11 @@ def run(argv=None):
 # ---- CLI ------------------------------------------------------------------------------------
 
 def _main():
-    ap = argparse.ArgumentParser(description="snapz command line", epilog="env: SNAPZ_URL, SNAPZ_TOKEN")
+    ap = argparse.ArgumentParser(description="snapz command line", epilog="env: SNAPZ_URL, SNAPZ_TOKEN, SNAPZ_VAULT")
+    ap.add_argument("--vault", help="vault to work in (default: $SNAPZ_VAULT, else the server's default)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    sub.add_parser("vaults")
     p = sub.add_parser("ls"); p.add_argument("collection", nargs="?")
     p = sub.add_parser("tail"); p.add_argument("feed"); p.add_argument("--follow", action="store_true")
     p.add_argument("--after", type=int, default=0); p.add_argument("-f", "--filter", action="append", default=[], metavar="KEY=VALUE")
@@ -389,8 +444,11 @@ def _main():
     p.add_argument("--note"); p.add_argument("--barcode", action="append", default=[])
     p = sub.add_parser("records"); p.add_argument("ns", nargs="?"); p.add_argument("prefix", nargs="?")
     a = ap.parse_args()
-    sz = Snapz()
-    if a.cmd == "status":
+    sz = Snapz(vault=a.vault)
+    if a.cmd == "vaults":
+        for v in sz.vaults():
+            print(f"{v['slug']:<20} {v['collection_count']:>4} {v['photo_count']:>6} {v['bytes']:>12}  {'default' if v['is_default'] else ''}")
+    elif a.cmd == "status":
         st = sz.status()
         print(f"{'feed':<12} {'sequence':>9} {'rows':>7} {'pending':>8}")
         for f in st["feeds"]:
