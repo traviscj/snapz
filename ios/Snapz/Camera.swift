@@ -39,6 +39,8 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
     @Published private(set) var focusing = false
     /// Which physical lens the virtual camera is using right now, e.g. "1x" or "macro".
     @Published private(set) var lens = ""
+    @Published private(set) var hasTorch = false
+    @Published private(set) var torchOn = false
     let previewLayer = AVCaptureVideoPreviewLayer()
 
     private let session = AVCaptureSession()
@@ -127,6 +129,8 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
             device.unlockForConfiguration()
         }
         self.device = device
+        let torch = device.hasTorch
+        DispatchQueue.main.async { self.hasTorch = torch }
         rotation = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: previewLayer)
         observers = [
             device.observe(\.isAdjustingFocus, options: [.initial, .new]) { [weak self] d, _ in
@@ -142,6 +146,12 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
                 }
                 DispatchQueue.main.async { self?.lens = label }
             },
+            // Mirrors the real state: the system turns the torch off when the session stops
+            // (backgrounding, closing the camera) or the device overheats.
+            device.observe(\.torchMode, options: [.initial, .new]) { [weak self] d, _ in
+                let on = d.torchMode == .on
+                DispatchQueue.main.async { self?.torchOn = on }
+            },
         ]
         // The scene changed after a tap-to-focus: hand focus back to continuous AF.
         NotificationCenter.default.addObserver(forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: device, queue: nil) { [weak self] _ in
@@ -155,6 +165,20 @@ final class CameraController: NSObject, ObservableObject, AVCapturePhotoCaptureD
     func focus(atLayerPoint layerPoint: CGPoint) {
         let p = previewLayer.captureDevicePointConverted(fromLayerPoint: layerPoint)
         queue.async { self.applyFocus(point: p) }
+    }
+
+    /// Flashlight, at full brightness: it's for reading barcodes in the back of a dark cupboard.
+    func setTorch(_ on: Bool) {
+        queue.async {
+            guard let device = self.device, device.hasTorch, (try? device.lockForConfiguration()) != nil else { return }
+            defer { device.unlockForConfiguration() }
+            if on {
+                guard device.isTorchAvailable else { return }
+                try? device.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel)
+            } else {
+                device.torchMode = .off
+            }
+        }
     }
 
     /// Runs on `queue`. nil = back to continuous autofocus on the center.

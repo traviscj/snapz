@@ -71,6 +71,7 @@ struct CaptureView: View {
                 HStack(alignment: .bottom) {
                     tape
                     Spacer()
+                    torchButton
                 }
                 .padding(.horizontal, 10)
                 if showNote {
@@ -198,6 +199,23 @@ struct CaptureView: View {
             .frame(minWidth: 46)
             .background(on ? color : Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 3))
             .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(color.opacity(on ? 1 : 0.5), lineWidth: 1))
+    }
+
+    /// Big and thumb-reachable, right above the shutter: dark shelves are where barcodes hide.
+    @ViewBuilder private var torchButton: some View {
+        if camera.hasTorch {
+            Button { camera.setTorch(!camera.torchOn) } label: {
+                Image(systemName: camera.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                    .font(.system(size: 34, weight: .semibold))
+                    .foregroundStyle(camera.torchOn ? Color.black : Color.white)
+                    .frame(width: 80, height: 80)
+                    .background(camera.torchOn ? Color.yellow : Color.black.opacity(0.6), in: Circle())
+                    .overlay(Circle().strokeBorder(Color.yellow, lineWidth: camera.torchOn ? 0 : 2))
+            }
+            .sensoryFeedback(.selection, trigger: camera.torchOn)
+            .accessibilityLabel(camera.torchOn ? "Flashlight on" : "Flashlight off")
+            .accessibilityIdentifier("capture-torch")
+        }
     }
 
     /// Running tape of codes saved this session, newest last.
