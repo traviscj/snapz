@@ -19,8 +19,8 @@ struct SnapzApp: App {
             }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active, app.signedIn else { return }
-                app.queue.kick()
-                Task { await app.refreshCollections() }
+                app.queue.rescan()
+                Task { await app.refreshVaults(); await app.refreshCollections() }
             }
         }
     }
@@ -83,6 +83,7 @@ struct MainView: View {
                     ToolbarItem(placement: .cancellationAction) {
                         Button { showSettings = true } label: { Image(systemName: "gearshape") }
                     }
+                    ToolbarItem(placement: .principal) { VaultMenu() }
                     ToolbarItem(placement: .primaryAction) {
                         Button { showQueue = true } label: { QueueBadge() }
                     }
@@ -100,10 +101,34 @@ struct MainView: View {
                     .padding(.horizontal, 12).padding(.bottom, 4)
                 }
         }
+        // A different vault is a different set of collections: drop whatever was pushed.
+        .id(app.vault ?? "")
         .cover(isPresented: $showCamera) { CaptureView() }
         .sheet(isPresented: $showQueue) { QueueView() }
         .sheet(isPresented: $showSettings) { SettingsView() }
-        .task { await app.refreshCollections() }
+        .task { await app.refreshVaults(); await app.refreshCollections() }
+    }
+}
+
+/// The vault switcher: title of the main screen. One vault = plain label.
+struct VaultMenu: View {
+    @EnvironmentObject private var app: AppState
+
+    var body: some View {
+        Menu {
+            ForEach(app.vaults) { v in
+                Button { Task { await app.selectVault(v.slug) } } label: {
+                    Label("\(v.icon ?? "▣") \(v.slug) · \(v.photoCount)", systemImage: v.slug == app.vault ? "checkmark" : "")
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("\(app.currentVault?.icon ?? "") \(app.vault ?? "snapz")").font(.headline.monospaced())
+                if app.vaults.count > 1 { Image(systemName: "chevron.down").font(.caption2.weight(.bold)) }
+            }
+        }
+        .disabled(app.vaults.count < 2)
+        .accessibilityIdentifier("vault-menu")
     }
 }
 
@@ -136,6 +161,7 @@ struct SettingsView: View {
                 Section("Account") {
                     LabeledContent("Signed in as", value: app.principal ?? "?")
                     LabeledContent("Server", value: app.serverURL)
+                    LabeledContent("Vault", value: app.vault ?? "?")
                     LabeledContent("Waiting to upload", value: "\(queue.pendingCount)")
                 }
                 .font(.callout.monospaced())

@@ -8,35 +8,56 @@ struct GridRoute: Hashable {
 
 struct CollectionsView: View {
     @EnvironmentObject private var app: AppState
+
+    private func inboxRow(_ inbox: PhotoCollection) -> some View {
+        HStack(spacing: 6) {
+            Text(inbox.icon ?? "📥").frame(width: 22)
+            Text(inbox.photoCount > 0 ? "inbox · file \(inbox.photoCount)" : "inbox").fontWeight(inbox.photoCount > 0 ? .bold : .regular)
+            if inbox.slug == app.captureCollection { Image(systemName: "camera.fill").font(.caption2).foregroundStyle(Color.accentColor) }
+            Spacer()
+            Text(inbox.photoCount > 0 ? Fmt.age(inbox.lastPhotoAt) : "empty").foregroundStyle(.secondary)
+        }
+        .font(.callout.monospaced())
+        .accessibilityIdentifier("inbox-row")
+    }
+
     @State private var showNew = false
     @State private var newName = ""
     @State private var newIcon = ""
 
     var body: some View {
         List {
-            if let inbox = app.collections.first(where: { $0.slug == app.inboxSlug }), inbox.photoCount > 0 {
-                NavigationLink(value: TriageRoute()) {
-                    HStack(spacing: 6) {
-                        Text("📥").frame(width: 22)
-                        Text("file \(inbox.photoCount) from inbox").fontWeight(.bold)
-                        Spacer()
-                        Text(Fmt.age(inbox.lastPhotoAt)).foregroundStyle(.secondary)
+            // The inbox leads, on its own: with photos waiting it opens triage, otherwise its (empty) grid.
+            if let inbox = app.collections.first(where: { $0.slug == app.inboxSlug }) {
+                Section {
+                    Group {
+                        if inbox.photoCount > 0 {
+                            NavigationLink(value: TriageRoute()) { inboxRow(inbox) }
+                        } else {
+                            NavigationLink(value: GridRoute(collection: inbox.slug)) { inboxRow(inbox) }
+                        }
                     }
-                    .font(.callout.monospaced())
+                    .listRowBackground(inbox.photoCount > 0 ? Color.accentColor.opacity(0.15) : nil)
+                    .swipeActions(edge: .leading) {
+                        Button { app.captureCollection = inbox.slug } label: { Label("Shoot here", systemImage: "camera") }.tint(.accentColor)
+                    }
                 }
-                .listRowBackground(Color.accentColor.opacity(0.15))
             }
+            Section {
             NavigationLink(value: GridRoute(collection: nil)) {
                 row(icon: "∗", name: "all", count: app.collections.reduce(0) { $0 + $1.photoCount },
                     bytes: app.collections.reduce(0) { $0 + $1.bytes }, last: app.collections.compactMap(\.lastPhotoAt).max(), target: false)
             }
-            ForEach(app.collections) { c in
+            ForEach(app.collections.filter { $0.slug != app.inboxSlug }) { c in
                 NavigationLink(value: GridRoute(collection: c.slug)) {
                     row(icon: c.icon ?? "·", name: c.slug, count: c.photoCount, bytes: c.bytes, last: c.lastPhotoAt, target: c.slug == app.captureCollection)
                 }
                 .swipeActions(edge: .leading) {
                     Button { app.captureCollection = c.slug } label: { Label("Shoot here", systemImage: "camera") }.tint(.accentColor)
                 }
+            }
+            } header: {
+                Text("collections").font(.caption2.monospaced()).foregroundStyle(.secondary)
             }
             Section {
                 NavigationLink(value: RecordsRoute(ns: nil)) {
@@ -132,10 +153,20 @@ struct PhotoGridView: View {
             if selecting {
                 ToolbarItem(placement: .status) { Text("\(selected.count) selected").font(.caption.monospaced()) }
                 ToolbarItem(placement: .secondaryAction) {
-                    Menu("Move to…") { destinations { dest in batch { _ = try await $0.updatePhoto($1, collection: dest) } } }.disabled(selected.isEmpty)
+                    Menu("Move to…") { destinations { dest, action in batch { _ = try await $0.updatePhoto($1, collection: dest, action: action?.name, qty: action?.takesQty == true ? 1 : nil) } } }.disabled(selected.isEmpty)
+                    if let here = app.collections.first(where: { $0.slug == collection }), !here.actionSet.isEmpty {
+                        // Bulk labeling: set the verb on the whole selection without moving it.
+                        Menu("Label…") {
+                            ForEach(here.actionSet) { a in
+                                Button(a.title) { batch { _ = try await $0.updatePhoto($1, action: a.name, qty: a.takesQty ? 1 : nil) } }
+                            }
+                            Button("no verb") { batch { _ = try await $0.updatePhoto($1, action: "") } }
+                        }
+                        .disabled(selected.isEmpty)
+                    }
                 }
                 ToolbarItem(placement: .secondaryAction) {
-                    Menu("Copy to…") { destinations { dest in batch { _ = try await $0.copyPhoto($1, to: dest) } } }.disabled(selected.isEmpty)
+                    Menu("Copy to…") { destinations(plain: true) { dest, _ in batch { _ = try await $0.copyPhoto($1, to: dest) } } }.disabled(selected.isEmpty)
                 }
                 ToolbarItem(placement: .secondaryAction) {
                     Button("Delete", role: .destructive) { batch { _ = try await $0.deletePhoto($1) } }.disabled(selected.isEmpty)
@@ -179,9 +210,10 @@ struct PhotoGridView: View {
         }
     }
 
-    @ViewBuilder private func destinations(_ pick: @escaping (String) -> Void) -> some View {
+    /// [plain]: no verb step (copies keep whatever the destination clears or allows).
+    @ViewBuilder private func destinations(plain: Bool = false, _ pick: @escaping (String, CollectionAction?) -> Void) -> some View {
         ForEach(app.collections.filter { $0.slug != collection }) { c in
-            Button("\(c.icon ?? "") \(c.slug)") { pick(c.slug) }
+            DestinationItem(collection: c, plain: plain, pick: pick)
         }
     }
 
@@ -265,6 +297,7 @@ struct PhotoDetailView: View {
                     Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 1) {
                         line("taken", "\(Fmt.stamp.string(from: photo.takenAt))  (\(Fmt.age(photo.takenAt)))")
                         line("collection", photo.collection)
+                        if let a = photo.meta?.action { line("action", a + (photo.meta?.qty.map { " × \($0)" } ?? "")) }
                         line("size", "\(photo.width.map(String.init) ?? "?")×\(photo.height.map(String.init) ?? "?")  \(Fmt.bytes(photo.bytes))")
                         if !photo.barcodes.isEmpty { line("barcodes", photo.barcodes.joined(separator: " ")) }
                         line("token", photo.token)
@@ -284,7 +317,17 @@ struct PhotoDetailView: View {
                     Menu {
                         Menu("Move to…") {
                             ForEach(app.collections.filter { $0.slug != photo.collection }) { c in
-                                Button("\(c.icon ?? "") \(c.slug)") { act { _ = try await $0.updatePhoto(photo.token, collection: c.slug) } }
+                                DestinationItem(collection: c) { dest, action in
+                                    act { _ = try await $0.updatePhoto(photo.token, collection: dest, action: action?.name, qty: action?.takesQty == true ? 1 : nil) }
+                                }
+                            }
+                        }
+                        if let here = app.collections.first(where: { $0.slug == photo.collection }), !here.actionSet.isEmpty {
+                            Menu("Label…") {
+                                ForEach(here.actionSet) { a in
+                                    Button(a.title) { act { _ = try await $0.updatePhoto(photo.token, action: a.name, qty: a.takesQty ? 1 : nil) } }
+                                }
+                                Button("no verb") { act { _ = try await $0.updatePhoto(photo.token, action: "") } }
                             }
                         }
                         Menu("Copy to…") {
@@ -321,6 +364,29 @@ struct PhotoDetailView: View {
                 await app.refreshCollections()
                 dismiss()
             } catch { app.error = error.localizedDescription }
+        }
+    }
+}
+
+/// A move destination in a menu: a plain button, or — when the collection has an action set — a
+/// submenu of its verbs, because filing there is (collection, action). Menus can't take input, so
+/// a verb with a quantity files as 1; triage has a stepper.
+struct DestinationItem: View {
+    let collection: PhotoCollection
+    var plain = false
+    let pick: (String, CollectionAction?) -> Void
+
+    var body: some View {
+        let title = "\(collection.icon ?? "") \(collection.slug)"
+        if plain || collection.actionSet.isEmpty {
+            Button(title) { pick(collection.slug, nil) }
+        } else {
+            Menu(title) {
+                ForEach(collection.actionSet) { a in
+                    Button(a.title) { pick(collection.slug, a) }
+                }
+                Button("no verb") { pick(collection.slug, nil) }
+            }
         }
     }
 }

@@ -4,19 +4,6 @@ import Network
 import UIKit
 #endif
 
-/// One captured photo waiting to reach the server: <id>.jpg + <id>.json side by side on disk.
-struct PendingUpload: Codable, Identifiable, Hashable {
-    let id: String              // also the server-side client_id (idempotency key)
-    var collection: String
-    let takenAt: Date
-    var note: String?
-    var barcodes: [Barcode]
-    var attempts: Int = 0
-    var lastError: String?
-    /// The server refused it for a reason retrying won't fix (e.g. the collection was deleted).
-    var stuck: Bool = false
-}
-
 /// Durable, offline-first upload queue.
 ///
 /// Capture never waits on the network: a shot is written to Application Support and is "taken".
@@ -33,6 +20,12 @@ final class UploadQueue: ObservableObject {
     var onUploaded: (() -> Void)?
     var onUnauthorized: (() -> Void)?
 
+    /// client id -> server photo token for shots uploaded this launch, so a shot can still be
+    /// relabelled or thrown away after it has left the phone (the capture review does both).
+    private var uploadedTokens: [String: String] = [:]
+    /// Shots discarded while their upload was in flight: deleted on the server once it lands.
+    private var doomed = Set<String>()
+
     private let dir: URL
     private var draining = false
     private var retryTask: Task<Void, Never>?
@@ -41,9 +34,9 @@ final class UploadQueue: ObservableObject {
     private let decoder = JSONDecoder()
 
     init() {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        dir = base.appendingPathComponent("upload-queue", isDirectory: true)
+        dir = Shared.queueDir
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        adoptLegacyQueue()
         load()
         monitor.pathUpdateHandler = { [weak self] path in
             Task { @MainActor in
@@ -63,12 +56,35 @@ final class UploadQueue: ObservableObject {
     func imageURL(_ id: String) -> URL { dir.appendingPathComponent("\(id).jpg") }
     private func metaURL(_ id: String) -> URL { dir.appendingPathComponent("\(id).json") }
 
-    private func load() {
+    /// Shots queued by a build that kept the queue in the app's own sandbox move to the shared one.
+    private func adoptLegacyQueue() {
+        let old = Shared.legacyQueueDir
+        guard old != dir, let files = try? FileManager.default.contentsOfDirectory(at: old, includingPropertiesForKeys: nil), !files.isEmpty else { return }
+        // Images before sidecars: a sidecar without its image is ignored, never the reverse.
+        for f in files.sorted(by: { $0.pathExtension != "json" && $1.pathExtension == "json" }) {
+            try? FileManager.default.moveItem(at: f, to: dir.appendingPathComponent(f.lastPathComponent))
+        }
+    }
+
+    private func onDisk() -> [PendingUpload] {
         let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-        items = files.filter { $0.pathExtension == "json" }
+        return files.filter { $0.pathExtension == "json" }
             .compactMap { try? decoder.decode(PendingUpload.self, from: Data(contentsOf: $0)) }
             .filter { FileManager.default.fileExists(atPath: imageURL($0.id).path) }
             .sorted { $0.takenAt < $1.takenAt }
+    }
+
+    private func load() { items = onDisk() }
+
+    /// The share extension writes into the same directory (and uploads what it can itself):
+    /// pick up what it left behind, forget what it already sent.
+    func rescan() {
+        let disk = onDisk()
+        let known = Set(items.map(\.id)), present = Set(disk.map(\.id))
+        items.removeAll { !present.contains($0.id) && $0.id != uploading }
+        items.append(contentsOf: disk.filter { !known.contains($0.id) })
+        items.sort { $0.takenAt < $1.takenAt }
+        kick()
     }
 
     private func persist(_ item: PendingUpload) {
@@ -76,13 +92,37 @@ final class UploadQueue: ObservableObject {
     }
 
     /// Durably records a shot. Throws only if the phone can't write it to disk.
-    func enqueue(jpeg: Data, collection: String, takenAt: Date = Date(), note: String?, barcodes: [Barcode]) throws {
-        let item = PendingUpload(id: UUID().uuidString.lowercased(), collection: collection, takenAt: takenAt, note: note, barcodes: barcodes)
+    @discardableResult
+    func enqueue(jpeg: Data, collection: String, vault: String?, action: String? = nil, qty: Int? = nil, takenAt: Date = Date(), note: String?, barcodes: [Barcode]) throws -> String {
+        let item = PendingUpload(id: UUID().uuidString.lowercased(), collection: collection, vault: vault, action: action, qty: qty, takenAt: takenAt, note: note, barcodes: barcodes)
         // Image first, sidecar second: load() ignores an image without a sidecar, never the reverse.
         try jpeg.write(to: imageURL(item.id), options: .atomic)
         try encoder.encode(item).write(to: metaURL(item.id), options: .atomic)
         items.append(item)
         kick()
+        return item.id
+    }
+
+    /// Change a shot's verb wherever it currently is: still queued (edit the sidecar), mid-upload
+    /// (fixed up when it lands), or already on the server (PATCH).
+    func revise(_ id: String, action: String?, qty: Int?) async throws {
+        if let i = items.firstIndex(where: { $0.id == id }) {
+            items[i].action = action
+            items[i].qty = qty
+            persist(items[i])
+        } else if let token = uploadedTokens[id], let api {
+            _ = try await api.updatePhoto(token, action: action ?? "", qty: qty)
+        }
+    }
+
+    /// Throw a shot away wherever it currently is. On the server that is the trash (restorable).
+    func remove(_ id: String) async throws {
+        if items.contains(where: { $0.id == id }) {
+            if uploading == id { doomed.insert(id) }
+            discard(id)
+        } else if let token = uploadedTokens[id], let api {
+            _ = try await api.deletePhoto(token)
+        }
     }
 
     func discard(_ id: String) {
@@ -91,10 +131,11 @@ final class UploadQueue: ObservableObject {
         items.removeAll { $0.id == id }
     }
 
-    /// Point a stuck item at a different collection and try again.
-    func retarget(_ id: String, to collection: String) {
+    /// Point a stuck item at a different collection (in [vault]) and try again.
+    func retarget(_ id: String, to collection: String, vault: String?) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items[i].collection = collection
+        items[i].vault = vault
         items[i].stuck = false
         items[i].lastError = nil
         persist(items[i])
@@ -132,19 +173,21 @@ final class UploadQueue: ObservableObject {
         var failures = 0
         while let api, let item = items.first(where: { !$0.stuck }) {
             uploading = item.id
-            let meta: [String: Any] = [
-                "source": "ios",
-                "barcodes": item.barcodes.map { b -> [String: Any] in
-                    var d: [String: Any] = ["symbology": b.symbology, "value": b.value]
-                    if let box = b.box { d["box"] = box }
-                    if let source = b.source { d["source"] = source }
-                    return d
-                },
-            ]
-            let metaJSON = (try? JSONSerialization.data(withJSONObject: meta)).map { String(decoding: $0, as: UTF8.self) }
+            guard FileManager.default.fileExists(atPath: imageURL(item.id).path) else {
+                discard(item.id)    // the share extension already sent it
+                continue
+            }
             do {
-                _ = try await api.upload(file: imageURL(item.id), collection: item.collection, takenAt: item.takenAt,
-                                         clientId: item.id, note: item.note, metaJSON: metaJSON)
+                // Each shot goes to the vault it was taken for, whatever is selected now.
+                let photo = try await api.with(vault: item.vault).upload(file: imageURL(item.id), collection: item.collection, takenAt: item.takenAt,
+                                         clientId: item.id, note: item.note, metaJSON: item.metaJSON)
+                uploadedTokens[item.id] = photo.token
+                // The shot may have been edited or discarded while its bytes were on the wire.
+                if doomed.remove(item.id) != nil {
+                    _ = try? await api.deletePhoto(photo.token)
+                } else if let now = items.first(where: { $0.id == item.id }), now.action != item.action || now.qty != item.qty {
+                    _ = try? await api.updatePhoto(photo.token, action: now.action ?? "", qty: now.qty)
+                }
                 discard(item.id)
                 failures = 0
                 onUploaded?()

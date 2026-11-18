@@ -14,6 +14,13 @@ struct CaptureView: View {
     @Environment(\.dismiss) private var dismiss
     @StateObject private var camera = CameraController()
     @AppStorage("captureAuto") private var auto = true
+    /// The verb the next shots are filed with: one of the target collection's actions, or none.
+    /// Sticky per collection (unloading groceries is thirty "purchase" in a row).
+    @State private var actionName = ""
+    @State private var qty = 1
+    private var actionSet: [CollectionAction] { app.collections.first { $0.slug == app.captureCollection }?.actionSet ?? [] }
+    private var action: CollectionAction? { actionSet.first { $0.name == actionName } }
+    private var actionKey: String { "captureAction.\(app.vault ?? "").\(app.captureCollection ?? "")" }
 
     @State private var shooting = false
     @State private var shots = 0
@@ -26,6 +33,9 @@ struct CaptureView: View {
     @State private var focusPoint: CGPoint?
     @State private var focusStamp = 0
     @State private var autoFire: Task<Void, Never>?
+    /// Everything saved since the camera opened, for the review on the way out.
+    @State private var session: [SessionShot] = []
+    @State private var showReview = false
 
     private var locked: [LiveCode] { camera.liveCodes.filter(\.locked) }
     private var fresh: [LiveCode] { locked.filter { !captured.contains($0.value) } }
@@ -66,15 +76,21 @@ struct CaptureView: View {
                 if showNote {
                     TextField("note for the next shots", text: $note).textFieldStyle(.roundedBorder).padding(.horizontal, 12)
                 }
+                if !actionSet.isEmpty { actionBar }
                 lights
                 bottomBar
             }
             .padding(.vertical, 8)
         }
         .hideStatusBar()
+        .sheet(isPresented: $showReview) {
+            CaptureReview(shots: $session) { dismiss() }
+        }
         .sensoryFeedback(.impact(weight: .light), trigger: shots)
         .sensoryFeedback(.selection, trigger: locked.map(\.value))
         .task { await camera.start() }
+        .onAppear { actionName = UserDefaults.standard.string(forKey: actionKey) ?? "" }
+        .onChange(of: app.captureCollection) { _, _ in actionName = UserDefaults.standard.string(forKey: actionKey) ?? ""; qty = 1 }
         .onDisappear { camera.stop(); autoFire?.cancel() }
         .onChange(of: fresh.map(\.value)) { _, values in scheduleAutoFire(values) }
         .onChange(of: auto) { _, on in if on { scheduleAutoFire(fresh.map(\.value)) } else { autoFire?.cancel() } }
@@ -128,6 +144,36 @@ struct CaptureView: View {
             }
         }
         .allowsHitTesting(false)
+    }
+
+    /// Only shown when the target collection has an action set. Shooting into the inbox (or any
+    /// collection without one) asks nothing: the verb is picked when the photo is filed.
+    private var actionBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) { actionChips }
+    }
+
+    private var actionChips: some View {
+        HStack(spacing: 5) {
+            Button { pick("") } label: { light("NO VERB", on: action == nil, color: .white) }
+            ForEach(actionSet) { a in
+                Button { pick(a.name) } label: {
+                    light(a.title + (a.name == actionName && a.takesQty ? " \(qty)" : ""), on: a.name == actionName, color: .yellow)
+                }
+                .accessibilityLabel("file as \(a.name)")
+            }
+            if action?.takesQty == true {
+                Button { qty = max(1, qty - 1) } label: { light("−", on: false, color: .yellow) }
+                Button { qty = min(99, qty + 1) } label: { light("+", on: false, color: .yellow) }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+    }
+
+    private func pick(_ name: String) {
+        actionName = name
+        qty = 1
+        UserDefaults.standard.set(name, forKey: actionKey)
     }
 
     /// Annunciator row: lit = true right now.
@@ -187,13 +233,13 @@ struct CaptureView: View {
                 }
             } label: {
                 HStack(spacing: 4) {
-                    Text("→ \(app.captureCollection ?? "pick a collection")").font(.headline.monospaced())
+                    Text("→ \(app.vaults.count > 1 ? "@\(app.vault ?? "")/" : "")\(app.captureCollection ?? "pick a collection")").font(.headline.monospaced())
                     Image(systemName: "chevron.down").font(.caption.weight(.bold))
                 }
                 .padding(.horizontal, 10).padding(.vertical, 6).background(.black.opacity(0.6), in: Capsule())
             }
             Spacer()
-            Button { dismiss() } label: {
+            Button { if session.isEmpty { dismiss() } else { showReview = true } } label: {
                 Text(shots == 0 ? "Done" : "Done · \(shots)")
                     .font(.system(size: 15, weight: .bold)).foregroundStyle(.black)
                     .padding(.horizontal, 12).padding(.vertical, 6).background(Color.yellow, in: Capsule())
@@ -273,7 +319,13 @@ struct CaptureView: View {
         let codes = BarcodeScanner.merge(still: still, shot: lockedShot)
         for c in codes where !captured.contains(c.value) { captured.append(c.value) }
         do {
-            try queue.enqueue(jpeg: shot.jpeg, collection: collection, takenAt: Date(), note: note, barcodes: codes)
+            let verb = collection == app.captureCollection ? action : nil
+            let n = verb?.takesQty == true ? qty : nil
+            let id = try queue.enqueue(jpeg: shot.jpeg, collection: collection, vault: app.vault, action: verb?.name,
+                                       qty: n, takenAt: Date(), note: note, barcodes: codes)
+            let data = shot.jpeg
+            let thumb = await Task.detached { ImageDecoder.decode(data, maxPixel: 200) }.value
+            session.append(SessionShot(id: id, collection: collection, takenAt: Date(), codes: codes.map(\.value), thumb: thumb, action: verb?.name ?? "", qty: n ?? 1))
         } catch {
             app.error = "Could not save the photo on this phone: \(error.localizedDescription)"
         }
@@ -299,6 +351,144 @@ struct CaptureView: View {
     }
 }
 
+/// One shot of the current camera session, as the review shows it.
+struct SessionShot: Identifiable {
+    let id: String              // upload-queue id == server client_id
+    let collection: String
+    let takenAt: Date
+    let codes: [String]
+    let thumb: CGImage?
+    /// "" = no verb. Starts as whatever the HUD had selected at the shutter.
+    var action: String
+    var qty: Int
+    var excluded = false
+    /// What it was saved with, to tell which rows need a write.
+    var savedAction: String = ""
+    var savedQty: Int = 1
+
+    init(id: String, collection: String, takenAt: Date, codes: [String], thumb: CGImage?, action: String, qty: Int) {
+        self.id = id; self.collection = collection; self.takenAt = takenAt; self.codes = codes; self.thumb = thumb
+        self.action = action; self.qty = qty; savedAction = action; savedQty = qty
+    }
+
+    var changed: Bool { excluded || action != savedAction || qty != savedQty }
+}
+
+/// Shown when leaving the camera: what was just captured and what each shot was filed as. Fix a
+/// verb, set one for the whole run, or drop a shot, then confirm. Nothing here blocks capture —
+/// the shots are already saved (and probably uploaded); this only revises them.
+struct CaptureReview: View {
+    @EnvironmentObject private var app: AppState
+    @EnvironmentObject private var queue: UploadQueue
+    @Environment(\.dismiss) private var dismiss
+    @Binding var shots: [SessionShot]
+    let finish: () -> Void
+    @State private var busy = false
+
+    private func actions(_ slug: String) -> [CollectionAction] { app.collections.first { $0.slug == slug }?.actionSet ?? [] }
+    private var kept: Int { shots.filter { !$0.excluded }.count }
+    /// Verbs every shot's collection offers (a session is nearly always one collection).
+    private var common: [CollectionAction] {
+        let sets = Set(shots.map(\.collection)).map(actions)
+        return (sets.first ?? []).filter { a in sets.allSatisfy { $0.contains(a) } }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if !common.isEmpty {
+                    HStack(spacing: 5) {
+                        Text("all →").foregroundStyle(.secondary)
+                        ForEach(common) { a in
+                            Button(a.title) { for i in shots.indices where !shots[i].excluded { shots[i].action = a.name } }
+                                .buttonStyle(.bordered).accessibilityIdentifier("all-\(a.name)")
+                        }
+                        Button("none") { for i in shots.indices { shots[i].action = "" } }.buttonStyle(.bordered)
+                    }
+                    .font(.caption.monospaced().weight(.semibold))
+                }
+                ForEach($shots) { $s in
+                    row($s)
+                }
+            }
+            .listStyle(.plain)
+            .environment(\.defaultMinListRowHeight, 30)
+            .navigationTitle("captured \(kept) of \(shots.count)").inlineTitle()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Camera") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Confirm") { apply() }.fontWeight(.bold).disabled(busy).accessibilityIdentifier("review-confirm")
+                }
+            }
+        }
+        .interactiveDismissDisabled(busy)
+    }
+
+    @ViewBuilder private func row(_ s: Binding<SessionShot>) -> some View {
+        let shot = s.wrappedValue
+        let set = actions(shot.collection)
+        let verb = set.first { $0.name == shot.action }
+        HStack(spacing: 8) {
+            ZStack {
+                Rectangle().fill(.quaternary)
+                if let t = shot.thumb { Image(decorative: t, scale: 1).resizable().aspectRatio(contentMode: .fill) }
+            }
+            .frame(width: 52, height: 52).clipped().opacity(shot.excluded ? 0.3 : 1)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text("→ \(shot.collection)").fontWeight(.semibold)
+                    Text(Fmt.stamp.string(from: shot.takenAt).suffix(8)).foregroundStyle(.secondary)
+                    Spacer()
+                    if shot.changed && !shot.excluded { Text("edited").foregroundStyle(.orange) }
+                }
+                Text(shot.codes.isEmpty ? "no code" : shot.codes.joined(separator: " ")).foregroundStyle(shot.codes.isEmpty ? Color.secondary : Color.green).lineLimit(1)
+                if shot.excluded {
+                    Text("EXCLUDED — goes to the trash").foregroundStyle(.red)
+                } else if !set.isEmpty {
+                    HStack(spacing: 6) {
+                        Menu {
+                            ForEach(set) { a in Button(a.title) { s.wrappedValue.action = a.name } }
+                            Button("no verb") { s.wrappedValue.action = "" }
+                        } label: {
+                            Text(verb.map { $0.title + ($0.takesQty ? " \(shot.qty)" : "") } ?? "no verb")
+                                .fontWeight(.bold).foregroundStyle(verb == nil ? Color.secondary : Color.primary)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(verb == nil ? Color.secondary.opacity(0.15) : Color.yellow.opacity(0.35), in: RoundedRectangle(cornerRadius: 4))
+                        }
+                        if verb?.takesQty == true {
+                            Stepper("", value: s.qty, in: 1...99).labelsHidden().scaleEffect(0.8, anchor: .leading)
+                        }
+                    }
+                }
+            }
+            .font(.caption.monospaced())
+        }
+        .swipeActions {
+            Button(shot.excluded ? "Keep" : "Exclude", role: shot.excluded ? nil : .destructive) { s.wrappedValue.excluded.toggle() }
+        }
+    }
+
+    private func apply() {
+        busy = true
+        Task {
+            var failed = 0
+            for s in shots where s.changed {
+                let verb = actions(s.collection).first { $0.name == s.action }
+                do {
+                    if s.excluded { try await queue.remove(s.id) }
+                    else { try await queue.revise(s.id, action: verb?.name, qty: verb?.takesQty == true ? s.qty : nil) }
+                } catch { failed += 1 }
+            }
+            busy = false
+            if failed > 0 { app.error = "\(failed) change\(failed == 1 ? "" : "s") could not be applied; those photos are unchanged." }
+            shots = []
+            await app.refreshCollections()
+            dismiss()
+            finish()
+        }
+    }
+}
+
 /// What's still on the phone, why, and what to do about it.
 struct QueueView: View {
     @EnvironmentObject private var app: AppState
@@ -316,7 +506,7 @@ struct QueueView: View {
                         LocalThumb(url: queue.imageURL(item.id)).frame(width: 44, height: 44).clipped()
                         VStack(alignment: .leading, spacing: 1) {
                             HStack {
-                                Text("→ \(item.collection)").fontWeight(.semibold)
+                                Text("→ \(item.vault.map { "@\($0)/" } ?? "")\(item.collection)\(item.action.map { " [\($0)\(item.qty.map { " \($0)" } ?? "")]" } ?? "")").fontWeight(.semibold)
                                 Spacer()
                                 Text(state(item)).foregroundStyle(item.stuck ? Color.red : queue.uploading == item.id ? Color.accentColor : Color.secondary)
                             }
@@ -330,7 +520,7 @@ struct QueueView: View {
                     }
                     .contextMenu {
                         ForEach(app.collections) { c in
-                            Button("Send to \(c.slug) instead") { queue.retarget(item.id, to: c.slug) }
+                            Button("Send to \(c.slug) instead") { queue.retarget(item.id, to: c.slug, vault: app.vault) }
                         }
                     }
                 }

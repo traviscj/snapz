@@ -24,11 +24,20 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(SNAPZ_BUNDLE_PREFIX).snapz
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: SnapzShare
+    entitlements:
+      path: Snapz/Snapz.entitlements
+      properties:
+        # Shared with the share extension: the upload queue, a few settings, and the device token.
+        com.apple.security.application-groups: [group.$(SNAPZ_BUNDLE_PREFIX).snapz]
     info:
       path: Snapz/Info.plist
       properties:
         CFBundleDisplayName: Snapz
         SnapzDefaultServer: $(SNAPZ_DEFAULT_SERVER)
+        SnapzAppGroup: group.$(SNAPZ_BUNDLE_PREFIX).snapz
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         NSCameraUsageDescription: Snapz takes photos straight into your own collections, never into the Photos library.
@@ -39,6 +48,38 @@ targets:
         NSAppTransportSecurity:
           # plain-http servers on the LAN (dev); real deployments are https
           NSAllowsLocalNetworking: true
+  # "Share → Snapz" from Photos, the screenshot editor, etc. Uploads through the app's own queue.
+  SnapzShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - SnapzShare
+      - Snapz/API.swift
+      - Snapz/Models.swift
+      - Snapz/Keychain.swift
+      - Snapz/Shared.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(SNAPZ_BUNDLE_PREFIX).snapz.share
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+    entitlements:
+      path: SnapzShare/SnapzShare.entitlements
+      properties:
+        com.apple.security.application-groups: [group.$(SNAPZ_BUNDLE_PREFIX).snapz]
+    info:
+      path: SnapzShare/Info.plist
+      properties:
+        CFBundleDisplayName: Snapz
+        SnapzAppGroup: group.$(SNAPZ_BUNDLE_PREFIX).snapz
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsImageWithMaxCount: 100
   SnapzUITests:
     type: bundle.ui-testing
     platform: iOS

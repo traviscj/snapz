@@ -1,14 +1,49 @@
 import Foundation
 
+/// A namespace over collections, photos and records (like a password manager's vaults).
+struct VaultInfo: Codable, Identifiable, Hashable {
+    var id: String { slug }
+    let slug: String
+    let name: String
+    let icon: String?
+    let isDefault: Bool
+    let collectionCount: Int
+    let photoCount: Int
+}
+
+struct VaultList: Codable {
+    let `default`: String
+    let vaults: [VaultInfo]
+}
+
+/// One verb a photo filed in a collection can carry (photo meta `action`, + `qty` when it takes
+/// one). Each collection has its own set; what the names mean is up to whoever reads the feed.
+struct CollectionAction: Codable, Hashable, Identifiable {
+    var id: String { name }
+    let name: String
+    let label: String?
+    let qty: Bool?
+    var title: String { label ?? name }
+    var takesQty: Bool { qty ?? false }
+}
+
+struct ActionSuggestion: Codable, Hashable {
+    let action: String
+    let p: Double
+}
+
 struct PhotoCollection: Codable, Identifiable, Hashable {
     var id: String { slug }
     let slug: String
     let name: String
     let description: String?
     let icon: String?
+    let actions: [CollectionAction]?
     let photoCount: Int
     let bytes: Int64
     let lastPhotoAt: Date?
+
+    var actionSet: [CollectionAction] { actions ?? [] }
 }
 
 struct Photo: Codable, Identifiable, Hashable {
@@ -39,9 +74,14 @@ struct Photo: Codable, Identifiable, Hashable {
 /// meta is written by scripts too, and a surprising shape must not make a photo undecodable.
 struct PhotoMeta: Codable, Hashable {
     let barcodes: [Barcode]
+    /// The verb the photo was filed with (one of its collection's actions), and its quantity.
+    let action: String?
+    let qty: Int?
 
     init(from decoder: Decoder) throws {
         let c = try? decoder.container(keyedBy: CodingKeys.self)
+        action = try? c?.decode(String.self, forKey: .action)
+        qty = try? c?.decode(Int.self, forKey: .qty)
         barcodes = ((try? c?.decode([Lenient<Barcode>].self, forKey: .barcodes)) ?? []).compactMap(\.value)
     }
 }
@@ -54,6 +94,8 @@ struct Lenient<T: Codable & Hashable>: Codable, Hashable {
 struct Suggestion: Codable, Hashable {
     let collection: String
     let p: Double
+    /// The destination's verbs ranked for this photo; nil when it has none.
+    let actions: [ActionSuggestion]?
 }
 
 /// A photo waiting in the inbox, with destinations ranked by P(collection | photo).
@@ -70,7 +112,7 @@ struct InboxResponse: Codable {
 
 struct CollectionList: Codable { let collections: [PhotoCollection] }
 struct PhotoPage: Codable { let photos: [Photo]; let nextBefore: String? }
-struct Me: Codable { let principal: String }
+struct Me: Codable { let principal: String; let vault: String? }
 struct AuthInfo: Codable { let oidc: Bool; let principal: String? }
 struct DeviceToken: Codable { let token: String; let principal: String }
 struct BatchResult: Codable { let photos: [Photo] }

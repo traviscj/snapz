@@ -12,6 +12,10 @@ struct APIError: LocalizedError {
 struct API {
     let base: URL
     let token: String?
+    /// Vault the request is about (X-Snapz-Vault). nil = the server's default vault.
+    var vault: String? = nil
+
+    func with(vault: String?) -> API { API(base: base, token: token, vault: vault) }
 
     static let session: URLSession = {
         let c = URLSessionConfiguration.default
@@ -56,6 +60,7 @@ struct API {
         var r = URLRequest(url: url(path, query))
         r.httpMethod = method
         if let token { r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if let vault { r.setValue(vault, forHTTPHeaderField: "X-Snapz-Vault") }
         return r
     }
 
@@ -100,6 +105,8 @@ struct API {
     func me() async throws -> Me { try await get("/api/me") }
     func authInfo() async throws -> AuthInfo { try await get("/auth/info") }
 
+    func vaults() async throws -> VaultList { try await get("/api/vaults") }
+
     func collections() async throws -> [PhotoCollection] {
         let l: CollectionList = try await get("/api/collections")
         return l.collections
@@ -115,10 +122,13 @@ struct API {
         try await get("/api/photos", query: ["collection": collection, "before": before, "limit": String(limit)])
     }
 
-    func updatePhoto(_ token: String, note: String? = nil, collection: String? = nil) async throws -> Photo {
+    /// `action` is the verb it is filed with (one of the destination's actions; "" clears it).
+    func updatePhoto(_ token: String, note: String? = nil, collection: String? = nil, action: String? = nil, qty: Int? = nil) async throws -> Photo {
         var body: [String: Any] = [:]
         if let note { body["note"] = note }
         if let collection { body["collection"] = collection }
+        if let action { body["action"] = action }
+        if let qty { body["qty"] = qty }
         return try await send("PATCH", "/api/photos/\(token)", json: body)
     }
 

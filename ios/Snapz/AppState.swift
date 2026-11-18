@@ -4,15 +4,18 @@ import SwiftUI
 
 @MainActor
 final class AppState: ObservableObject {
-    @Published var serverURL: String { didSet { UserDefaults.standard.set(serverURL, forKey: "serverURL") } }
+    @Published var serverURL: String { didSet { UserDefaults.standard.set(serverURL, forKey: "serverURL"); Shared.defaults.set(serverURL, forKey: "serverURL") } }
     @Published private(set) var token: String?
     @Published private(set) var principal: String?
     @Published var collections: [PhotoCollection] = []
+    @Published private(set) var vaults: [VaultInfo] = []
+    /// The vault being browsed and shot into; nil until the server has been asked (= its default).
+    @Published private(set) var vault: String? { didSet { UserDefaults.standard.set(vault, forKey: "vault"); Shared.defaults.set(vault, forKey: "vault") } }
     /// Where the camera shoots into; remembered across launches.
     @Published var captureCollection: String? { didSet { UserDefaults.standard.set(captureCollection, forKey: "captureCollection") } }
     @Published var error: String?
     /// The "snap first, file later" collection (server-configured; learned from /api/inbox).
-    @Published var inboxSlug = "inbox"
+    @Published var inboxSlug = "inbox" { didSet { Shared.defaults.set(inboxSlug, forKey: "inboxSlug") } }
 
     let queue = UploadQueue()
     private let webSignIn = WebSignIn()
@@ -21,6 +24,7 @@ final class AppState: ObservableObject {
         serverURL = UserDefaults.standard.string(forKey: "serverURL")
             ?? (Bundle.main.object(forInfoDictionaryKey: "SnapzDefaultServer") as? String) ?? ""
         captureCollection = UserDefaults.standard.string(forKey: "captureCollection")
+        vault = UserDefaults.standard.string(forKey: "vault")
         token = Keychain.get("token")
         principal = UserDefaults.standard.string(forKey: "principal")
         #if DEBUG
@@ -34,6 +38,9 @@ final class AppState: ObservableObject {
             UserDefaults.standard.set(serverURL, forKey: "serverURL")
         }
         #endif
+        // The share extension reads these (didSet does not fire for assignments made in init).
+        Shared.defaults.set(serverURL, forKey: "serverURL")
+        Shared.defaults.set(vault, forKey: "vault")
         configureQueue()
     }
 
@@ -47,7 +54,33 @@ final class AppState: ObservableObject {
 
     var api: API? {
         guard let baseURL, let token else { return nil }
-        return API(base: baseURL, token: token)
+        return API(base: baseURL, token: token, vault: vault)
+    }
+
+    var currentVault: VaultInfo? { vaults.first { $0.slug == vault } }
+
+    func selectVault(_ slug: String) async {
+        guard slug != vault else { return }
+        vault = slug
+        collections = []
+        captureCollection = UserDefaults.standard.string(forKey: "captureCollection.\(slug)")
+        configureQueue()
+        await refreshCollections()
+    }
+
+    /// Learns the vault list, and falls back to the server's default when the remembered one is gone.
+    func refreshVaults() async {
+        guard let api else { return }
+        do {
+            let l = try await api.with(vault: nil).vaults()
+            vaults = l.vaults
+            if vault == nil || !l.vaults.contains(where: { $0.slug == vault }) {
+                vault = l.vaults.contains(where: { $0.slug == l.default }) ? l.default : l.vaults.first?.slug
+                configureQueue()
+            }
+        } catch {
+            self.error = error.localizedDescription
+        }
     }
 
     private func configureQueue() {
@@ -96,16 +129,20 @@ final class AppState: ObservableObject {
         token = nil
         principal = nil
         collections = []
+        vaults = []
+        vault = nil
         queue.api = nil
     }
 
     func refreshCollections() async {
+        if vaults.isEmpty { await refreshVaults() }
         guard let api else { return }
         do {
             collections = try await api.collections()
             if captureCollection == nil || !collections.contains(where: { $0.slug == captureCollection }) {
                 captureCollection = collections.first?.slug
             }
+            if let vault, let c = captureCollection { UserDefaults.standard.set(c, forKey: "captureCollection.\(vault)") }
         } catch {
             self.error = error.localizedDescription
         }
