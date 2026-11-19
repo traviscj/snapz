@@ -64,7 +64,8 @@ object FakeIdp {
 
 class SnapzTestModule : KAbstractModule() {
   override fun configure() {
-    val base = MiskConfig.load<SnapzConfig>("snapz", TESTING, listOf<String>())
+    // SNAPZ_TEST_CONFIG layers a file over snapz-testing.yaml, e.g. to run the suite against MariaDB.
+    val base = MiskConfig.load<SnapzConfig>("snapz", TESTING, listOfNotNull(System.getenv("SNAPZ_TEST_CONFIG")?.takeIf { it.isNotBlank() }?.let { "filesystem:$it" }))
     val config = base.copy(
       snapz = base.snapz.copy(
         oidc = OidcConfig(
