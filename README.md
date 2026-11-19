@@ -324,7 +324,16 @@ The link opens a page that walks them through registering a passkey (a one-time 
 Pocket ID) and into the vault; once they have signed in it no longer lets anyone in. The web UI
 has this under vaults → people.
 
-Every vault also has a `token`, globally unique and permanent, accepted wherever a slug is.
+A vault has two names. Its **token** is globally unique and permanent: it is accepted wherever a
+slug is, feed entries carry it as `vault_token`, and replication matches vaults by it (so a vault
+is the same vault on every server). Its **slug** is what a person calls it: unique among that
+person's vaults, not on the server, so two people can each have a `pantry`. A member can make
+vaults of their own (`POST /api/vaults`), edit and delete the ones they own, and rename their view
+of any vault they can see (`PUT /api/vaults/{slug}/alias`) without changing anyone else's.
+Operators see every vault under its own server-unique slug (the second `pantry` is `pantry-2` to
+them), which is also what the `vault` field of feed entries holds.
+
+Not replicated yet: users, memberships and invitations.
 
 ### hardening
 

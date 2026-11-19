@@ -98,14 +98,21 @@ class Replica @Inject constructor(
 
   // ------------------------------------------------------------------------------ parents
 
-  /** Id of the vault an entry names: that slug, or for a tombstone slug the live vault it was, else a stub. */
-  private fun vaultId(c: Connection, slug: String): Long {
-    fun find(s: String) = c.select("SELECT id FROM vaults WHERE slug = ?", listOf(s)) { it.getLong(1) }.firstOrNull()
-    find(slug)?.let { return it }
-    baseSlug(slug)?.let(::find)?.let { return it }
+  /**
+   * Id of the vault an entry is in. Its token says which vault it is, on any server; entries from
+   * a source that predates tokens fall back to the slug (or, for a tombstone slug, the live vault
+   * it was). A vault not seen before is created as a stub under the source's token.
+   */
+  private fun vaultId(c: Connection, e: Map<String, Any?>): Long {
+    val slug = e.str("vault")
+    val token = e.strOrNull("vault_token")
+    fun find(col: String, v: String) = c.select("SELECT id FROM vaults WHERE $col = ?", listOf(v)) { it.getLong(1) }.firstOrNull()
+    token?.let { find("token", it) }?.let { return it }
+    find("slug", slug)?.let { return it }
+    baseSlug(slug)?.let { find("slug", it) }?.let { return it }
     return c.insert(
       "INSERT INTO vaults (slug, name, created_at_ms, updated_at_ms, deleted_at_ms, shard, token) VALUES (?,?,0,0,?,?,?)",
-      listOf(slug, baseSlug(slug) ?: slug, if (baseSlug(slug) != null) 0L else null, shardOf("vault:$slug", shards), newVaultToken()),
+      listOf(slug, baseSlug(slug) ?: slug, if (baseSlug(slug) != null) 0L else null, shardOf("vault:$slug", shards), token ?: newVaultToken()),
     )
   }
 
@@ -127,21 +134,27 @@ class Replica @Inject constructor(
     val deleted = e.msOrNull("deleted_at")
     if (deleted != null) {
       val base = baseSlug(slug) ?: slug
-      val live = c.select("SELECT id, updated_at_ms FROM vaults WHERE slug = ? AND deleted_at_ms IS NULL FOR UPDATE", listOf(base)) { it.getLong(1) to it.getLong(2) }.firstOrNull()
-        ?: return Outcome.UNCHANGED
+      fun live(where: String, v: String) = c.select("SELECT id, updated_at_ms FROM vaults WHERE $where = ? AND deleted_at_ms IS NULL FOR UPDATE", listOf(v)) { it.getLong(1) to it.getLong(2) }.firstOrNull()
+      val live = e.strOrNull("token")?.let { live("token", it) } ?: live("slug", base) ?: return Outcome.UNCHANGED
       // The default vault is what requests fall back to; it is never deleted, here or at the source.
       if (live.second > updated || base == config.snapz.default_vault) return Outcome.STALE
       c.exec("UPDATE vaults SET slug = ?, deleted_at_ms = ?, updated_at_ms = ?, feed_sync_id = NULL WHERE id = ?", listOf("$base.deleted.${live.first}", deleted, updated, live.first))
       return Outcome.APPLIED
     }
     val want = listOf(e.str("name"), e.strOrNull("description"), e.strOrNull("icon"))
-    val cur = c.select("SELECT id, name, description, icon, updated_at_ms FROM vaults WHERE slug = ? FOR UPDATE", listOf(slug)) {
+    val token = e.strOrNull("token")
+    fun row(where: String, v: String) = c.select("SELECT id, name, description, icon, updated_at_ms FROM vaults WHERE $where = ? FOR UPDATE", listOf(v)) {
       Triple(it.getLong(1), listOf(it.getString(2), it.getString(3), it.getString(4)), it.getLong(5))
     }.firstOrNull()
+    val byToken = token?.let { row("token", it) }
+    val cur = byToken ?: row("slug", slug)
+    // Same slug, different token: this server made its own vault of that name before it started
+    // following the source. A replica takes the source's identity for it.
+    if (cur != null && byToken == null && token != null) c.exec("UPDATE vaults SET token = ?, feed_sync_id = NULL WHERE id = ?", listOf(token, cur.first))
     if (cur == null) {
       c.insert(
         "INSERT INTO vaults (slug, name, description, icon, created_at_ms, updated_at_ms, shard, token) VALUES (?,?,?,?,?,?,?,?)",
-        listOf(slug) + want + listOf(e.ms("created_at"), updated, shardOf("vault:$slug", shards), newVaultToken()),
+        listOf(slug) + want + listOf(e.ms("created_at"), updated, shardOf("vault:$slug", shards), token ?: newVaultToken()),
       )
       return Outcome.APPLIED
     }
@@ -165,7 +178,7 @@ class Replica @Inject constructor(
     val slug = e.str("slug")
     val updated = e.ms("updated_at")
     val deleted = e.msOrNull("deleted_at")
-    val vault = vaultId(c, e.str("vault"))
+    val vault = vaultId(c, e)
     if (deleted != null) {
       val base = baseSlug(slug) ?: slug
       val live = c.select("SELECT id, updated_at_ms FROM collections WHERE vault_id = ? AND slug = ? AND deleted_at_ms IS NULL FOR UPDATE", listOf(vault, base)) { it.getLong(1) to it.getLong(2) }.firstOrNull()
@@ -204,7 +217,7 @@ class Replica @Inject constructor(
     val updated = e.ms("updated_at")
     val meta = (e["meta"] as? Map<*, *>).orEmpty().mapKeys { it.key.toString() }
     val blob = BlobInfo(sha, e.str("content_type"), (e["bytes"] as Number).toLong(), e.intOrNull("width"), e.intOrNull("height"))
-    val collection = collectionId(c, vaultId(c, e.str("vault")), e.str("collection"))
+    val collection = collectionId(c, vaultId(c, e), e.str("collection"))
     val want = listOf(collection, sha, e.ms("taken_at"), e.strOrNull("note"), e.msOrNull("deleted_at"))
 
     val cur = c.select("SELECT id, collection_id, sha256, taken_at_ms, note, deleted_at_ms, meta, updated_at_ms, current_version_id FROM photos WHERE token = ? FOR UPDATE", listOf(token)) { rs ->
@@ -259,7 +272,7 @@ class Replica @Inject constructor(
   private fun record(c: Connection, e: Map<String, Any?>): Outcome {
     val ns = e.str("ns")
     val k = e.str("k")
-    val vault = vaultId(c, e.str("vault"))
+    val vault = vaultId(c, e)
     val updated = e.ms("updated_at")
     val text = json.write(e["v"])
     val deleted = e.msOrNull("deleted_at")

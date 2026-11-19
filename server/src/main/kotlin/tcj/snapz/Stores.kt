@@ -35,6 +35,8 @@ data class CollectionDto(
   val updated_at: String,
   val deleted_at: String?,
   val feed_sync_id: Long?,
+  /** The vault's permanent, globally unique name; `vault` is only its slug. */
+  val vault_token: String? = null,
 )
 
 data class PhotoDto(
@@ -60,6 +62,8 @@ data class PhotoDto(
   val updated_at: String,
   val deleted_at: String?,
   val feed_sync_id: Long?,
+  /** The vault's permanent, globally unique name; `vault` is only its slug. */
+  val vault_token: String? = null,
 )
 
 data class RecordDto(
@@ -71,6 +75,8 @@ data class RecordDto(
   val updated_at: String,
   val deleted_at: String?,
   val feed_sync_id: Long?,
+  /** The vault's permanent, globally unique name; `vault` is only its slug. */
+  val vault_token: String? = null,
 )
 
 data class TokenDto(
@@ -121,7 +127,7 @@ class CollectionStore @Inject constructor(
   }
 
   private val select = """
-    SELECT c.*, vt.slug AS vault, COALESCE(s.n, 0) AS photo_count, COALESCE(s.bytes, 0) AS photo_bytes, s.last_taken
+    SELECT c.*, vt.slug AS vault, vt.token AS vault_token, COALESCE(s.n, 0) AS photo_count, COALESCE(s.bytes, 0) AS photo_bytes, s.last_taken
     FROM collections c JOIN vaults vt ON vt.id = c.vault_id
     LEFT JOIN (SELECT collection_id, COUNT(*) n, SUM(bytes) bytes, MAX(taken_at_ms) last_taken
                FROM photos WHERE deleted_at_ms IS NULL GROUP BY collection_id) s ON s.collection_id = c.id
@@ -141,6 +147,7 @@ class CollectionStore @Inject constructor(
     updated_at = iso(rs.getLong("updated_at_ms")),
     deleted_at = isoOrNull(rs.longOrNull("deleted_at_ms")),
     feed_sync_id = rs.longOrNull("feed_sync_id"),
+    vault_token = rs.getString("vault_token"),
   )
 
   fun list(vaultId: Long): List<CollectionDto> = db.tx { c ->
@@ -304,7 +311,7 @@ class PhotoStore @Inject constructor(
   private val lineage: Lineage,
 ) {
   private val select = """
-    SELECT p.id, p.token, vt.slug AS vault, c.slug AS collection, p.sha256, p.content_type, p.bytes, p.width, p.height, p.taken_at_ms,
+    SELECT p.id, p.token, vt.slug AS vault, vt.token AS vault_token, c.slug AS collection, p.sha256, p.content_type, p.bytes, p.width, p.height, p.taken_at_ms,
            p.note, p.meta, p.barcodes, p.client_id, p.created_at_ms, p.updated_at_ms, p.deleted_at_ms, p.feed_sync_id,
            v.token AS version_token
     FROM photos p JOIN collections c ON c.id = p.collection_id JOIN vaults vt ON vt.id = c.vault_id
@@ -336,6 +343,7 @@ class PhotoStore @Inject constructor(
       updated_at = iso(rs.getLong("updated_at_ms")),
       deleted_at = isoOrNull(rs.longOrNull("deleted_at_ms")),
       feed_sync_id = rs.longOrNull("feed_sync_id"),
+      vault_token = rs.getString("vault_token"),
     )
   }
 
@@ -622,7 +630,7 @@ class RecordStore @Inject constructor(
   private val config: SnapzConfig,
   private val json: Json,
 ) {
-  private val select = "SELECT r.*, vt.slug AS vault FROM records r JOIN vaults vt ON vt.id = r.vault_id"
+  private val select = "SELECT r.*, vt.slug AS vault, vt.token AS vault_token FROM records r JOIN vaults vt ON vt.id = r.vault_id"
 
   private fun dto(rs: ResultSet) = RecordDto(
     vault = rs.getString("vault"),
@@ -633,6 +641,7 @@ class RecordStore @Inject constructor(
     updated_at = iso(rs.getLong("updated_at_ms")),
     deleted_at = isoOrNull(rs.longOrNull("deleted_at_ms")),
     feed_sync_id = rs.longOrNull("feed_sync_id"),
+    vault_token = rs.getString("vault_token"),
   )
 
   fun namespaces(vaultId: Long): List<NamespaceDto> = db.tx { c ->

@@ -37,3 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m py_compile scripts/*.py
+      # The web client is one page of inline script: at least make sure it parses.
+      - name: web script syntax
+        run: |
+          python3 - <<'PY'
+          import re
+          s = open("server/src/main/resources/web/index.html").read()
+          open("/tmp/page.js", "w").write("\n".join(re.findall(r"<script>(.*?)</script>", s, re.S)))
+          PY
+          node --check /tmp/page.js

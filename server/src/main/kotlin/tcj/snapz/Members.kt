@@ -29,7 +29,8 @@ object Role {
   val all = setOf(OWNER, EDITOR, VIEWER)
 }
 
-data class Membership(val vault: Vault, val role: String)
+/** [alias] is this member's own name for the vault: what they type and see. */
+data class Membership(val vault: Vault, val role: String, val alias: String = vault.slug)
 data class MemberDto(val principal: String, val role: String, val since: String)
 
 @Singleton
@@ -52,11 +53,11 @@ class MemberStore @Inject constructor(
   private val vaults: VaultStore,
 ) {
   private val select = """
-    SELECT v.id, v.slug, m.role FROM vault_members m JOIN vaults v ON v.id = m.vault_id AND v.deleted_at_ms IS NULL
+    SELECT v.id, v.slug, m.role, m.slug AS alias FROM vault_members m JOIN vaults v ON v.id = m.vault_id AND v.deleted_at_ms IS NULL
     WHERE m.user_id = ?
   """.trimIndent()
 
-  private fun row(rs: java.sql.ResultSet) = Membership(Vault(rs.getLong(1), rs.getString(2)), rs.getString(3))
+  private fun row(rs: java.sql.ResultSet) = Membership(Vault(rs.getLong(1), rs.getString(2)), rs.getString(3), rs.getString(4))
 
   /** One of the user's vaults, by their slug for it or by its token. */
   fun find(userId: Long, name: String): Membership? = db.tx { c ->
@@ -67,8 +68,34 @@ class MemberStore @Inject constructor(
     c.select("$select AND v.id = ?", listOf(userId, vaultId), ::row).firstOrNull()
   }
 
-  /** vault id -> role, for everything the user can reach. */
-  fun roles(userId: Long): Map<Long, String> = db.tx { c -> c.select(select, listOf(userId), ::row).associate { it.vault.id to it.role } }
+  /** vault id -> membership, for everything the user can reach. */
+  fun views(userId: Long): Map<Long, Membership> = db.tx { c -> c.select(select, listOf(userId), ::row).associateBy { it.vault.id } }
+
+  /** A new vault of the user's own, under the name they chose (unique among their vaults, not on the server). */
+  fun createOwn(userId: Long, alias: String, name: String, description: String?, icon: String?): Membership {
+    if (!SLUG.matches(alias)) throw BadRequestException("bad slug '$alias': want ${SLUG.pattern}")
+    if (db.tx { c -> c.select("SELECT 1 FROM vault_members WHERE user_id = ? AND slug = ?", listOf(userId, alias)) { 1 } }.isNotEmpty()) {
+      throw ConflictException("you already have a vault called '$alias'")
+    }
+    val vault = vaults.require(vaults.createFree(alias, name, description, icon).token!!)
+    db.tx { c ->
+      c.exec("INSERT INTO vault_members (vault_id, user_id, role, slug, created_at_ms) VALUES (?,?,?,?,?)", listOf(vault.id, userId, Role.OWNER, alias, clock.millis()))
+    }
+    return Membership(vault, Role.OWNER, alias)
+  }
+
+  /** Call a vault something else. It changes nothing for anyone else. */
+  fun rename(userId: Long, vaultId: Long, alias: String) {
+    if (!SLUG.matches(alias)) throw BadRequestException("bad slug '$alias': want ${SLUG.pattern}")
+    db.tx { c ->
+      if (c.select("SELECT 1 FROM vault_members WHERE user_id = ? AND slug = ? AND vault_id <> ?", listOf(userId, alias, vaultId)) { 1 }.isNotEmpty()) {
+        throw ConflictException("you already have a vault called '$alias'")
+      }
+      if (c.exec("UPDATE vault_members SET slug = ? WHERE user_id = ? AND vault_id = ?", listOf(alias, userId, vaultId)) == 0 &&
+        c.select("SELECT 1 FROM vault_members WHERE user_id = ? AND vault_id = ?", listOf(userId, vaultId)) { 1 }.isEmpty()
+      ) throw NotFoundException("not one of your vaults")
+    }
+  }
 
   /**
    * Where a member lands when a request names no vault: the one they chose or were first given a
@@ -79,23 +106,10 @@ class MemberStore @Inject constructor(
       c.select("$select AND v.id = (SELECT default_vault_id FROM users WHERE id = ?)", listOf(userId, userId), ::row).firstOrNull()
         ?: c.select("$select AND m.role = '${Role.OWNER}' ORDER BY m.id LIMIT 1", listOf(userId), ::row).firstOrNull()
     }?.let { return it }
-    // No vault of their own yet. The slug is theirs to choose later; start from the name they sign in with.
-    val base = slugify(principal.substringBefore('@')).take(56)
-    for (n in 1..50) {
-      val slug = if (n == 1) base else "$base-$n"
-      val created = try {
-        vaults.create(slug, principal.substringBefore('@'), null, null)
-      } catch (e: ConflictException) {
-        continue
-      }
-      val vault = vaults.require(created.slug)
-      db.tx { c ->
-        c.exec("INSERT INTO vault_members (vault_id, user_id, role, slug, created_at_ms) VALUES (?,?,?,?,?)", listOf(vault.id, userId, Role.OWNER, vault.slug, clock.millis()))
-        c.exec("UPDATE users SET default_vault_id = ? WHERE id = ?", listOf(vault.id, userId))
-      }
-      return Membership(vault, Role.OWNER)
-    }
-    throw ConflictException("could not find a free vault name for $principal")
+    // No vault of their own yet: start from the name they sign in with. They can call it anything later.
+    val own = createOwn(userId, slugify(principal.substringBefore('@')).take(56), principal.substringBefore('@'), null, null)
+    db.tx { c -> c.exec("UPDATE users SET default_vault_id = ? WHERE id = ?", listOf(own.vault.id, userId)) }
+    return own
   }
 
   fun members(vaultId: Long): List<MemberDto> = db.tx { c ->

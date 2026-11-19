@@ -1051,6 +1051,9 @@ class SnapzServiceTest {
     receive("collections")
     receive("vaults")
     assertThat(state()).isEqualTo(before)
+    // The rebuilt vaults are the same vaults: same tokens, including the default one this server had made for itself.
+    assertThat(api("GET", "/api/vaults").list("vaults").associate { it["slug"] to it["token"] })
+      .isEqualTo(feeds.getValue("vaults").associate { it["slug"] to it["token"] })
 
     // Delivered again: nothing is written, so nothing is republished.
     publisher.publishAll()
@@ -1094,7 +1097,7 @@ class SnapzServiceTest {
     assertThat(obj(call("GET", "/api/me", token = null, cookie = plain))).containsEntry("admin", false)
     assertThat(call("GET", "/api/collections", token = null, cookie = plain).code).isEqualTo(200)
     assertThat(call("GET", "/api/tokens", token = null, cookie = plain).code).isEqualTo(403)
-    assertThat(call("POST", "/api/vaults", mapOf("name" to "nope"), token = null, cookie = plain).code).isEqualTo(403)
+    assertThat(call("POST", "/api/admin/purge", token = null, cookie = plain).code).isEqualTo(403)
     assertThat(call("GET", "/_admin/", token = null, cookie = plain).code).isEqualTo(403)
 
     // In the admin group at sign-in: the session carries it.
@@ -1169,7 +1172,7 @@ class SnapzServiceTest {
       Triple("GET", "/_feeds/blobs/${theirs["sha256"]}", null),
       Triple("POST", "/_feeds/receive/records", mapOf("entries" to listOf<Any>())),
       Triple("GET", "/api/tokens", null),
-      Triple("POST", "/api/vaults", mapOf("name" to "more")),
+      Triple("POST", "/api/admin/purge", null),
       Triple("PUT", "/api/transforms/mine", mapOf("kind" to "extract")),
       Triple("POST", "/api/transforms/run", null),
       Triple("GET", "/_admin/", null),
@@ -1206,10 +1209,44 @@ class SnapzServiceTest {
     assertThat(asAlly("DELETE", "/api/vaults/ally/members?principal=ally@else.com").code).isEqualTo(409)
     assertThat(asAlly("PUT", "/api/vaults/ally/members", mapOf("principal" to "ally@else.com", "role" to "viewer")).code).isEqualTo(409)
 
+    // Names are hers: a vault called "pantry" although the server already has one by that slug.
+    api("POST", "/api/vaults", mapOf("name" to "Pantry", "slug" to "pantry"))
+    val own = obj(asAlly("POST", "/api/vaults", mapOf("name" to "Pantry", "slug" to "pantry")))
+    assertThat(own).containsEntry("slug", "pantry").containsEntry("role", "owner")
+    assertThat(asAlly("POST", "/api/vaults", mapOf("name" to "Pantry", "slug" to "pantry")).code).describedAs("she already has one called that").isEqualTo(409)
+    assertThat(api("GET", "/api/vaults").list("vaults").map { it["slug"] }).contains("pantry", "pantry-2")   // the operator sees both, under their own slugs
+    assertThat(asAlly("POST", "/api/collections", mapOf("name" to "shelf"), vault = "pantry").code).isEqualTo(200)
+    assertThat(api("GET", "/api/collections", vault = "pantry").list("collections")).isEmpty()
+    assertThat(api("GET", "/api/collections", vault = "pantry-2").list("collections").map { it["slug"] }).containsExactly("shelf")
+    // Entries say which vault they are in by its token, the name that is the same for everyone.
+    val shelf = obj(asAlly("GET", "/api/collections/shelf", vault = "pantry"))
+    assertThat(shelf["vault_token"]).isEqualTo(own["token"])
+    assertThat(obj(asAlly("GET", "/api/collections", vault = own["token"] as String)).list("collections").map { it["slug"] }).containsExactly("shelf")
+
+    // She can call a vault something else; only her view changes.
+    assertThat(asAlly("PUT", "/api/vaults/ally/alias", mapOf("slug" to "home")).code).isEqualTo(200)
+    val renamed = obj(asAlly("GET", "/api/vaults"))
+    assertThat(renamed["default"]).isEqualTo("home")
+    assertThat(renamed.list("vaults").map { it["slug"] }).containsExactlyInAnyOrder("home", "pantry", "personal")
+    assertThat(asAlly("GET", "/api/collections", vault = "ally").code).isEqualTo(404)
+    assertThat(obj(asAlly("GET", "/api/collections", vault = "home")).list("collections").map { it["slug"] }).containsExactly("mine")
+    assertThat(api("GET", "/api/collections", vault = "ally").list("collections").map { it["slug"] }).containsExactly("mine")   // unchanged for the operator
+    assertThat(asAlly("PUT", "/api/vaults/home/alias", mapOf("slug" to "pantry")).code).isEqualTo(409)
+    assertThat(asAlly("PUT", "/api/vaults/personal/alias", mapOf("slug" to "travis-stuff")).code).isEqualTo(200)   // a shared one too
+    assertThat(asAlly("GET", "/api/photos/$t").code).isEqualTo(200)
+    assertThat(obj(asAlly("GET", "/api/photos", vault = "travis-stuff")).list("photos").map { it["token"] }).containsExactly(t)
+    // Her own vaults are hers to edit and delete; a shared one is not.
+    assertThat(obj(asAlly("PATCH", "/api/vaults/pantry", mapOf("name" to "Ally's pantry")))["name"]).isEqualTo("Ally's pantry")
+    assertThat(asAlly("PATCH", "/api/vaults/travis-stuff", mapOf("name" to "mine now")).code).isEqualTo(403)
+    assertThat(asAlly("DELETE", "/api/vaults/travis-stuff").code).isEqualTo(403)
+    assertThat(asAlly("DELETE", "/api/vaults/pantry?force=true").code).isEqualTo(200)
+    assertThat(obj(asAlly("GET", "/api/vaults")).list("vaults").map { it["slug"] }).containsExactlyInAnyOrder("home", "travis-stuff")
+    assertThat(api("GET", "/api/vaults").list("vaults").map { it["slug"] }).contains("pantry").doesNotContain("pantry-2")
+
     // Taken away again: gone, as if it never was.
     assertThat(call("DELETE", "/api/vaults/personal/members?principal=ally@else.com").code).isEqualTo(200)
     assertThat(asAlly("GET", "/api/photos/$t").code).isEqualTo(404)
-    assertThat(asAlly("GET", "/api/photos?vault=personal").code).isEqualTo(404)
+    assertThat(asAlly("GET", "/api/photos?vault=travis-stuff").code).isEqualTo(404)
   }
 
   @Test

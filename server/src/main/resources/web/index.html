@@ -310,7 +310,9 @@ function selectVault(slug) {
 $("#vault").onchange = ev => selectVault(ev.target.value);
 
 async function vaultsTab() {
-  const admin = S.me.admin;
+  // Operators manage every vault; anyone else manages the ones they own. A vault-pinned or read-only credential manages nothing.
+  const admin = S.me.admin || (S.me.operator === false && !S.me.read_only && !S.me.vault);
+  const mine = v => S.me.admin || v.role === "owner";
   main.innerHTML = `<div class="pane"><h3>vaults <span class="dim" style="font-weight:400">— a namespace over collections, photos, records and the inbox. The same collection name in two vaults is two collections. Blobs are deduplicated across all of them.</span></h3>
     <div id="v-list"></div>
     <div id="v-people"></div>
@@ -326,7 +328,9 @@ moving a photo to a collection moves it into the request's vault</pre></div>`;
       S.vaults.map(v => `<tr class="${v.slug === S.vault ? "sel" : ""}"><td>${esc(v.icon || "▣")}</td><td><a href="#/@${encodeURIComponent(v.slug)}/photos/~all" class="${v.slug === S.vault ? "ok" : ""}">${esc(v.slug)}</a>${v.is_default ? ' <span class="dim">default</span>' : ""}</td>
         <td>${esc(v.name)}</td><td class="n">${v.collection_count}</td><td class="n">${v.photo_count}</td><td class="n dim">${fmtBytes(v.bytes)}</td><td class="n dim">${age(v.last_photo_at)}</td><td class="dim">${fmtTs(v.created_at)}</td>
         <td class="wrap dim" style="word-break:normal">${esc(v.description)}</td>
-        <td>${admin ? `<button data-sh="${esc(v.slug)}" title="who can see this vault; share it; invite someone new">people</button> <button data-ed="${esc(v.slug)}">edit</button> <button class="danger" data-rm="${esc(v.slug)}" ${v.is_default ? "disabled title='the default vault cannot be deleted'" : ""}>delete</button>` : ""}</td></tr>`).join("") + `</tbody></table>`;
+        <td>${admin ? `<button data-sh="${esc(v.slug)}" title="who can see this vault${mine(v) ? "; share it" : ""}">people</button>` +
+          (S.me.operator === false ? ` <button data-al="${esc(v.slug)}" title="call it something else; only your view changes">rename</button>` : "") +
+          (mine(v) ? ` <button data-ed="${esc(v.slug)}">edit</button> <button class="danger" data-rm="${esc(v.slug)}" ${v.is_default ? "disabled title='your default vault cannot be deleted'" : ""}>delete</button>` : ` <span class="dim">${esc(v.role || "")}</span>`) : ""}</td></tr>`).join("") + `</tbody></table>`;
     $("#v-list").querySelectorAll("[data-ed]").forEach(b => b.onclick = async () => {
       const v = S.vaults.find(x => x.slug === b.dataset.ed);
       const name = prompt("Name", v.name); if (name == null) return;
@@ -335,6 +339,14 @@ moving a photo to a collection moves it into the request's vault</pre></div>`;
       await run("update vault", () => api("PATCH", `/api/vaults/${encodeURIComponent(v.slug)}`, { name, icon, description }, { vault: null })); load();
     });
     $("#v-list").querySelectorAll("[data-sh]").forEach(b => b.onclick = () => { S.peopleOf = b.dataset.sh; people(); });
+    $("#v-list").querySelectorAll("[data-al]").forEach(b => b.onclick = async () => {
+      const to = prompt(`Your name for '${b.dataset.al}' (letters, digits, - and _). Nobody else's view changes.`, b.dataset.al);
+      if (!to || to === b.dataset.al) return;
+      await run("rename", () => api("PUT", `/api/vaults/${encodeURIComponent(b.dataset.al)}/alias`, { slug: to.trim().toLowerCase() }, { vault: null }));
+      if (S.vault === b.dataset.al) { S.vault = to.trim().toLowerCase(); syncUrl(); }
+      if (S.peopleOf === b.dataset.al) S.peopleOf = to.trim().toLowerCase();
+      load();
+    });
     $("#v-list").querySelectorAll("[data-rm]").forEach(b => b.onclick = async () => {
       const v = S.vaults.find(x => x.slug === b.dataset.rm);
       if (!confirm(`Delete vault '${v.slug}'` + (v.photo_count ? ` and move its ${v.photo_count} photos to the trash?` : "?") + "\nTokens pinned to it stop working.")) return;
@@ -348,17 +360,19 @@ moving a photo to a collection moves it into the request's vault</pre></div>`;
     const slug = S.peopleOf, box = $("#v-people"); if (!slug || !box) return;
     const path = `/api/vaults/${encodeURIComponent(slug)}`;
     let m, inv;
-    try { [m, inv] = await Promise.all([api("GET", path + "/members", undefined, { vault: null }), api("GET", path + "/invites", undefined, { vault: null })]); }
+    const owner = mine(S.vaults.find(v => v.slug === slug) || {});
+    // Invitations make accounts: only the people who run the server send (or see) them.
+    try { [m, inv] = await Promise.all([api("GET", path + "/members", undefined, { vault: null }), S.me.admin ? api("GET", path + "/invites", undefined, { vault: null }) : { invites: [] }]); }
     catch (e) { box.innerHTML = `<div class="bad">${esc(e.message)}</div>`; return; }
     const pending = inv.invites.filter(i => !i.accepted_at);
     box.innerHTML = `<h3>people in ${esc(slug)} <a class="dim" style="font-weight:400;cursor:pointer" id="p-close">close</a></h3>
       <table><thead><tr><th>who</th><th>role</th><th>since</th><th></th></tr></thead><tbody>` +
-      (m.members.map(x => `<tr><td>${esc(x.principal)}</td><td>${esc(x.role)}</td><td class="dim">${fmtTs(x.since)}</td><td><button class="danger" data-un="${esc(x.principal)}">remove</button></td></tr>`).join("") ||
-        `<tr><td colspan="4" class="dim">nobody but the people who run the server</td></tr>`) + `</tbody></table>
-      <form id="p-add" style="margin-top:4px"><input id="p-email" type="email" placeholder="email" size="28"> <input id="p-name" placeholder="name (new people)" size="18">
+      (m.members.map(x => `<tr><td>${esc(x.principal)}</td><td>${esc(x.role)}</td><td class="dim">${fmtTs(x.since)}</td><td>${owner ? `<button class="danger" data-un="${esc(x.principal)}">remove</button>` : ""}</td></tr>`).join("") ||
+        `<tr><td colspan="4" class="dim">nobody but the people who run the server</td></tr>`) + `</tbody></table>` +
+      (owner ? `<form id="p-add" style="margin-top:4px"><input id="p-email" type="email" placeholder="email" size="28"> ${S.me.admin ? `<input id="p-name" placeholder="name (new people)" size="18">` : ""}
         <select id="p-role"><option>viewer</option><option>editor</option><option>owner</option></select>
-        <button name="how" value="invite" title="makes their sign-in account if they have none, shares the vault, and gives you a link to send">invite</button>
-        <button name="how" value="share" title="someone who already signs in here: no link needed">share</button></form>` +
+        ${S.me.admin ? `<button name="how" value="invite" title="makes their sign-in account if they have none, shares the vault, and gives you a link to send">invite</button>` : ""}
+        <button name="how" value="share" title="someone who already signs in here: no link needed">share</button></form>` : "") +
       (pending.length ? `<table style="margin-top:4px"><thead><tr><th>invited</th><th>role</th><th>expires</th><th>link to send</th><th></th></tr></thead><tbody>` +
         pending.map(i => `<tr><td>${esc(i.email)}</td><td>${esc(i.role)}</td><td class="dim">${fmtTs(i.expires_at)}</td><td><input readonly size="46" value="${esc(i.url)}" onclick="this.select()"> <button data-cp="${esc(i.url)}">copy</button></td><td><button class="danger" data-rv="${esc(i.code)}">withdraw</button></td></tr>`).join("") + `</tbody></table>` : "");
     $("#p-close").onclick = () => { S.peopleOf = null; box.innerHTML = ""; };
@@ -368,9 +382,9 @@ moving a photo to a collection moves it into the request's vault</pre></div>`;
     });
     box.querySelectorAll("[data-rv]").forEach(b => b.onclick = async () => { await run("withdraw", () => api("DELETE", `/api/invites/${encodeURIComponent(b.dataset.rv)}`, undefined, { vault: null })); people(); });
     box.querySelectorAll("[data-cp]").forEach(b => b.onclick = async () => { try { await navigator.clipboard.writeText(b.dataset.cp); say("link copied", "ok"); } catch (e) { say("select the link and copy it", "warn"); } });
-    $("#p-add").onsubmit = async ev => {
+    if ($("#p-add")) $("#p-add").onsubmit = async ev => {
       ev.preventDefault();
-      const email = $("#p-email").value.trim(), role = $("#p-role").value, name = $("#p-name").value.trim() || undefined; if (!email) return;
+      const email = $("#p-email").value.trim(), role = $("#p-role").value, name = $("#p-name")?.value.trim() || undefined; if (!email) return;
       if (ev.submitter?.value === "share") await run("share", () => api("PUT", path + "/members", { principal: email, role }, { vault: null }));
       else {
         const r = await run("invite", () => api("POST", path + "/invites", { email, role, name }, { vault: null }));
@@ -1062,7 +1076,7 @@ async function boot() {
   $("#who").textContent = S.me.principal + (S.me.vault ? ` @${S.me.vault}` : "") + (S.me.read_only ? " ro" : ""); $("#logout").classList.remove("hide");
   document.querySelector('#top .tab[data-tab="tokens"]').classList.toggle("hide", !S.me.admin);
   // Feeds, transforms and vault management are for the people who run the server.
-  for (const t of ["feeds", "transforms", "vaults"]) document.querySelector(`#top .tab[data-tab="${t}"]`).classList.toggle("hide", S.me.operator === false);
+  for (const t of ["feeds", "transforms"]) document.querySelector(`#top .tab[data-tab="${t}"]`).classList.toggle("hide", S.me.operator === false);
   try { await loadVaults(); } catch (e) { say("could not load vaults: " + e.message, "bad"); return; }
   applyUrl();
 }

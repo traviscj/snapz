@@ -114,6 +114,23 @@ class VaultStore @Inject constructor(
     c.select("$select WHERE v.slug = ? AND v.deleted_at_ms IS NULL", listOf(slug), ::dto).firstOrNull() ?: throw NotFoundException("no vault '$slug'")
 
   /** By slug, or by token (the name that never changes). */
+  /**
+   * A vault's own slug is unique on this server; a member's name for it need not be. So a vault made
+   * for a member takes the name they asked for when it is free here, and the next free variant when
+   * it is not ("pantry-2"): they still call it what they asked for.
+   */
+  fun createFree(wanted: String, name: String, description: String?, icon: String?): VaultDto {
+    if (!SLUG.matches(wanted)) throw BadRequestException("bad slug '$wanted': want ${SLUG.pattern}")
+    for (n in 1..200) {
+      try {
+        return create(if (n == 1) wanted else "${wanted.take(56)}-$n", name, description, icon)
+      } catch (e: ConflictException) {
+        continue
+      }
+    }
+    throw ConflictException("no free name near '$wanted'")
+  }
+
   fun find(c: Connection, slug: String): Vault? =
     c.select("SELECT id, slug FROM vaults WHERE (slug = ? OR token = ?) AND deleted_at_ms IS NULL", listOf(slug, slug)) { Vault(it.getLong(1), it.getString(2)) }.firstOrNull()
 
@@ -121,7 +138,8 @@ class VaultStore @Inject constructor(
 
   fun default(): Vault = require(config.snapz.default_vault)
 
-  fun create(slug: String?, name: String, description: String?, icon: String?): VaultDto {
+  /** [token]: a replica passes the source's, so the vault is the same vault on both servers. */
+  fun create(slug: String?, name: String, description: String?, icon: String?, token: String? = null): VaultDto {
     val s = slug?.takeIf { it.isNotBlank() } ?: slugify(name)
     if (!SLUG.matches(s)) throw BadRequestException("bad slug '$s': want ${SLUG.pattern}")
     val now = clock.millis()
@@ -129,7 +147,7 @@ class VaultStore @Inject constructor(
       val id = try {
         c.insert(
           "INSERT INTO vaults (slug, name, description, icon, created_at_ms, updated_at_ms, shard, token) VALUES (?,?,?,?,?,?,?,?)",
-          listOf(s, name, description, icon, now, now, shardOf("vault:$s", config.snapz.feed_shards), newVaultToken()),
+          listOf(s, name, description, icon, now, now, shardOf("vault:$s", config.snapz.feed_shards), token ?: newVaultToken()),
         )
       } catch (e: SQLIntegrityConstraintViolationException) {
         throw ConflictException("vault '$s' already exists")
@@ -318,7 +336,7 @@ class VaultActions @Inject constructor(
 ) : WebAction {
   private fun owned(slug: String): Vault {
     val m = ctx.membership(slug)
-    if (m.role != Role.OWNER) throw UnauthorizedException("only an owner of '$slug' manages who can see it")
+    if (m.role != Role.OWNER) throw UnauthorizedException("only an owner of '$slug' can do that")
     return m.vault
   }
 
@@ -326,7 +344,7 @@ class VaultActions @Inject constructor(
   @Get("/api/vaults/{slug}/members")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
-  fun members(@PathParam slug: String): MemberList = ctx.membership(slug).vault.let { MemberList(it.slug, members.members(it.id)) }
+  fun members(@PathParam slug: String): MemberList = MemberList(slug, members.members(ctx.membership(slug).vault.id))
 
   /** Share: give someone (by the email they sign in with) a role, or change it. They need not have signed in yet. */
   @Put("/api/vaults/{slug}/members")
@@ -336,7 +354,7 @@ class VaultActions @Inject constructor(
   fun share(@PathParam slug: String, @RequestBody req: MemberReq): MemberList {
     val vault = owned(slug)
     members.put(vault, req.principal, req.role ?: Role.VIEWER)
-    return MemberList(vault.slug, members.members(vault.id))
+    return MemberList(slug, members.members(vault.id))
   }
 
   @Delete("/api/vaults/{slug}/members")
@@ -345,7 +363,7 @@ class VaultActions @Inject constructor(
   fun unshare(@PathParam slug: String, @QueryParam principal: String): MemberList {
     val vault = owned(slug)
     members.remove(vault, principal)
-    return MemberList(vault.slug, members.members(vault.id))
+    return MemberList(slug, members.members(vault.id))
   }
 
   /** Operators see every vault; a pinned token its own; a member the ones they belong to, with their role. */
@@ -355,31 +373,58 @@ class VaultActions @Inject constructor(
   fun list(): VaultList {
     ctx.pinned()?.let { return VaultList(it, store.list(store.require(it).id)) }
     if (ctx.operator()) return VaultList(config.snapz.default_vault, store.list().map { it.copy(role = "operator") })
-    val home = ctx.current()   // makes their own vault on first use
-    val roles = members.roles(ctx.userId())
-    return VaultList(home.slug, store.list().filter { it.id in roles }.map { it.copy(role = roles[it.id], is_default = it.id == home.id) })
+    val home = members.default(ctx.principal(), ctx.userId()).vault   // makes their own vault on first use
+    val views = members.views(ctx.userId())
+    val mine = store.list().filter { it.id in views }.map { mine(it, views.getValue(it.id), home) }
+    return VaultList(mine.first { it.is_default }.slug, mine.sortedBy { it.slug })
   }
 
+  /** A vault as one of its members sees it: under their name for it, with their role. */
+  private fun mine(v: VaultDto, m: Membership, home: Vault) = v.copy(slug = m.alias, role = m.role, is_default = v.id == home.id)
+
+  /**
+   * Operators make vaults for the server (the slug must be free). Anyone else makes one of their
+   * own: the slug only has to be new among their vaults.
+   */
   @Post("/api/vaults")
-  @Authenticated(capabilities = [ADMIN])
+  @Authenticated(capabilities = [USER])
   @RequestContentType(MediaTypes.APPLICATION_JSON)
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
   fun create(@RequestBody req: VaultReq): VaultDto {
+    if (ctx.pinned() != null) throw UnauthorizedException("a vault-pinned token can't make vaults")
     val name = req.name?.takeIf { it.isNotBlank() } ?: req.slug ?: throw BadRequestException("name is required")
-    return store.create(req.slug, name, req.description, req.icon)
+    if (ctx.operator()) return store.create(req.slug, name, req.description, req.icon).copy(role = "operator")
+    val m = members.createOwn(ctx.userId(), req.slug?.takeIf { it.isNotBlank() } ?: slugify(name), name, req.description, req.icon)
+    return store.list(m.vault.id).single().copy(slug = m.alias, role = m.role)
   }
 
   @Patch("/api/vaults/{slug}")
-  @Authenticated(capabilities = [ADMIN])
+  @Authenticated(capabilities = [USER])
   @RequestContentType(MediaTypes.APPLICATION_JSON)
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
-  fun update(@PathParam slug: String, @RequestBody req: VaultReq) = store.update(slug, req.name, req.description, req.icon)
+  fun update(@PathParam slug: String, @RequestBody req: VaultReq): VaultDto {
+    val vault = owned(slug)
+    return store.update(vault.slug, req.name, req.description, req.icon).copy(slug = slug)
+  }
 
   @Delete("/api/vaults/{slug}")
-  @Authenticated(capabilities = [ADMIN])
+  @Authenticated(capabilities = [USER])
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
   fun delete(@PathParam slug: String, @QueryParam force: Boolean?): Ok {
-    store.delete(slug, force == true)
+    store.delete(owned(slug).slug, force == true)
+    return Ok()
+  }
+
+  /** Call one of your vaults something else. Only your view changes; `token` is what stays the same for everyone. */
+  @Put("/api/vaults/{slug}/alias")
+  @Authenticated(capabilities = [USER])
+  @RequestContentType(MediaTypes.APPLICATION_JSON)
+  @ResponseContentType(MediaTypes.APPLICATION_JSON)
+  fun alias(@PathParam slug: String, @RequestBody req: VaultReq): Ok {
+    if (ctx.pinned() != null || ctx.operator()) throw BadRequestException("the people who run the server see every vault under its own slug; a member renames their view")
+    val uid = ctx.userId()
+    val m = members.find(uid, slug) ?: throw NotFoundException("no vault '$slug'")
+    members.rename(uid, m.vault.id, req.slug?.trim()?.takeIf { it.isNotEmpty() } ?: throw BadRequestException("slug is required"))
     return Ok()
   }
 }
