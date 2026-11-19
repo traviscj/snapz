@@ -258,19 +258,39 @@ geometry should pass `current=False`: detection boxes are fractions of the image
 
 ### reading photos with a vision model
 
-`scripts/vision_transforms.py` is a worker with two extract transforms that ask a vision model
-(anything that speaks the OpenAI chat-completions API with image input; a local llama.cpp /
-llama-swap / Ollama server keeps the photos on your network):
+`scripts/vision_transforms.py` is a worker whose extract transforms ask a vision model (anything
+that speaks the OpenAI chat-completions API with image input; a local llama.cpp / llama-swap /
+Ollama server keeps the photos on your network):
 
 | transform | what it writes |
 |---|---|
+| `look` | `meta.caption`, `meta.tags`, and a request for each reader below that applies to the photo: one model call to decide, instead of every reader on every photo. Params `{"route": false}`: caption and tags only |
 | `important-text` | `meta.text`: `[{kind, value, label}]` for license plates, serial / model / part numbers, VINs, dates (as `YYYY-MM-DD`), lot codes, phones, URLs, prices |
 | `fullness` | `meta.fullness` (0..1) and `meta.fullness_of`: how full the bottle, jug or jar in the picture is; null when the level can't be seen |
+| `address` | `meta.addresses`: `[{role, name, street, unit, city, state, zip, line}]` and `meta.contacts`: `[{name, company, title, phone, email, url, license}]` from envelopes, labels, signs, business cards, truck lettering |
+| `receipt` | `meta.receipt`: `{merchant, date, subtotal, tax, tip, total, currency, invoice, lines}`; the line items are in the result's data |
+| `meter-read` | `meta.reading`: `{value, unit, kind, meter_id, digits}` off a utility meter, gauge, odometer, thermostat or scale |
+| `nameplate` | `meta.nameplate`: `{type, make, model, serial, mfg_date, specs}` off an equipment rating plate |
+| `expiry` | `meta.expiry`: `{date, kind, product}` for a best-by / use-by / expiry date |
+| `whiteboard` | `meta.transcript` (Markdown) and `meta.transcript_title` for whiteboards, notes and lists |
+
+A reader that finds nothing answers ok and clears its keys, so a retake does not keep the old answer.
 
     VISION_URL=http://localhost:8080/v1 VISION_MODEL=qwen3-vl uv run --with pillow scripts/vision_transforms.py --follow
-    scripts/vision_transforms.py --try plate.jpg milk.jpg      # ask about local files, no server
+    scripts/vision_transforms.py --try plate.jpg milk.jpg      # look, then the readers it picks; no server
+    scripts/vision_transforms.py --try --only receipt r.jpg    # just the readers named
 
-Attach either to a collection (it then runs on everything filed there) or run one on a single
+`scripts/photo_facts.py` is a second worker that needs no model, only Pillow:
+
+| transform | what it writes |
+|---|---|
+| `geo` | `meta.gps` `{lat, lon}` from the photo's own GPS tag, and `meta.place` named from a list you keep in `~/.config/snapz/places.json` (`[{name, lat, lon, radius_m}]`): no geocoder is asked. Skips photos with no tag |
+| `quality` | `meta.quality`: `{sharp, mean, flags}`, flags `blurry` / `dark` |
+| `dedupe` | `meta.phash` (256-bit difference hash) and `meta.dup_of`: earlier photos in the same collection that look the same |
+
+`scripts/workers.py` runs both in one process.
+
+Attach any of them to a collection (it then runs on everything filed there) or run one on a single
 photo. To run a transform over what is already in a collection, whether or not it is in the chain:
 
     POST /api/collections/{slug}/transforms/{name}/run                  incremental (default)
@@ -280,7 +300,8 @@ Incremental leaves alone every photo the transform has already handled as it is 
 the photo's current bytes that is waiting or did not fail): new photos, photos whose bytes changed
 since, and earlier failures get it. `all` re-runs it everywhere; an extract's new answer replaces
 what it wrote before. The web UI has both under transforms → run one. `GET /api/photos?q=kzm4827` (and the find box in the web UI) matches notes, codes and
-whatever transforms read off a photo; tiles show the fullness and the identifying text.
+whatever transforms read off a photo; tiles show the fullness, the identifying text, receipt totals,
+meter readings, expiry dates (red once past), the place, and blurry / duplicate flags.
 
 ## inbox
 

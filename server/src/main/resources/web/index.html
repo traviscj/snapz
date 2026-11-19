@@ -578,11 +578,11 @@ function renderPhotos() {
   if (S.view === "grid") {
     content.innerHTML = `<div id="grid">` + S.photos.map((p, i) => `
       <div class="t${S.sel.has(p.token) ? " sel" : ""}${i === S.cur ? " cur" : ""}${p.deleted_at ? " del" : ""}${S.fresh.has(p.token) ? " chg" : ""}" data-i="${i}">
-        <img loading="lazy" src="${esc(p.thumb_url)}" alt="">
+        <img loading="lazy" src="${esc(p.thumb_url)}" alt="" title="${esc(p.meta?.caption ?? "")}">
         ${p.barcodes.length || textItems(p).length ? `<span class="bc" title="${esc(textItems(p).map(t => t.kind + " " + t.value).join("\n"))}">${esc([...p.barcodes, ...textItems(p).filter(t => ["plate", "serial", "model", "vin"].includes(t.kind)).map(t => t.value)].join(" "))}</span>` : ""}
         ${p.note && !S.sel.has(p.token) && !S.sug[p.token] ? `<span class="nt" title="${esc(p.note)}">n</span>` : ""}
         ${S.sug[p.token]?.[0] && !S.sel.has(p.token) ? `<span class="sg">${esc(S.sug[p.token][0].collection)} ${pct(S.sug[p.token][0].p)}</span>` : ""}
-        <span class="cap">${fullPct(p) ? `<b class="${p.meta.fullness <= 0.2 ? "bad" : p.meta.fullness <= 0.5 ? "warn" : "ok"}" title="how full${p.meta.fullness_of ? ": " + esc(p.meta.fullness_of) : ""}">${fullPct(p)}</b> ` : ""}${p.meta?.action ? `<b class="warn">${esc(p.meta.action)}${p.meta.qty != null ? " " + esc(p.meta.qty) : ""}</b> ` : ""}${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
+        <span class="cap">${fullPct(p) ? `<b class="${p.meta.fullness <= 0.2 ? "bad" : p.meta.fullness <= 0.5 ? "warn" : "ok"}" title="how full${p.meta.fullness_of ? ": " + esc(p.meta.fullness_of) : ""}">${fullPct(p)}</b> ` : ""}${p.meta?.action ? `<b class="warn">${esc(p.meta.action)}${p.meta.qty != null ? " " + esc(p.meta.qty) : ""}</b> ` : ""}${facts(p).map(([c, t, tip]) => `<b class="${c}" title="${esc(tip)}">${esc(t)}</b> `).join("")}${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
       </div>`).join("") + `</div>`;
   } else {
     content.innerHTML = `<table><thead><tr><th></th><th>taken</th><th class="n">age</th>${showColl ? "<th>collection</th>" : ""}<th>action</th><th>token</th><th class="n">w×h</th><th class="n">size</th><th>barcodes</th><th>note</th><th class="n">fsi</th></tr></thead><tbody>` +
@@ -632,6 +632,7 @@ function showDetail(p) {
     ["token", p.token], ["vault", p.vault], ["collection", p.collection],
     p.meta?.action ? ["action", p.meta.action + (p.meta.qty != null ? " × " + p.meta.qty : "")] : null, ["taken", `${fmtTs(p.taken_at)} (${age(p.taken_at)})`],
     fullPct(p) ? ["fullness", fullPct(p) + (p.meta.fullness_of ? " of " + p.meta.fullness_of : "")] : null,
+    ...factRows(p),
     ...textItems(p).map(t => [t.kind, t.value + (t.label ? `  (${t.label})` : "")]),
     ["uploaded", fmtTs(p.created_at)], ["updated", fmtTs(p.updated_at)],
     p.deleted_at ? ["deleted", fmtTs(p.deleted_at)] : null,
@@ -769,6 +770,38 @@ const matchesView = e => (inTrash() ? !!e.deleted_at : !e.deleted_at && (!S.coll
 // How full, as a transform read it: "17%". And the identifying text it found, most useful first.
 const fullPct = p => p.meta?.fullness == null ? "" : Math.round(p.meta.fullness * 100) + "%";
 const textItems = p => Array.isArray(p.meta?.text) ? p.meta.text.filter(t => t && t.value) : [];
+// What the other readers left on the photo (scripts/vision_transforms.py, photo_facts.py).
+const money = (v, cur) => v == null ? "" : (cur && cur !== "USD" ? cur + " " : "$") + Number(v).toFixed(2);
+const today = () => new Date().toISOString().slice(0, 10);
+const expCls = d => d < today() ? "bad" : d < new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10) ? "warn" : "ok";
+// Short, state-coloured facts for a tile's caption line: [class, text, title].
+function facts(p) {
+  const m = p.meta || {}, out = [];
+  if (m.quality?.flags?.length) out.push(["bad", m.quality.flags.join(" "), `sharpness ${m.quality.sharp}, brightness ${m.quality.mean}`]);
+  if (Array.isArray(m.dup_of) && m.dup_of.length) out.push(["warn", "dup", "looks the same as " + m.dup_of.join(" ")]);
+  if (m.expiry?.date) out.push([expCls(m.expiry.date), m.expiry.date.slice(2), `${m.expiry.kind || "date"}${m.expiry.product ? ": " + m.expiry.product : ""}`]);
+  if (m.receipt?.total != null) out.push(["acc", money(m.receipt.total, m.receipt.currency), [m.receipt.merchant, m.receipt.date].filter(Boolean).join(" ")]);
+  if (m.reading?.value != null) out.push(["acc", `${m.reading.value}${m.reading.unit ? " " + m.reading.unit : ""}`, [m.reading.kind, m.reading.meter_id].filter(Boolean).join(" ")]);
+  if (m.place) out.push(["dim", "@" + m.place, m.gps ? `${m.gps.lat},${m.gps.lon}` : ""]);
+  return out;
+}
+// The same, in full, as rows for the detail pane.
+function factRows(p) {
+  const m = p.meta || {}, rows = [];
+  if (m.caption) rows.push(["caption", m.caption]);
+  if (Array.isArray(m.tags) && m.tags.length) rows.push(["tags", m.tags.join(" · ")]);
+  if (m.place || m.gps) rows.push(["place", [m.place, m.gps ? `${m.gps.lat},${m.gps.lon}` : null].filter(Boolean).join("  ")]);
+  for (const a of Array.isArray(m.addresses) ? m.addresses : []) rows.push([a.role || "address", [a.name, a.line].filter(Boolean).join(" — ")]);
+  for (const c of Array.isArray(m.contacts) ? m.contacts : []) rows.push(["contact", [c.name, c.title, c.company, c.phone, c.email, c.url, c.license].filter(Boolean).join(" · ")]);
+  if (m.receipt) rows.push(["receipt", [m.receipt.merchant, m.receipt.date, money(m.receipt.total, m.receipt.currency), m.receipt.tax != null ? "tax " + money(m.receipt.tax, m.receipt.currency) : null, m.receipt.lines ? m.receipt.lines + " lines" : null, m.receipt.invoice].filter(Boolean).join(" · ")]);
+  if (m.reading) rows.push(["reading", [`${m.reading.value}${m.reading.unit ? " " + m.reading.unit : ""}`, m.reading.kind, m.reading.meter_id ? "#" + m.reading.meter_id : null].filter(Boolean).join(" · ")]);
+  if (m.nameplate) rows.push(["nameplate", [m.nameplate.type, m.nameplate.make, m.nameplate.model, m.nameplate.serial ? "s/n " + m.nameplate.serial : null, m.nameplate.mfg_date, ...Object.entries(m.nameplate.specs || {}).map(([k, v]) => `${k} ${v}`)].filter(Boolean).join(" · ")]);
+  if (m.expiry?.date) rows.push(["expiry", [m.expiry.date, m.expiry.kind, m.expiry.product].filter(Boolean).join(" · ")]);
+  if (m.transcript) rows.push(["notes", (m.transcript_title ? m.transcript_title + ": " : "") + m.transcript.replace(/\s+/g, " ").slice(0, 300)]);
+  if (m.quality) rows.push(["quality", `${m.quality.flags?.length ? m.quality.flags.join(" ") : "ok"} · sharp ${m.quality.sharp} · bright ${m.quality.mean}`]);
+  if (Array.isArray(m.dup_of) && m.dup_of.length) rows.push(["same as", m.dup_of.join(" ")]);
+  return rows;
+}
 async function drainFeed(feed) {
   const out = [];
   for (;;) {

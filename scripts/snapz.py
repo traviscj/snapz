@@ -419,15 +419,24 @@ def run(argv=None):
     handlers = {t["name"]: _work(t, sz, worker_id, args.dry_run, log, args.attempts) for t in workers}
     while True:
         total, retry = 0, False
-        for t in todo:
-            total += sz.consume(t["feed"], t["consumer"] + scope, handler_for(t), commit=not args.dry_run, log=log, **t["filters"])
-        for t in workers:
-            try:
-                # batch=1: the cursor commits per intent, so a retry never re-walks answered ones.
-                total += sz.consume("intents", f"worker:{t['name']}{scope}", handlers[t["name"]],
-                                    commit=not args.dry_run, batch=1, transform=t["name"])
-            except _Retry:
-                retry = True
+        try:
+            for t in todo:
+                total += sz.consume(t["feed"], t["consumer"] + scope, handler_for(t), commit=not args.dry_run, log=log, **t["filters"])
+            for t in workers:
+                try:
+                    # batch=1: the cursor commits per intent, so a retry never re-walks answered ones.
+                    total += sz.consume("intents", f"worker:{t['name']}{scope}", handlers[t["name"]],
+                                        commit=not args.dry_run, batch=1, transform=t["name"])
+                except _Retry:
+                    retry = True
+        except (SnapzError, OSError) as e:
+            # A long-running worker outlives server restarts and network blips: cursors make the next pass pick up
+            # exactly where this one stopped. A one-shot run still fails loudly; so does a refused credential.
+            if not args.follow or (isinstance(e, SnapzError) and e.status in (401, 403)):
+                raise
+            log(f"server unavailable, will retry: {str(e)[:120]}")
+            time.sleep(min(60, max(args.poll, 15)))
+            continue
         if not args.follow and not retry:
             log(f"caught up ({total} entries)")
             return

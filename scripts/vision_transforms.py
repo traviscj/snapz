@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Two image transforms that ask a vision model, as an external worker.
+"""Image transforms that ask a vision model, as an external worker.
 
+    look             extract   one cheap pass: a caption, tags, and what kinds of thing are in the photo;
+                               then queues only the readers below that apply   -> meta `caption`, `tags`
     important-text   extract   the text worth finding again: license plates, serial / model / part
-                               numbers, VINs, dates, lot codes, phone numbers, URLs, prices
-                               -> result data {"items": [...]} + photo meta `text`
-    fullness         extract   how full the container in the picture is, 0..1
-                               -> result data {...} + photo meta `fullness` (and `fullness_of`)
+                               numbers, VINs, dates, lot codes, phone numbers, URLs, prices   -> meta `text`
+    fullness         extract   how full the container in the picture is, 0..1  -> meta `fullness`, `fullness_of`
+    address          extract   postal addresses and contact details (envelopes, signs, cards, trucks)
+                                                                               -> meta `addresses`, `contacts`
+    receipt          extract   merchant, date, totals, line items              -> meta `receipt`
+    meter-read       extract   the number on a meter, gauge, odometer or scale -> meta `reading`
+    nameplate        extract   an equipment rating plate, structured           -> meta `nameplate`
+    expiry           extract   best-by / use-by / expiry date and the product  -> meta `expiry`
+    whiteboard       extract   handwriting, whiteboards and notes as markdown  -> meta `transcript`
+
+Put `look` in a collection's chain and each photo costs one model call plus one per reader that
+applies, instead of one per reader. Any reader can also be attached or run on its own.
 
 The model is anything that speaks the OpenAI chat-completions API with image input: a local
 llama.cpp / llama-swap / Ollama / vLLM server, or a hosted one. Nothing leaves your network unless
@@ -21,9 +31,10 @@ Those, like SNAPZ_URL / SNAPZ_TOKEN, come from the environment or ~/.config/snap
     uv run --with pillow scripts/vision_transforms.py            # catch up and exit
     uv run --with pillow scripts/vision_transforms.py --follow   # keep working
 
-Then attach either transform to a collection (web UI → transforms), or run one on a single photo
+Then attach a transform to a collection (web UI → transforms), or run one on a single photo
 (photo detail → run). `--try FILE...` asks the model about local files and prints the answers,
 without a snapz server: the quick way to see how a model does on your pictures.
+(`--try --only receipt,expiry FILE...` runs just those readers; default is `look` and what it picks.)
 """
 import base64
 import io
@@ -60,6 +71,80 @@ If the level cannot be seen or inferred (opaque container, closed box), say so w
 
 Answer with JSON only, in this shape:
 {"container": "<what it is>", "contents": "<what is in it, or null>", "fullness": <0 to 1, or null>, "confidence": <0 to 1>, "basis": "<a few words: what you judged it from>"}"""
+
+# What `look` can report seeing, and the reader each one calls for.
+ROUTES = {
+    "identifiers": "important-text",
+    "address": "address",
+    "contact": "address",
+    "receipt": "receipt",
+    "meter": "meter-read",
+    "nameplate": "nameplate",
+    "container": "fullness",
+    "expiry": "expiry",
+    "notes": "whiteboard",
+}
+
+LOOK_PROMPT = """Describe this photo for a personal photo index.
+
+Answer with JSON only, in this shape:
+{"caption": "<one plain sentence: what this is a photo of>", "tags": ["<3 to 8 lowercase search words: objects, materials, setting, brand>"], "has": ["<every one of the following that is clearly present, else leave it out>"]}
+
+Values allowed in "has":
+identifiers  a license plate, serial / model / part number, VIN, lot code, or a printed date
+address      a postal street address (envelope, package label, sign, building number with street)
+contact      a person's or business's phone, email, website or license number (business card, sign, vehicle lettering)
+receipt      a store receipt, invoice or bill with amounts
+meter        a utility meter, gauge, odometer, thermostat or scale showing a reading
+nameplate    an equipment rating plate or spec label (appliance, HVAC, motor, electronics)
+container    a bottle, jug, jar, carton, glass or tank whose fill level is visible
+expiry       a best-by, use-by, sell-by or expiry date on a product
+notes        a whiteboard, handwritten note, sticky note, to-do list or page of notes worth transcribing"""
+
+ADDRESS_PROMPT = """Read the postal addresses and contact details printed or written in this photo (envelope, package label, sign, business card, vehicle lettering, letterhead).
+Do not guess characters you cannot read; leave that field null. Do not invent a city or ZIP that is not shown.
+
+Answer with JSON only, in this shape:
+{"addresses": [{"role": "<sender | recipient | location | business | other>", "name": "<who it is addressed to or belongs to, or null>", "street": "<number and street, or null>", "unit": "<apt / suite / floor, or null>", "city": null, "state": "<two letters if US, or null>", "zip": null, "country": null}],
+ "contacts": [{"name": "<person, or null>", "company": null, "title": null, "phone": "<digits with country code if shown>", "email": null, "url": null, "license": "<license / registration number shown, or null>"}]}
+Use empty lists when there is nothing of that sort."""
+
+RECEIPT_PROMPT = """Read this receipt, invoice or bill.
+Copy amounts exactly; do not compute or correct them. Leave anything you cannot read null.
+
+Answer with JSON only, in this shape:
+{"merchant": "<business name, or null>", "date": "<YYYY-MM-DD, or null>", "time": "<HH:MM 24h, or null>", "currency": "<ISO code such as USD, or null>", "subtotal": <number or null>, "tax": <number or null>, "tip": <number or null>, "total": <number or null>, "invoice": "<receipt / invoice / order number, or null>",
+ "items": [{"desc": "<as printed>", "qty": <number or null>, "amount": <number or null>}]}
+If this is not a receipt, invoice or bill, answer {"merchant": null, "total": null, "items": []}."""
+
+METER_PROMPT = """Read the measuring device in this photo: a water, gas or electric meter, a gauge, an odometer, a thermostat or a scale.
+Give the reading as a number, with the decimal point where the device marks one, and separately the digits exactly as the display shows them. For dial meters read each dial in order; when a pointer sits between two digits take the lower one.
+If no reading can be read with confidence, use null rather than guessing.
+
+Answer with JSON only, in this shape:
+{"kind": "<water | gas | electric | odometer | pressure | temperature | scale | fuel | other>", "reading": <number or null>, "unit": "<unit shown or implied, such as gal, ft3, kWh, mi, psi, °F, lb, or null>", "digits": "<the digits exactly as shown, with leading zeros>", "meter_id": "<the meter's own serial or number if printed, or null>", "confidence": <0 to 1>}"""
+
+NAMEPLATE_PROMPT = """Read the equipment rating plate or specification label in this photo.
+Copy values exactly as printed. Leave anything not shown or not readable null; do not fill in from what such equipment usually has.
+
+Answer with JSON only, in this shape:
+{"type": "<what the equipment is: furnace, condenser, water heater, refrigerator, motor, router, ...>", "make": null, "model": null, "serial": null, "mfg_date": "<YYYY-MM or YYYY-MM-DD if printed, or null>",
+ "specs": {"<printed label, lowercase, such as volts, amps, hz, phase, btu_in, btu_out, refrigerant, charge, capacity, watts, mca, mop, gallons, fcc_id>": "<value with its unit, as printed>"}}
+If there is no rating plate or spec label, answer {"type": null, "make": null, "model": null, "serial": null, "specs": {}}."""
+
+EXPIRY_PROMPT = """Find the date-coded shelf life on the product in this photo: best by, best before, use by, sell by, EXP, or a manufacture / packed-on date.
+Read the date exactly; do not guess digits. Resolve two-digit years to 20YY. If only month and year are printed, give YYYY-MM.
+
+Answer with JSON only, in this shape:
+{"product": "<what the product is, with brand if visible, or null>", "date": "<YYYY-MM-DD or YYYY-MM, or null>", "kind": "<best_by | use_by | sell_by | exp | mfg | packed | unknown>", "as_printed": "<the date text exactly as printed>", "confidence": <0 to 1>}
+Use "date": null when no such date is visible."""
+
+WHITEBOARD_PROMPT = """Transcribe the whiteboard, note or list in this photo as Markdown.
+Keep the structure that is there: headings, lists, checkboxes ("- [ ]" / "- [x]"), tables, arrows as "->". Keep the writer's words and spelling. Mark anything you cannot read as [?] rather than guessing.
+
+Answer with JSON only, in this shape:
+{"title": "<a few words for what this is, or null>", "markdown": "<the transcription>"}
+Use "markdown": "" when there is no such writing to read."""
 
 
 def _prepare(image):
@@ -106,7 +191,7 @@ def _json_in(text):
     raise ValueError(f"no JSON in the model's reply: {text[:160]!r}")
 
 
-def ask(image, prompt):
+def ask(image, prompt, max_tokens=900):
     """One question about one image -> the parsed JSON answer."""
     model = _setting("VISION_MODEL")
     if not model:
@@ -115,7 +200,7 @@ def ask(image, prompt):
     body = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 900,
+        "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(data).decode()}"}},
             {"type": "text", "text": prompt},
@@ -137,8 +222,13 @@ def ask(image, prompt):
         raise Skip(f"vision model refused: HTTP {e.code} {detail}") from None
     except OSError as e:
         raise RuntimeError(f"vision model unreachable: {e}") from None
-    return _json_in(reply["choices"][0]["message"]["content"] or "")
+    answer = _json_in(reply["choices"][0]["message"]["content"] or "")
+    if not isinstance(answer, dict):
+        raise ValueError("the model's reply was not a JSON object")
+    return answer
 
+
+# ---- cleaning what a model says into what a photo should carry
 
 def _num(v):
     try:
@@ -147,18 +237,58 @@ def _num(v):
         return None
 
 
+def _s(v, n=120):
+    """A trimmed string, or None for the many ways a model says "nothing"."""
+    if v is None or isinstance(v, (dict, list)):
+        return None
+    s = str(v).strip()
+    return None if not s or s.lower() in ("null", "none", "n/a", "unknown", "?") else s[:n]
+
+
+def _amount(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return round(float(v), 4)
+    m = re.search(r"-?\d[\d,]*\.?\d*", str(v or ""))
+    try:
+        return round(float(m.group().replace(",", "")), 4) if m else None
+    except ValueError:
+        return None
+
+
+def _date(v):
+    s = _s(v, 10)
+    return s if s and re.fullmatch(r"\d{4}-\d{2}(-\d{2})?", s) else None
+
+
+def _rows(v, limit=20):
+    return [x for x in (v if isinstance(v, list) else []) if isinstance(x, dict)][:limit]
+
+
+def _compact(d):
+    return {k: v for k, v in d.items() if v not in (None, "", [], {})}
+
+
+# ---- the readers: image bytes -> cleaned answer
+
+def look(image):
+    a = ask(image, LOOK_PROMPT, max_tokens=400)
+    tags = [t for t in (_s(t, 30) for t in (a.get("tags") if isinstance(a.get("tags"), list) else [])) if t]
+    has = [h for h in (a.get("has") if isinstance(a.get("has"), list) else []) if h in ROUTES]
+    return {"caption": _s(a.get("caption"), 200), "tags": [t.lower() for t in tags][:10], "has": list(dict.fromkeys(has))}
+
+
 def important_text(image):
     items = []
-    for it in (ask(image, TEXT_PROMPT).get("items") or [])[:40]:
-        if not isinstance(it, dict):
-            continue
+    for it in _rows(ask(image, TEXT_PROMPT).get("items"), 40):
         text = str(it.get("text") or "").strip()
         if not text or len(text) > 200:
             continue
         kind = it.get("kind") if it.get("kind") in KINDS else "other"
         value = str(it.get("value") or text).strip()[:200]
-        if kind in ("plate", "serial", "vin", "lot", "part", "model"):
-            value = re.sub(r"\s+", "", value).upper() if kind in ("plate", "serial", "vin") else value.strip()
+        if kind in ("plate", "serial", "vin"):
+            value = re.sub(r"\s+", "", value).upper()
         label = it.get("label")
         items.append({"kind": kind, "text": text, "value": value, "label": str(label)[:40] if label else None, "confidence": _num(it.get("confidence"))})
     return items
@@ -168,12 +298,90 @@ def fullness_of(image):
     a = ask(image, FULLNESS_PROMPT)
     f = a.get("fullness")
     return {
-        "container": (str(a["container"])[:80] if a.get("container") else None),
-        "contents": (str(a["contents"])[:80] if a.get("contents") else None),
+        "container": _s(a.get("container"), 80),
+        "contents": _s(a.get("contents"), 80),
         "fullness": None if f is None else _num(f),
         "confidence": _num(a.get("confidence")),
-        "basis": (str(a["basis"])[:160] if a.get("basis") else None),
+        "basis": _s(a.get("basis"), 160),
     }
+
+
+def addresses_in(image):
+    a = ask(image, ADDRESS_PROMPT, max_tokens=1200)
+    addresses, contacts = [], []
+    for r in _rows(a.get("addresses"), 8):
+        x = _compact({k: _s(r.get(k)) for k in ("role", "name", "street", "unit", "city", "state", "zip", "country")})
+        if x.get("street") or (x.get("city") and x.get("zip")):
+            # One line to read and to search by, as an envelope would have it.
+            x["line"] = ", ".join(p for p in (" ".join(p for p in (x.get("street"), x.get("unit")) if p), x.get("city"),
+                                              " ".join(p for p in (x.get("state"), x.get("zip")) if p)) if p)
+            addresses.append(x)
+    for r in _rows(a.get("contacts"), 8):
+        x = _compact({k: _s(r.get(k)) for k in ("name", "company", "title", "phone", "email", "url", "license")})
+        if any(x.get(k) for k in ("phone", "email", "url", "license")):
+            contacts.append(x)
+    return {"addresses": addresses, "contacts": contacts}
+
+
+def receipt_in(image):
+    a = ask(image, RECEIPT_PROMPT, max_tokens=2500)
+    items = [_compact({"desc": _s(r.get("desc")), "qty": _amount(r.get("qty")), "amount": _amount(r.get("amount"))}) for r in _rows(a.get("items"), 80)]
+    return {
+        "merchant": _s(a.get("merchant")), "date": _date(a.get("date")), "time": _s(a.get("time"), 5), "currency": _s(a.get("currency"), 3),
+        "subtotal": _amount(a.get("subtotal")), "tax": _amount(a.get("tax")), "tip": _amount(a.get("tip")), "total": _amount(a.get("total")),
+        "invoice": _s(a.get("invoice"), 60), "items": [i for i in items if i.get("desc")],
+    }
+
+
+def meter_in(image):
+    a = ask(image, METER_PROMPT, max_tokens=300)
+    return {"kind": _s(a.get("kind"), 20), "reading": _amount(a.get("reading")), "unit": _s(a.get("unit"), 12), "digits": _s(a.get("digits"), 24),
+            "meter_id": _s(a.get("meter_id"), 40), "confidence": _num(a.get("confidence"))}
+
+
+def nameplate_in(image):
+    a = ask(image, NAMEPLATE_PROMPT, max_tokens=1200)
+    specs = a.get("specs") if isinstance(a.get("specs"), dict) else {}
+    specs = {re.sub(r"[^a-z0-9]+", "_", str(k).lower()).strip("_")[:32]: _s(v, 60) for k, v in list(specs.items())[:30]}
+    return {"type": _s(a.get("type"), 60), "make": _s(a.get("make"), 60), "model": _s(a.get("model"), 60), "serial": _s(a.get("serial"), 60),
+            "mfg_date": _date(a.get("mfg_date")), "specs": {k: v for k, v in specs.items() if k and v}}
+
+
+def expiry_in(image):
+    a = ask(image, EXPIRY_PROMPT, max_tokens=300)
+    return {"product": _s(a.get("product"), 80), "date": _date(a.get("date")), "kind": _s(a.get("kind"), 12), "as_printed": _s(a.get("as_printed"), 40),
+            "confidence": _num(a.get("confidence"))}
+
+
+def whiteboard_in(image):
+    a = ask(image, WHITEBOARD_PROMPT, max_tokens=3000)
+    md = a.get("markdown")
+    return {"title": _s(a.get("title"), 80), "markdown": md.strip()[:12000] if isinstance(md, str) else ""}
+
+
+# ---- the transforms: what each reader leaves on the photo. A reader that finds nothing still
+# answers ok and clears its keys, so a rerun after a retake does not leave the old answer behind.
+
+def _out(data, patch):
+    data["model"] = _setting("VISION_MODEL")
+    return data, patch
+
+
+@image_transform("look", kind="extract",
+                 description="Caption + tags, then queues only the readers that apply (text, address, receipt, meter, nameplate, fullness, expiry, whiteboard). Sets meta.caption, meta.tags.")
+def look_transform(intent, image, sz):
+    # Filing a photo starts the destination's chain; if a chain already looked at it (say, in the inbox), once was enough.
+    if intent.get("origin") == "chain" and intent.get("photo") and (sz.photo(intent["photo"]).get("meta") or {}).get("caption"):
+        raise Skip("already looked at")
+    r = look(image)
+    queued = []
+    # params {"route": false}: caption and tags only.
+    if (intent.get("params") or {}).get("route") is not False and intent.get("photo"):
+        for name in dict.fromkeys(ROUTES[h] for h in r["has"]):
+            sz.request_transform(intent["photo"], name)
+            queued.append(name)
+    r["queued"] = queued
+    return _out(r, {"caption": r["caption"], "tags": r["tags"] or None})
 
 
 @image_transform("important-text", kind="extract",
@@ -181,30 +389,91 @@ def fullness_of(image):
 def important_text_transform(intent, image, sz):
     items = important_text(image)
     # meta.text is what the photo carries around (and what search matches): kind + value, no model chatter.
-    return {"items": items, "model": _setting("VISION_MODEL")}, {"text": [{"kind": i["kind"], "value": i["value"], "label": i["label"]} for i in items]}
+    return _out({"items": items}, {"text": [{"kind": i["kind"], "value": i["value"], "label": i["label"]} for i in items]})
 
 
 @image_transform("fullness", kind="extract",
                  description="How full the container in the photo is, 0..1 (vision model, external worker). Sets meta.fullness.")
 def fullness_transform(intent, image, sz):
     r = fullness_of(image)
-    r["model"] = _setting("VISION_MODEL")
     if r["fullness"] is None:
-        return r, {"fullness": None, "fullness_of": None}   # clears what an earlier run may have set
-    return r, {"fullness": round(r["fullness"], 2), "fullness_of": r["contents"] or r["container"]}
+        return _out(r, {"fullness": None, "fullness_of": None})
+    return _out(r, {"fullness": round(r["fullness"], 2), "fullness_of": r["contents"] or r["container"]})
 
 
-def _try(paths):
-    for p in paths:
+@image_transform("address", kind="extract",
+                 description="Postal addresses and contact details: envelopes, labels, signs, business cards, truck lettering (vision model). Sets meta.addresses, meta.contacts.")
+def address_transform(intent, image, sz):
+    r = addresses_in(image)
+    return _out(r, {"addresses": r["addresses"] or None, "contacts": r["contacts"] or None})
+
+
+@image_transform("receipt", kind="extract",
+                 description="Receipts, invoices, bills: merchant, date, subtotal / tax / total, line items (vision model). Sets meta.receipt.")
+def receipt_transform(intent, image, sz):
+    r = receipt_in(image)
+    if r["total"] is None and not r["items"]:
+        return _out(r, {"receipt": None})
+    # Line items stay in the result; the photo carries the header and how many lines there were.
+    return _out(r, {"receipt": _compact({**{k: r[k] for k in ("merchant", "date", "currency", "subtotal", "tax", "tip", "total", "invoice")}, "lines": len(r["items"])})})
+
+
+@image_transform("meter-read", kind="extract",
+                 description="The reading on a utility meter, gauge, odometer, thermostat or scale (vision model). Sets meta.reading.")
+def meter_transform(intent, image, sz):
+    r = meter_in(image)
+    if r["reading"] is None:
+        return _out(r, {"reading": None})
+    return _out(r, {"reading": _compact({"value": r["reading"], "unit": r["unit"], "kind": r["kind"], "meter_id": r["meter_id"], "digits": r["digits"]})})
+
+
+@image_transform("nameplate", kind="extract",
+                 description="Equipment rating plates: type, make, model, serial, manufacture date, electrical / capacity specs (vision model). Sets meta.nameplate.")
+def nameplate_transform(intent, image, sz):
+    r = nameplate_in(image)
+    if not (r["model"] or r["serial"]):
+        return _out(r, {"nameplate": None})
+    return _out(r, {"nameplate": _compact(r)})
+
+
+@image_transform("expiry", kind="extract",
+                 description="Best-by / use-by / expiry date and the product it is on (vision model). Sets meta.expiry.")
+def expiry_transform(intent, image, sz):
+    r = expiry_in(image)
+    if r["date"] is None:
+        return _out(r, {"expiry": None})
+    return _out(r, {"expiry": _compact({"date": r["date"], "kind": r["kind"], "product": r["product"]})})
+
+
+@image_transform("whiteboard", kind="extract",
+                 description="Whiteboards, handwritten notes and lists, transcribed as Markdown (vision model). Sets meta.transcript.")
+def whiteboard_transform(intent, image, sz):
+    r = whiteboard_in(image)
+    if not r["markdown"]:
+        return _out(r, {"transcript": None, "transcript_title": None})
+    return _out(r, {"transcript": r["markdown"][:4000], "transcript_title": r["title"]})
+
+
+READERS = {"important-text": important_text, "fullness": fullness_of, "address": addresses_in, "receipt": receipt_in,
+           "meter-read": meter_in, "nameplate": nameplate_in, "expiry": expiry_in, "whiteboard": whiteboard_in}
+
+
+def _try(args):
+    only = None
+    if args[:1] == ["--only"]:
+        only, args = [n for n in args[1].split(",") if n], args[2:]
+    for p in args:
         with open(p, "rb") as fh:
             image = fh.read()
         print(f"== {p}")
         try:
-            for i in important_text(image):
-                print(f"  {i['kind']:<7} {i['value']:<28} {('(' + i['label'] + ')') if i['label'] else '':<10} conf {i['confidence']}")
-            f = fullness_of(image)
-            pct = "?" if f["fullness"] is None else f"{round(f['fullness'] * 100)}%"
-            print(f"  fullness {pct}  of {f['contents'] or f['container']}  conf {f['confidence']}  ({f['basis']})")
+            names = only
+            if names is None:
+                seen = look(image)
+                print(f"  look           {json.dumps(seen, ensure_ascii=False)}")
+                names = list(dict.fromkeys(ROUTES[h] for h in seen["has"]))
+            for n in names:
+                print(f"  {n:<14} {json.dumps(READERS[n](image), ensure_ascii=False)}")
         except (Skip, RuntimeError, ValueError) as e:
             print(f"  failed: {e}")
 
