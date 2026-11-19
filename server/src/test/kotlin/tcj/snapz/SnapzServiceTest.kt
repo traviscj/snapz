@@ -938,4 +938,92 @@ class SnapzServiceTest {
     assertThat(Posture.check(with("https://snapz.example.net", "x".repeat(40))).none { it.fatal }).isTrue()
     assertThat(Posture.check(with("https://snapz.example.net", "x".repeat(40))).map { it.message }).anyMatch { it.contains("bootstrap token(s) in config") }
   }
+
+  @Test
+  @Suppress("UNCHECKED_CAST")
+  fun `receive rebuilds a server from another one's feeds, idempotently, in any order`() {
+    // A source with a bit of everything.
+    api("POST", "/api/vaults", mapOf("name" to "work"))
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    api("PUT", "/api/collections/pantry/actions", mapOf("actions" to listOf(mapOf("name" to "consume", "label" to "USE", "qty" to true), mapOf("name" to "out"))))
+    api("POST", "/api/collections", mapOf("name" to "desk"), vault = "work")
+    val a = upload("pantry", jpeg(color = Color.RED), "&note=beans&meta=" + java.net.URLEncoder.encode("""{"barcodes":[{"symbology":"ean13","value":"0123456789012"}],"n":3}""", "UTF-8"))
+    val b = upload("pantry", jpeg(color = Color.BLUE))
+    val w = obj(call("POST", "/api/photos?collection=desk", raw = jpeg(color = Color.GREEN), vault = "work"))
+    api("PATCH", "/api/photos/${a["token"]}", mapOf("action" to "consume", "qty" to 2))
+    api("DELETE", "/api/photos/${b["token"]}")
+    api("PUT", "/api/records/stock/0123456789012", mapOf("qty" to 4, "name" to "beans"))
+    api("PUT", "/api/records/notes/x", mapOf("a" to listOf(1, 2)), vault = "work")
+    publisher.publishAll()
+
+    fun feed(name: String) = api("GET", "/_feeds/fetch/$name?limit=1000")["entries"] as List<Map<String, Any?>>
+    val feeds = listOf("vaults", "collections", "photos", "records").associateWith(::feed)
+    assertThat(feeds.getValue("photos")).hasSize(3)
+
+    // What a reader of the API sees; volatile bookkeeping aside, this must survive the trip.
+    fun strip(m: Map<String, Any?>) = m - setOf("feed_sync_id", "current_version", "client_id")
+    fun state(): Map<String, Any?> = mapOf(
+      "photos" to listOf("personal", "work").flatMap { v ->
+        (api("GET", "/api/photos?limit=500", vault = v).list("photos") + api("GET", "/api/photos?limit=500&deleted=true", vault = v).list("photos")).map(::strip)
+      }.sortedBy { it["token"] as String },
+      "collections" to listOf("personal", "work").flatMap { v -> api("GET", "/api/collections", vault = v).list("collections").map(::strip) },
+      "stock" to api("GET", "/api/records/stock").list("records").map(::strip),
+      "notes" to api("GET", "/api/records/notes", vault = "work").list("records").map(::strip),
+    )
+    val before = state()
+
+    // An empty server (the default vault and its inbox exist, as on any fresh install), one blob short.
+    val lost = b["sha256"] as String
+    val lostBytes = blobs.original(lost).readBytes()
+    setUp()
+    assertThat(blobs.original(lost).delete()).isTrue()
+
+    fun receive(name: String, entries: List<Map<String, Any?>> = feeds.getValue(name)) = api("POST", "/_feeds/receive/$name", mapOf("entries" to entries))
+    // Children before parents: photos and records first, vaults last.
+    val first = receive("photos")
+    assertThat(first["applied"]).isEqualTo(2L)
+    assertThat(first.list("missing_blobs").map { it["sha256"] }).containsExactly(lost)
+    // The bytes are checked against the name they are pushed under.
+    assertThat(call("PUT", "/_feeds/blobs/$lost", raw = jpeg(color = Color.YELLOW)).code).isEqualTo(400)
+    assertThat(call("PUT", "/_feeds/blobs/$lost", raw = lostBytes).code).isEqualTo(200)
+    assertThat(call("GET", "/_feeds/blobs/$lost").body!!.bytes()).isEqualTo(lostBytes)
+    val second = receive("photos")
+    assertThat(second["applied"] to second["unchanged"]).isEqualTo(1L to 2L)
+    receive("records")
+    receive("collections")
+    receive("vaults")
+    assertThat(state()).isEqualTo(before)
+
+    // Delivered again: nothing is written, so nothing is republished.
+    publisher.publishAll()
+    for (name in feeds.keys) {
+      val again = receive(name)
+      assertThat(again["applied"]).withFailMessage { "$name: $again" }.isEqualTo(0L)
+    }
+    assertThat(publisher.publishAll()).isEqualTo(0)
+
+    // Last writer wins: an older entry loses to the local row, a newer one replaces it.
+    val entry = feeds.getValue("photos").first { it["token"] == a["token"] }
+    val older = entry + mapOf("note" to "stale", "updated_at" to "2001-01-01T00:00:00Z")
+    assertThat(receive("photos", listOf(older))["stale"]).isEqualTo(1L)
+    assertThat(api("GET", "/api/photos/${a["token"]}")["note"]).isEqualTo("beans")
+    val newer = entry + mapOf("note" to "fresh", "collection" to "elsewhere", "updated_at" to "2100-01-01T00:00:00Z")
+    assertThat(receive("photos", listOf(newer))["applied"]).isEqualTo(1L)
+    val moved = api("GET", "/api/photos/${a["token"]}")
+    assertThat(listOf(moved["note"], moved["collection"], moved["updated_at"])).containsExactly("fresh", "elsewhere", "2100-01-01T00:00:00Z")
+
+    // A collection deleted at the source arrives under its tombstone slug and takes the live one here.
+    val pantry = feeds.getValue("collections").first { it["slug"] == "pantry" }
+    receive("collections", listOf(pantry + mapOf("slug" to "pantry.deleted.99", "deleted_at" to "2100-01-01T00:00:00Z", "updated_at" to "2100-01-01T00:00:00Z")))
+    assertThat(api("GET", "/api/collections").list("collections").map { it["slug"] }).doesNotContain("pantry")
+
+    // Sink endpoints are admin-only, and only replicated tables have one.
+    val pinned = api("POST", "/api/tokens", mapOf("name" to "work-bot", "vault" to "work"))["token"] as String
+    assertThat(call("POST", "/_feeds/receive/records", mapOf("entries" to listOf<Any>()), token = pinned).code).isEqualTo(403)
+    assertThat(call("GET", "/_feeds/blobs/$lost", token = pinned).code).isEqualTo(403)
+    val reader = api("POST", "/api/tokens", mapOf("name" to "replicator", "read_only" to true))["token"] as String
+    assertThat(call("GET", "/_feeds/blobs/$lost", token = reader).code).isEqualTo(200)
+    assertThat(call("PUT", "/_feeds/blobs/$lost", raw = lostBytes, token = reader).code).isEqualTo(403)
+    assertThat(call("POST", "/_feeds/receive/intents", mapOf("entries" to listOf<Any>())).code).isEqualTo(400)
+  }
 }

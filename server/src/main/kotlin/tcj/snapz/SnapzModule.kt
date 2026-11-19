@@ -43,6 +43,7 @@ class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
     install(WebActionModule.create<BlobAction>())
     install(WebActionModule.create<RecordActions>())
     install(WebActionModule.create<FeedActions>())
+    install(WebActionModule.create<ReplicaActions>())
     install(WebActionModule.create<TokenActions>())
     install(WebActionModule.create<InfoAction>())
     install(WebActionModule.create<TransformActions>())

@@ -340,7 +340,7 @@ class PhotoStore @Inject constructor(
   }
 
   /** ",v1,v2," so `LIKE '%,v1,%'` matches whole codes; null when there are none. */
-  private fun barcodeColumn(meta: Map<String, Any?>): String? {
+  fun barcodeColumn(meta: Map<String, Any?>): String? {
     val values = (meta["barcodes"] as? List<*>).orEmpty().mapNotNull {
       when (it) {
         is Map<*, *> -> it["value"]?.toString()

@@ -174,6 +174,34 @@ photo's `meta` to *remove* a barcode doesn't retract the old UPC.
     scripts/pantry_orders.py --follow
     scripts/snapz.py status | ls [coll] | tail photos -f collection=pantry | upload pantry x.jpg --barcode 0016000275287
 
+## replication (feedglue)
+
+A feed has a receiving half. `POST /_feeds/receive/{feed}` takes entries in exactly the shape
+`/_feeds/fetch/{feed}` hands out and makes the local rows look like them, so fetch on one server
+plus receive on another is replication:
+
+    source (fetch) --> [filters] --> sink (receive)        one cursor per glue and feed
+
+    cp scripts/glue.example.json glue.json                  # sources, sinks, glues
+    SNAPZ_HOME_TOKEN=… SNAPZ_PUB_TOKEN=… scripts/feedglue.py run --follow
+    scripts/feedglue.py status                              # cursor, head and lag per feed
+
+- **At-least-once**: the cursor moves only after the sink accepted the page. Receive is
+  idempotent (an entry already reflected writes nothing and republishes nothing).
+- **Last writer wins** on `updated_at`; rows keep the source's tokens, slugs and timestamps.
+- **Bytes** are not in the feed. Receive lists the photos whose blob it lacks; the glue copies
+  each by hash (`GET` / `PUT /_feeds/blobs/{sha256}`) and sends the page again.
+- **Order does not matter** between feeds: a photo that arrives before its collection gets a
+  stub parent that the real entry later overwrites.
+- **Transforms do not re-run** on the receiving side; their outcome (current bytes, meta,
+  records) arrives through the feeds. Version history and intents/results are not replicated.
+- The source token can be read-only; the sink token needs admin. Filters are
+  `{"ignore_if" | "retain_if": {"field": "vault", "equals": "work"}}`.
+
+One direction only for now. Pointing two glues at each other does converge (identical rows are
+not rewritten), but concurrent edits on both sides resolve by timestamp alone, and vaults and
+collections are matched by slug rather than by a stable token.
+
 ## image transforms
 
 A collection has an ordered **chain** of transforms. A photo entering the collection (upload, move,

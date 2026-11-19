@@ -1,0 +1,15 @@
+{
+  "sources": {"home": {"url": "https://snapz.home.example", "token_env": "SNAPZ_HOME_TOKEN"}},
+  "sinks": {"pub": {"url": "https://snapz.example.net", "token_env": "SNAPZ_PUB_TOKEN"}},
+  "glues": [
+    {
+      "name": "home-to-pub",
+      "source": "home",
+      "sink": "pub",
+      "feeds": ["vaults", "collections", "photos", "records"],
+      "limit": 100,
+      "interval_s": 5,
+      "filters": []
+    }
+  ]
+}
