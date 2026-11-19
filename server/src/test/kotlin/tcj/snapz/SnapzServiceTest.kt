@@ -59,8 +59,40 @@ object FakeIdp {
       val groups = (u["groups"] as? List<*>).orEmpty().joinToString(",") { "\"$it\"" }
       reply(ex, """{"sub":"${u["sub"]}","email":"${u["email"]}","groups":[$groups]}""")
     }
+    // The corner of Pocket ID's admin API that invitations use.
+    server.createContext("/api/") { ex ->
+      check(ex.requestHeaders.getFirst("X-API-KEY") == "idp-key") { "wrong api key" }
+      val path = ex.requestURI.path
+      val body = String(ex.requestBody.readAllBytes())
+      fun arr(items: List<String>) = items.joinToString(",", "[", "]")
+      fun account(a: Map<String, Any?>) = """{"id":"${a["id"]}","username":"${a["username"]}","email":"${a["email"]}"}"""
+      val userGroups = Regex("^/api/users/([^/]+)/(groups|user-groups)$").matchEntire(path)
+      val oneTime = Regex("^/api/users/([^/]+)/one-time-access-token$").matchEntire(path)
+      when {
+        path == "/api/user-groups" -> reply(ex, """{"data":[{"id":"g-users","name":"snapz-users"},{"id":"g-other","name":"other"}]}""")
+        path == "/api/users" && ex.requestMethod == "GET" -> reply(ex, """{"data":${arr(accounts.map(::account))}}""")
+        path == "/api/users" -> {
+          val f = { k: String -> Regex("\"$k\":\"([^\"]*)\"").find(body)?.groupValues?.get(1) }
+          val a = mapOf("id" to "acct-${accounts.size + 1}", "username" to f("username"), "email" to f("email"), "displayName" to f("displayName"),
+            "groups" to Regex("\"userGroupIds\":\\[([^\\]]*)\\]").find(body)!!.groupValues[1].split(',').map { it.trim('"') }.filter { it.isNotEmpty() })
+          accounts.add(a)
+          reply(ex, account(a))
+        }
+        userGroups != null && ex.requestMethod == "GET" -> reply(ex, arr((accounts.first { it["id"] == userGroups.groupValues[1] }["groups"] as List<*>).map { """{"id":"$it"}""" }))
+        userGroups != null -> {
+          val i = accounts.indexOfFirst { it["id"] == userGroups.groupValues[1] }
+          accounts[i] = accounts[i] + ("groups" to Regex("\"userGroupIds\":\\[([^\\]]*)\\]").find(body)!!.groupValues[1].split(',').map { it.trim('"') })
+          reply(ex, "{}")
+        }
+        oneTime != null -> reply(ex, """{"token":"once-${oneTime.groupValues[1]}"}""")
+        else -> error("unexpected $path")
+      }
+    }
     server.start()
   }
+
+  /** Accounts at the fake provider: id, username, email, displayName, groups. */
+  val accounts = java.util.concurrent.CopyOnWriteArrayList<Map<String, Any?>>()
 }
 
 class SnapzTestModule : KAbstractModule() {
@@ -74,6 +106,7 @@ class SnapzTestModule : KAbstractModule() {
           allowed_emails = listOf("travis@example.com"), allowed_groups = listOf("snapz-users"),
           bearer_audiences = listOf("snapz-cli"), admin_groups = listOf("snapz-admins"),
         ),
+        pocket_id = PocketIdConfig(url = FakeIdp.issuer, api_key = "idp-key", users_group = "snapz-users"),
       ),
     )
     install(MiskTestingServiceModule())
@@ -103,7 +136,7 @@ class SnapzServiceTest {
   fun setUp() {
     db.tx { c ->
       for (t in listOf(
-        "photos", "collections", "records", "vaults", "api_tokens", "users", "vault_members", "sequences", "feed_cursors",
+        "photos", "collections", "records", "vaults", "api_tokens", "users", "vault_members", "invites", "sequences", "feed_cursors",
         "photo_versions", "transforms", "collection_transforms", "transform_intents", "transform_results",
       )) c.exec("DELETE FROM $t")
     }
@@ -1177,5 +1210,58 @@ class SnapzServiceTest {
     assertThat(call("DELETE", "/api/vaults/personal/members?principal=ally@else.com").code).isEqualTo(200)
     assertThat(asAlly("GET", "/api/photos/$t").code).isEqualTo(404)
     assertThat(asAlly("GET", "/api/photos?vault=personal").code).isEqualTo(404)
+  }
+
+  @Test
+  fun `an invitation makes the account, shares the vault and hands over a link`() {
+    FakeIdp.accounts.clear()
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    val photo = upload("pantry", jpeg())
+
+    val inv = api("POST", "/api/vaults/personal/invites", mapOf("email" to "JD.Beals@Example.com", "role" to "viewer", "name" to "JD Beals"))
+    assertThat(inv).containsEntry("email", "jd.beals@example.com").containsEntry("vault", "personal").containsEntry("role", "viewer").containsEntry("account", "created")
+    val code = inv["code"] as String
+    assertThat(inv["url"] as String).endsWith("/invite/$code")
+    // An account in the group that may sign in, and a place in the vault waiting for them.
+    assertThat(FakeIdp.accounts).hasSize(1)
+    assertThat(FakeIdp.accounts[0]).containsEntry("email", "jd.beals@example.com").containsEntry("username", "jd.beals").containsEntry("displayName", "JD Beals").containsEntry("groups", listOf("g-users"))
+    assertThat(api("GET", "/api/vaults/personal/members").list("members").map { it["principal"] to it["role"] }).containsExactly("jd.beals@example.com" to "viewer")
+
+    // The page the link opens needs no sign-in (they cannot sign in yet) and leads to a one-time sign-in.
+    val page = call("GET", "/invite/$code", token = null)
+    assertThat(page.code).isEqualTo(200)
+    assertThat(page.header("Content-Security-Policy")).contains("frame-ancestors 'none'")
+    assertThat(page.body!!.string()).contains("You're invited", "jd.beals@example.com", "/invite/$code/setup", "/auth/login?return_to=")
+    val setup = call("GET", "/invite/$code/setup", token = null)
+    assertThat(setup.code).isEqualTo(302)
+    assertThat(setup.header("Location")).isEqualTo("${FakeIdp.issuer}/lc/once-acct-1")
+    assertThat(call("GET", "/invite/nope", token = null).body!!.string()).contains("does not exist")
+    assertThat(call("GET", "/invite/nope/setup", token = null).code).isEqualTo(404)
+
+    // They register a passkey and sign in: the shared vault and one of their own.
+    FakeIdp.user = mapOf("sub" to "acct-1", "email" to "jd.beals@example.com", "groups" to listOf("snapz-users"))
+    val (state, _) = startLogin("")
+    val beals = call("GET", "/auth/callback?code=c0de&state=$state", token = null).header("Set-Cookie")!!.substringBefore(';')
+    assertThat(obj(call("GET", "/api/vaults", token = null, cookie = beals)).list("vaults").map { it["slug"] to it["role"] })
+      .containsExactlyInAnyOrder("personal" to "viewer", "jd-beals" to "owner")
+    assertThat(obj(call("GET", "/api/photos", token = null, cookie = beals, vault = "personal")).list("photos").map { it["token"] }).containsExactly(photo["token"])
+    assertThat(call("POST", "/api/vaults/personal/invites", mapOf("email" to "x@y.zz"), token = null, cookie = beals).code).describedAs("inviting is the operator's").isEqualTo(403)
+
+    // Used: the link no longer signs anyone in.
+    assertThat(call("GET", "/invite/$code", token = null).body!!.string()).contains("already set up")
+    assertThat(call("GET", "/invite/$code/setup", token = null).code).isEqualTo(404)
+    assertThat(api("GET", "/api/vaults/personal/invites").list("invites").map { it["email"] to (it["accepted_at"] != null) }).containsExactly("jd.beals@example.com" to true)
+
+    // Inviting someone who already has an account (here, with other groups) keeps the account and adds the group.
+    FakeIdp.accounts.add(mapOf("id" to "acct-9", "username" to "val", "email" to "val@example.com", "groups" to listOf("g-other")))
+    val again = api("POST", "/api/vaults/personal/invites", mapOf("email" to "val@example.com", "role" to "editor"))
+    assertThat(again).containsEntry("account", "existing")
+    assertThat(FakeIdp.accounts.first { it["id"] == "acct-9" }["groups"]).isEqualTo(listOf("g-other", "g-users"))
+    // A second invitation replaces the first unused one; a withdrawn one is gone.
+    val third = api("POST", "/api/vaults/personal/invites", mapOf("email" to "val@example.com", "role" to "editor"))
+    assertThat(call("GET", "/invite/${again["code"]}", token = null).body!!.string()).contains("does not exist")
+    assertThat(call("DELETE", "/api/invites/${third["code"]}").code).isEqualTo(200)
+    assertThat(call("GET", "/invite/${third["code"]}/setup", token = null).code).isEqualTo(404)
+    assertThat(call("POST", "/api/vaults/personal/invites", mapOf("email" to "not-an-email")).code).isEqualTo(400)
   }
 }

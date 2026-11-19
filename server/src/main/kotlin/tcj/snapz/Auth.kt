@@ -267,6 +267,7 @@ class LoginAction @Inject constructor(
 }
 
 class CallbackAction @Inject constructor(
+  private val invites: InviteStore,
   private val oidc: OidcClient,
   private val states: LoginStates,
   private val sessions: Sessions,
@@ -284,6 +285,7 @@ class CallbackAction @Inject constructor(
     }
     val principal = user.email ?: user.sub
     logger.info { "login ok: $principal via ${pending.client}" }
+    user.email?.let(invites::accepted)
     return if (pending.client == "ios") {
       redirect("${config.snapz.ios_redirect_scheme}://auth?code=" + states.issueIosCode(principal, pending.appChallenge!!, oidc.isAdmin(user)))
     } else {

@@ -36,6 +36,10 @@ data class SnapzSettings(
   val session_ttl_days: Long = 60,
   /** null = OIDC login disabled (only bearer tokens work). */
   val oidc: OidcConfig? = null,
+  /** Lets an invitation create the person's account at the identity provider. null = invitations only share; make accounts by hand. */
+  val pocket_id: PocketIdConfig? = null,
+  /** How long an invitation link can be used to set up a sign-in. */
+  val invite_ttl_days: Long = 14,
   /** Static bearer tokens defined in config. For local dev / tests / first-boot bootstrap. */
   val bootstrap_tokens: List<BootstrapToken> = listOf(),
 )
@@ -62,6 +66,17 @@ data class OidcConfig(
   val admin_groups: List<String> = listOf(),
 ) {
   override fun toString() = "OidcConfig(issuer=$issuer, client_id=$client_id, client_secret=████)"
+}
+
+data class PocketIdConfig(
+  /** Where its API answers; on the same host that is its local port, e.g. http://127.0.0.1:1411 */
+  val url: String,
+  /** An admin API key there (its STATIC_API_KEY). Whoever holds it can create accounts and sign-in links. */
+  val api_key: String,
+  /** New accounts are put in this group: the one `oidc.allowed_groups` lets in. */
+  val users_group: String? = null,
+) {
+  override fun toString() = "PocketIdConfig(url=$url, api_key=████, users_group=$users_group)"
 }
 
 data class BootstrapToken(

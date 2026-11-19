@@ -56,7 +56,7 @@ class SecurityHeaders @Inject constructor(config: SnapzConfig) : NetworkIntercep
     /** misk's admin dashboard (admin-only) brings its own scripts, styles and CDN assets. */
     const val DASHBOARD_CSP = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; frame-ancestors 'self'"
     /** Everything snapz itself serves; any other path belongs to misk. */
-    val OWN_PREFIXES = listOf("/api/", "/auth/", "/_feeds/", "/blobs/", "/icon.png")
+    val OWN_PREFIXES = listOf("/api/", "/auth/", "/_feeds/", "/blobs/", "/invite/", "/icon.png")
     const val FEEDS_PAGE = "/_feeds/ui"
     const val BLOB_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
   }
@@ -128,6 +128,7 @@ object Posture {
     if (s.bootstrap_tokens.isNotEmpty()) add(Finding(false, "${s.bootstrap_tokens.size} bootstrap token(s) in config: remove them once a script token exists"))
     if (config.data_source.username == "root") add(Finding(false, "database user is root: give snapz its own user with rights on its own schema only"))
     if (config.data_source.password.isNullOrEmpty()) add(Finding(false, "database password is empty"))
+    if (s.pocket_id != null && s.oidc == null) add(Finding(true, "pocket_id is configured without oidc: invitations would lead nowhere"))
     if (s.oidc == null) add(Finding(false, "no OIDC: the only way in is a bearer token"))
     else if (s.oidc.allowed_emails.isEmpty() && s.oidc.allowed_groups.isEmpty()) add(Finding(false, "OIDC is configured but nobody is on the allowlist"))
   }

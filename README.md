@@ -308,6 +308,24 @@ front of port 8788, a `snapz` MySQL database, and a blob directory that gets bac
 identity provider is only reachable on your LAN/VPN, signing in from the phone needs that network;
 capture itself works anywhere (offline queue).
 
+### people
+
+Whoever is in `oidc.admin_groups` runs the server: an **operator**, who sees every vault. Everyone
+else who may sign in is a **member**: a vault of their own (made on first use) plus whatever has
+been shared with them, as owner, editor or viewer; nothing else exists as far as they can tell.
+
+    PUT    /api/vaults/{slug}/members   {"principal": "ally@example.com", "role": "viewer"}    share
+    DELETE /api/vaults/{slug}/members?principal=…
+    POST   /api/vaults/{slug}/invites   {"email": "...", "role": "viewer", "name": "..."}      invite someone new
+
+An invitation (operators only) is one action: with `pocket_id` configured it creates the person's
+account at Pocket ID in the group that may sign in, shares the vault, and returns a link to send.
+The link opens a page that walks them through registering a passkey (a one-time sign-in at
+Pocket ID) and into the vault; once they have signed in it no longer lets anyone in. The web UI
+has this under vaults → people.
+
+Every vault also has a `token`, globally unique and permanent, accepted wherever a slug is.
+
 ### hardening
 
 What the server does by itself:

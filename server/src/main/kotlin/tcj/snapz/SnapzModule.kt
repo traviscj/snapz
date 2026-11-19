@@ -64,6 +64,7 @@ class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
     install(WebActionModule.create<AuthInfoAction>())
     install(WebActionModule.create<MeAction>())
     install(WebActionModule.create<VaultActions>())
+    install(WebActionModule.create<InviteActions>())
     install(WebActionModule.create<CollectionActions>())
     install(WebActionModule.create<PhotoActions>())
     install(WebActionModule.create<BlobAction>())

@@ -25,6 +25,12 @@ snapz:
     admin_groups: [snapz-admins]
     # Other client ids whose issuer-signed JWTs are accepted as bearer tokens (client_id always is):
     # bearer_audiences: []
+  # Optional: let "invite" create the person's account at Pocket ID and add them to the group that may
+  # sign in. Without it an invitation only shares the vault and you make the account yourself.
+  # pocket_id:
+  #   url: http://127.0.0.1:1411        # Pocket ID's API as this server reaches it
+  #   api_key: CHANGEME                 # Pocket ID's STATIC_API_KEY: an admin key, guard it like one
+  #   users_group: snapz-users          # = one of allowed_groups above
   # Optional break-glass token for first boot / when SSO is down. Remove once a script token exists.
   # With an https public_url the server refuses to start on a token shorter than 32 chars
   # (openssl rand -hex 24).
