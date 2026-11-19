@@ -64,6 +64,11 @@ final class ShareModel: ObservableObject {
     private let staging = FileManager.default.temporaryDirectory.appendingPathComponent("share-\(UUID().uuidString)", isDirectory: true)
 
     var signedIn: Bool { api != nil }
+    /// Which server this is going to, shown so a surprise is visible before sending.
+    var serverHost: String {
+        guard let base = api?.base, let host = base.host else { return "" }
+        return base.port.map { "\(host):\($0)" } ?? host
+    }
     var totalBytes: Int { staged.reduce(0) { $0 + $1.bytes } }
     var sentCount: Int { staged.filter { $0.state == .sent }.count }
     var queuedCount: Int { staged.filter { if case .queued = $0.state { return true } else { return false } }.count }
@@ -146,7 +151,8 @@ final class ShareModel: ObservableObject {
         for (n, s) in staged.enumerated() {
             // Distinct, ordered timestamps keep a multi-select in the order it was picked.
             let item = PendingUpload(id: s.id, collection: collection, vault: vault, takenAt: now.addingTimeInterval(Double(n) / 1000),
-                                     note: text.isEmpty ? nil : text, barcodes: [], source: "ios-share")
+                                     note: text.isEmpty ? nil : text, barcodes: [], source: "ios-share",
+                                     server: Shared.defaults.string(forKey: "serverURL").map(Shared.serverKey))
             do {
                 try FileManager.default.moveItem(at: s.file, to: PendingUpload.imageURL(item.id, in: dir))
                 try encoder.encode(item).write(to: PendingUpload.metaURL(item.id, in: dir), options: .atomic)
@@ -355,7 +361,7 @@ struct ShareView: View {
                     }
                 }
             }
-            Text("→ \(model.vault.map { "\($0)/" } ?? "")\(model.collection)").font(mono.bold())
+            Text("→ \(model.vault.map { "\($0)/" } ?? "")\(model.collection)  @\(model.serverHost)").font(mono.bold()).accessibilityIdentifier("share-dest")
             ScrollView {
                 FlowRows(spacing: 4) {
                     if model.collections.isEmpty {

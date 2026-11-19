@@ -16,7 +16,12 @@ final class UploadQueue: ObservableObject {
     @Published private(set) var uploading: String?
     @Published private(set) var online = true
 
+    /// The active server's client.
     var api: API?
+    /// Key of the active server; new shots are bound to it.
+    var server: String?
+    /// Client for a saved server by key, nil while not signed in there.
+    var apiFor: ((String) -> API?)?
     var onUploaded: (() -> Void)?
     var onUnauthorized: (() -> Void)?
 
@@ -94,7 +99,7 @@ final class UploadQueue: ObservableObject {
     /// Durably records a shot. Throws only if the phone can't write it to disk.
     @discardableResult
     func enqueue(jpeg: Data, collection: String, vault: String?, action: String? = nil, qty: Int? = nil, takenAt: Date = Date(), note: String?, barcodes: [Barcode]) throws -> String {
-        let item = PendingUpload(id: UUID().uuidString.lowercased(), collection: collection, vault: vault, action: action, qty: qty, takenAt: takenAt, note: note, barcodes: barcodes)
+        let item = PendingUpload(id: UUID().uuidString.lowercased(), collection: collection, vault: vault, action: action, qty: qty, takenAt: takenAt, note: note, barcodes: barcodes, server: server)
         // Image first, sidecar second: load() ignores an image without a sidecar, never the reverse.
         try jpeg.write(to: imageURL(item.id), options: .atomic)
         try encoder.encode(item).write(to: metaURL(item.id), options: .atomic)
@@ -153,7 +158,7 @@ final class UploadQueue: ObservableObject {
     /// Start draining if not already. Safe to call from anywhere, any number of times.
     func kick() {
         retryTask?.cancel()
-        guard !draining, api != nil else { return }
+        guard !draining, api != nil || apiFor != nil else { return }
         draining = true
         Task { await drain() }
     }
@@ -171,7 +176,13 @@ final class UploadQueue: ObservableObject {
         defer { draining = false; uploading = nil }
 
         var failures = 0
-        while let api, let item = items.first(where: { !$0.stuck }) {
+        // Servers that refused our token during this run: their photos wait for a sign-in.
+        var refused = Set<String>()
+        func client(_ item: PendingUpload) -> API? {
+            guard let key = item.server, key != server else { return api }
+            return apiFor?(key)
+        }
+        while let item = items.first(where: { !$0.stuck && !refused.contains($0.server ?? server ?? "") && client($0) != nil }), let api = client(item) {
             uploading = item.id
             guard FileManager.default.fileExists(atPath: imageURL(item.id).path) else {
                 discard(item.id)    // the share extension already sent it
@@ -197,10 +208,11 @@ final class UploadQueue: ObservableObject {
                 items[i].attempts += 1
                 items[i].lastError = e.localizedDescription
                 if e.status == 401 {
-                    // Bad token: nothing will upload until sign-in. Keep everything, stop quietly.
+                    // Bad token: nothing goes to that server until sign-in. Keep everything; other servers carry on.
                     persist(items[i])
-                    onUnauthorized?()
-                    return
+                    refused.insert(item.server ?? server ?? "")
+                    if item.server == nil || item.server == server { onUnauthorized?() }
+                    continue
                 }
                 if e.isTransient {
                     persist(items[i])

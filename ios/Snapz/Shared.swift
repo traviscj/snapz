@@ -20,6 +20,11 @@ enum Shared {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("upload-queue", isDirectory: true)
     }
 
+    /// One spelling per server, for comparing URLs and keying what is stored per server.
+    static func serverKey(_ url: String) -> String {
+        url.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+    }
+
     static var queueDir: URL {
         container?.appendingPathComponent("upload-queue", isDirectory: true) ?? legacyQueueDir
     }
@@ -44,6 +49,9 @@ struct PendingUpload: Codable, Identifiable, Hashable {
     var stuck: Bool = false
     /// Photo meta `source`; nil = shot with the app's camera ("ios").
     var source: String?
+    /// The server it was taken for (`Shared.serverKey`); it goes there even if the app has since
+    /// been pointed elsewhere. nil (queued by an older build) = whichever server is active.
+    var server: String?
 
     static func imageURL(_ id: String, in dir: URL = Shared.queueDir) -> URL { dir.appendingPathComponent("\(id).jpg") }
     static func metaURL(_ id: String, in dir: URL = Shared.queueDir) -> URL { dir.appendingPathComponent("\(id).json") }

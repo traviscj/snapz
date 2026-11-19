@@ -157,6 +157,7 @@ final class SnapzShareUITests: XCTestCase {
         expectation(for: ready, evaluatedWith: send)
         waitForExpectations(timeout: 30)
         shot("s4-extension")
+        print("SHARE-DEST", photos.staticTexts["share-dest"].label)
         send.tap()
         sleep(1)
         shot("s5-sending")
@@ -179,7 +180,9 @@ final class SnapzLinkUITests: XCTestCase {
         // iOS may ask before handing a custom-scheme link to the app.
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         if springboard.buttons["Open"].waitForExistence(timeout: 3) { springboard.buttons["Open"].tap() }
-        let alert = app.alerts.firstMatch
+        // The made-up server is unreachable; if a token is left over in the Keychain the app says so first.
+        if app.alerts["Snapz"].waitForExistence(timeout: 4) { app.alerts["Snapz"].buttons["OK"].tap() }
+        let alert = app.alerts.matching(NSPredicate(format: "label CONTAINS 'Point Snapz at'")).firstMatch
         XCTAssertTrue(alert.waitForExistence(timeout: 10), "no offer shown")
         XCTAssertTrue(alert.label.contains("https://snapz.example.net"), alert.label)
         if let dir = ProcessInfo.processInfo.environment["SNAPZ_SHOTS"] {
@@ -189,14 +192,81 @@ final class SnapzLinkUITests: XCTestCase {
         // The sign-in callback shares the scheme and must not be mistaken for a server.
         XCUIDevice.shared.system.open(URL(string: "snapz://auth?code=x")!)
         if springboard.buttons["Open"].waitForExistence(timeout: 3) { springboard.buttons["Open"].tap() }
-        XCTAssertFalse(app.alerts.firstMatch.waitForExistence(timeout: 3), "auth callback treated as a server link")
+        XCTAssertFalse(app.alerts.matching(NSPredicate(format: "label CONTAINS 'Point Snapz at'")).firstMatch.waitForExistence(timeout: 3), "auth callback treated as a server link")
         // Confirming switches the server shown on the sign-in screen.
         XCUIDevice.shared.system.open(URL(string: "snapz://other.example.net:8443")!)
         if springboard.buttons["Open"].waitForExistence(timeout: 3) { springboard.buttons["Open"].tap() }
-        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 10))
-        app.alerts.firstMatch.buttons["Switch"].tap()
+        let second = app.alerts.matching(NSPredicate(format: "label CONTAINS 'Point Snapz at'")).firstMatch
+        XCTAssertTrue(second.waitForExistence(timeout: 10))
+        (second.buttons["Add"].exists ? second.buttons["Add"] : second.buttons["Switch"]).tap()
+        // Never signed in there: the sign-in screen comes up for it.
         let field = app.textFields.firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5))
         XCTAssertEqual(field.value as? String, "https://other.example.net:8443")
+    }
+}
+
+/// Two saved servers: add the second by link, sign in there, switch back without signing in again.
+/// Needs TEST_RUNNER_SNAPZ_URL/_TOKEN (a server with a `pantry` collection) and
+/// TEST_RUNNER_SNAPZ_URL2/_TOKEN2 (another server, on another port of localhost).
+final class SnapzServersUITests: XCTestCase {
+    func testAddSecondServerAndSwitchBack() throws {
+        continueAfterFailure = false
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["SNAPZ_URL"], let token = env["SNAPZ_TOKEN"], let url2 = env["SNAPZ_URL2"], let token2 = env["SNAPZ_TOKEN2"],
+              let port1 = URL(string: url)?.port, let u2 = URL(string: url2), let port2 = u2.port else {
+            throw XCTSkip("set TEST_RUNNER_SNAPZ_URL, _TOKEN, _URL2, _TOKEN2")
+        }
+        func shot(_ name: String) {
+            guard let dir = env["SNAPZ_SHOTS"] else { return }
+            try? XCUIScreen.main.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name).png"))
+        }
+        let app = XCUIApplication()
+        app.launchEnvironment["SNAPZ_DEBUG_TOKEN"] = token
+        app.launchArguments += ["-serverURL", url]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["pantry"].waitForExistence(timeout: 10), "first server did not load")
+
+        // Add the second server by link; it has never been signed in to, so the sign-in screen comes up.
+        XCUIDevice.shared.system.open(URL(string: "snapz://\(u2.host!):\(port2)?insecure=1")!)
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        if springboard.buttons["Open"].waitForExistence(timeout: 3) { springboard.buttons["Open"].tap() }
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 10), "no offer shown")
+        shot("servers-1-offer")
+        let offer = app.alerts.firstMatch
+        (offer.buttons["Add"].exists ? offer.buttons["Add"] : offer.buttons["Switch"]).tap()
+        // The Keychain outlives a reinstall, so a simulator that has run this before may already hold
+        // the second server's token; otherwise sign in with the pasted-token form.
+        let secure = app.secureTextFields.firstMatch
+        if secure.waitForExistence(timeout: 4) {
+            XCTAssertTrue(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "\(port1)")).firstMatch.exists, "first server not offered on the sign-in screen")
+            secure.tap()
+            secure.typeText(token2)
+            app.buttons["Use token"].tap()
+            // Typing into a secure field makes iOS offer to save it as a password.
+            for host in [app, springboard] where host.buttons["Not Now"].waitForExistence(timeout: 3) { host.buttons["Not Now"].tap(); break }
+        }
+        XCTAssertTrue(app.staticTexts["inbox"].waitForExistence(timeout: 10), "second server did not load")
+        XCTAssertFalse(app.staticTexts["pantry"].exists, "still showing the first server's collections")
+
+        // Back to the first one from the title menu: no sign-in.
+        let menu = app.descendants(matching: .any).matching(identifier: "vault-menu").firstMatch
+        XCTAssertTrue(menu.waitForExistence(timeout: 5))
+        menu.tap()
+        shot("servers-2-menu")
+        let first = app.buttons.matching(NSPredicate(format: "label CONTAINS %@", "\(port1)")).firstMatch
+        XCTAssertTrue(first.waitForExistence(timeout: 5), "first server missing from the menu")
+        first.tap()
+        XCTAssertTrue(app.staticTexts["pantry"].waitForExistence(timeout: 10), "did not switch back")
+
+        // Both survive a relaunch, and the active one is where we left off.
+        app.terminate()
+        let again = XCUIApplication()
+        again.launch()
+        XCTAssertTrue(again.staticTexts["pantry"].waitForExistence(timeout: 10), "active server not remembered")
+        again.buttons.matching(NSPredicate(format: "label CONTAINS 'gear' OR identifier == 'gearshape'")).firstMatch.tap()
+        XCTAssertTrue(again.staticTexts["Servers"].waitForExistence(timeout: 5) || again.staticTexts["SERVERS"].waitForExistence(timeout: 2))
+        shot("servers-3-settings")
+        XCTAssertTrue(again.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "\(port2)")).firstMatch.exists, "second server not in settings")
     }
 }
