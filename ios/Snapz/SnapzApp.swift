@@ -17,12 +17,34 @@ struct SnapzApp: App {
             } message: {
                 Text(app.error ?? "")
             }
+            .onOpenURL { app.consider(link: $0) }
+            .alert(
+                "Point Snapz at \(app.offeredServer?.absoluteString ?? "")?",
+                isPresented: Binding(get: { app.offeredServer != nil }, set: { if !$0 { app.offeredServer = nil } }),
+                presenting: app.offeredServer
+            ) { server in
+                Button("Switch") { Task { await app.switchServer(to: server) } }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in
+                Text(switchNotice)
+            }
             .onChange(of: scenePhase) { _, phase in
                 guard phase == .active, app.signedIn else { return }
                 app.queue.rescan()
                 Task { await app.refreshVaults(); await app.refreshCollections() }
             }
         }
+    }
+}
+
+extension SnapzApp {
+    /// What switching costs, said before it happens.
+    var switchNotice: String {
+        var parts: [String] = []
+        if app.signedIn { parts.append("Now: \(app.serverURL). You will be signed out there and sign in again on the new server.") }
+        let waiting = app.queue.pendingCount
+        if waiting > 0 { parts.append("\(waiting) photo\(waiting == 1 ? "" : "s") waiting to upload will go to the new server.") }
+        return parts.isEmpty ? "You will sign in on that server." : parts.joined(separator: " ")
     }
 }
 

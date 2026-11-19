@@ -167,3 +167,36 @@ final class SnapzShareUITests: XCTestCase {
         shot("s6-after")
     }
 }
+
+/// A `snapz://<host>` link offers to repoint the app; nothing changes unless confirmed.
+final class SnapzLinkUITests: XCTestCase {
+    func testServerLinkOffersToSwitch() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments += ["-serverURL", "http://localhost:1"]
+        app.launch()
+        XCUIDevice.shared.system.open(URL(string: "snapz://snapz.example.net")!)
+        // iOS may ask before handing a custom-scheme link to the app.
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        if springboard.buttons["Open"].waitForExistence(timeout: 3) { springboard.buttons["Open"].tap() }
+        let alert = app.alerts.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 10), "no offer shown")
+        XCTAssertTrue(alert.label.contains("https://snapz.example.net"), alert.label)
+        if let dir = ProcessInfo.processInfo.environment["SNAPZ_SHOTS"] {
+            try? XCUIScreen.main.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: dir).appendingPathComponent("link-offer.png"))
+        }
+        alert.buttons["Cancel"].tap()
+        // The sign-in callback shares the scheme and must not be mistaken for a server.
+        XCUIDevice.shared.system.open(URL(string: "snapz://auth?code=x")!)
+        if springboard.buttons["Open"].waitForExistence(timeout: 3) { springboard.buttons["Open"].tap() }
+        XCTAssertFalse(app.alerts.firstMatch.waitForExistence(timeout: 3), "auth callback treated as a server link")
+        // Confirming switches the server shown on the sign-in screen.
+        XCUIDevice.shared.system.open(URL(string: "snapz://other.example.net:8443")!)
+        if springboard.buttons["Open"].waitForExistence(timeout: 3) { springboard.buttons["Open"].tap() }
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 10))
+        app.alerts.firstMatch.buttons["Switch"].tap()
+        let field = app.textFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        XCTAssertEqual(field.value as? String, "https://other.example.net:8443")
+    }
+}

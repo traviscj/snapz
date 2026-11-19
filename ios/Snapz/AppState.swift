@@ -134,6 +134,36 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// A server someone asked the app to use via a `snapz://<host>` link; nothing changes until confirmed.
+    @Published var offeredServer: URL?
+
+    /// `snapz://snapz.example.net` (optionally `:port`, and `?insecure=1` for plain http on a LAN)
+    /// offers to point the app at that server. `snapz://auth…` is the sign-in callback, not this.
+    func consider(link: URL) {
+        guard link.scheme?.lowercased() == "snapz", let host = link.host, !host.isEmpty, host.lowercased() != "auth" else { return }
+        let insecure = URLComponents(url: link, resolvingAgainstBaseURL: false)?.queryItems?.contains { $0.name == "insecure" && $0.value == "1" } ?? false
+        var c = URLComponents()
+        c.scheme = insecure ? "http" : "https"
+        c.host = host
+        c.port = link.port
+        guard let target = c.url else { return }
+        if let baseURL, baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased() == target.absoluteString.lowercased() {
+            error = "Already using \(target.absoluteString)."
+            return
+        }
+        offeredServer = target
+    }
+
+    /// Leave the current server (its device token is revoked there) and point at [server]; the
+    /// sign-in screen comes up for it. Photos still waiting to upload stay queued and go to the
+    /// new server once signed in.
+    func switchServer(to server: URL) async {
+        if signedIn { await signOut() }
+        serverURL = server.absoluteString
+        UserDefaults.standard.removeObject(forKey: "captureCollection")
+        captureCollection = nil
+    }
+
     /// Revokes this device's token server-side. Queued, un-uploaded photos stay on the phone.
     func signOut() async {
         await api?.logout()
