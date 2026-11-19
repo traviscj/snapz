@@ -76,6 +76,11 @@ class DashboardGate @Inject constructor(private val caller: @JvmSuppressWildcard
       if (!open) {
         val who = caller.get() ?: throw UnauthenticatedException("sign in first")
         if (ADMIN !in who.capabilities) throw UnauthorizedException("${who.principal} is not an admin")
+      } else if (path.startsWith("/_feeds/") && !path.startsWith("/_feeds/fetch/") && path != "/_feeds/status") {
+        // Cursors, publishing and replication are shared, server-wide state: operators only.
+        // (Fetching is scoped to the caller's vaults by the fetch endpoint itself.)
+        val who = caller.get() ?: throw UnauthenticatedException("sign in first")
+        if (OPERATOR !in who.capabilities) throw UnauthorizedException("${who.principal} does not run this server")
       }
       chain.proceed(chain.httpCall)
     }

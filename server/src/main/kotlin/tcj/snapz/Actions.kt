@@ -325,6 +325,7 @@ class FeedActions @Inject constructor(private val feedz: Feedz, private val ctx:
       transform?.let { put(FeedParams.TRANSFORM, it) }
     }
     if (consumer == null) return@feedz feedz.fetch(feed, after ?: 0, limit ?: 100, shard, shard_count, params)
+    ctx.requireOperator()   // server-side cursors are shared state: a consumer is something an operator runs
     if (after != null) throw BadRequestException("after and consumer are exclusive: a consumer's position is its cursor")
     feedz.fetchFor(consumer, feed, limit ?: 100, shard ?: 0, shard_count ?: 1, params)
   }
@@ -428,8 +429,8 @@ class TransformActions @Inject constructor(
 ) : WebAction {
   /** Intents are named by token; a pinned caller only reaches the ones on its vault's photos. */
   private fun own(intent: String): String {
-    val pin = ctx.pinned() ?: return intent
-    if (store.vaultOfIntent(intent) != pin) throw NotFoundException("no intent '$intent'")
+    if (ctx.pinned() == null && ctx.operator()) return intent
+    ctx.reach(store.vaultOfIntent(intent) ?: throw NotFoundException("no intent '$intent'"), "no intent '$intent'")
     return intent
   }
 
@@ -444,6 +445,7 @@ class TransformActions @Inject constructor(
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
   fun register(@PathParam name: String, @RequestBody req: TransformReq): Ok {
+    ctx.requireOperator()
     store.register(name, req.kind, req.description)
     return Ok()
   }
@@ -532,7 +534,10 @@ class TransformActions @Inject constructor(
   @Post("/api/transforms/run")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun run() = mapOf("ran" to runner.runPending())
+  fun run(): Map<String, Int> {
+    ctx.requireOperator()
+    return mapOf("ran" to runner.runPending())
+  }
 }
 
 class InboxAction @Inject constructor(

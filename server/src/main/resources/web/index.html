@@ -1022,6 +1022,8 @@ async function boot() {
   try { S.me = await api("GET", "/api/me"); } catch (e) { if (e.status !== 401) say("server unreachable: " + e.message, "bad"); return; }
   $("#who").textContent = S.me.principal + (S.me.vault ? ` @${S.me.vault}` : "") + (S.me.read_only ? " ro" : ""); $("#logout").classList.remove("hide");
   document.querySelector('#top .tab[data-tab="tokens"]').classList.toggle("hide", !S.me.admin);
+  // Feeds, transforms and vault management are for the people who run the server.
+  for (const t of ["feeds", "transforms", "vaults"]) document.querySelector(`#top .tab[data-tab="${t}"]`).classList.toggle("hide", S.me.operator === false);
   try { await loadVaults(); } catch (e) { say("could not load vaults: " + e.message, "bad"); return; }
   applyUrl();
 }

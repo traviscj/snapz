@@ -22,6 +22,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.Response
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -102,7 +103,7 @@ class SnapzServiceTest {
   fun setUp() {
     db.tx { c ->
       for (t in listOf(
-        "photos", "collections", "records", "vaults", "api_tokens", "sequences", "feed_cursors",
+        "photos", "collections", "records", "vaults", "api_tokens", "users", "vault_members", "sequences", "feed_cursors",
         "photo_versions", "transforms", "collection_transforms", "transform_intents", "transform_results",
       )) c.exec("DELETE FROM $t")
     }
@@ -126,7 +127,12 @@ class SnapzServiceTest {
     cookie?.let { req.header("Cookie", it) }
     vault?.let { req.header("X-Snapz-Vault", it) }
     headers.forEach { (k, v) -> req.header(k, v) }
-    return http.newCall(req.build()).execute()
+    // Read the whole reply now and hand back a detached copy: most assertions look only at the status,
+    // and a reply left half-read on a kept-alive connection is how one test's body turns up in the next.
+    return http.newCall(req.build()).execute().use { r ->
+      val body = r.body!!
+      r.newBuilder().body(body.bytes().toResponseBody(body.contentType())).build()
+    }
   }
 
   @Suppress("UNCHECKED_CAST")
@@ -1075,5 +1081,101 @@ class SnapzServiceTest {
     assertThat(call("GET", "/_admin/").code).isEqualTo(200)
     val pinned = api("POST", "/api/tokens", mapOf("name" to "work-bot", "vault" to "personal"))["token"] as String
     assertThat(call("GET", "/_admin/", token = pinned).code).isEqualTo(403)
+  }
+
+  @Test
+  fun `members see their own vaults and what is shared with them, operators see everything`() {
+    // The operator (an admin-minted token) has a photo and a record in the default vault.
+    api("POST", "/api/collections", mapOf("name" to "pantry"))
+    val theirs = upload("pantry", jpeg(color = Color.RED))
+    api("PUT", "/api/records/stock/beans", mapOf("qty" to 4))
+
+    // Ally signs in through the identity provider: allowed, not in the admin group.
+    FakeIdp.user = mapOf("sub" to "u3", "email" to "Ally@Else.com", "groups" to listOf("snapz-users"))
+    val (state, _) = startLogin("")
+    val ally = call("GET", "/auth/callback?code=c0de&state=$state", token = null).header("Set-Cookie")!!.substringBefore(';')
+    fun asAlly(method: String, path: String, body: Any? = null, vault: String? = null, raw: ByteArray? = null) = call(method, path, body, token = null, cookie = ally, vault = vault, raw = raw)
+    assertThat(obj(asAlly("GET", "/api/me"))).containsEntry("admin", false).containsEntry("operator", false)
+
+    // She gets a vault of her own, and it is all she can see.
+    val vaults = obj(asAlly("GET", "/api/vaults"))
+    assertThat(vaults["default"]).isEqualTo("ally")
+    assertThat(vaults.list("vaults").map { listOf(it["slug"], it["role"], it["is_default"]) }).containsExactly(listOf("ally", "owner", true))
+    val allyToken = vaults.list("vaults").single()["token"] as String
+    assertThat(allyToken).startsWith("v")
+    assertThat(obj(asAlly("GET", "/api/collections")).list("collections")).isEmpty()
+    assertThat(asAlly("POST", "/api/collections", mapOf("name" to "mine")).code).isEqualTo(200)
+    val hers = obj(asAlly("POST", "/api/photos?collection=mine", raw = jpeg(color = Color.BLUE)))
+    assertThat(hers["vault"]).isEqualTo("ally")
+    assertThat(obj(asAlly("GET", "/api/photos")).list("photos").map { it["token"] }).containsExactly(hers["token"])
+    assertThat(obj(asAlly("GET", "/api/collections", vault = allyToken)).list("collections").map { it["slug"] }).containsExactly("mine")   // by token too
+    assertThat(obj(asAlly("GET", "/api/records")).list("namespaces")).isEmpty()
+
+    // The operator's vault does not exist for her, by name or through anything named by token.
+    val t = theirs["token"]
+    assertThat(asAlly("GET", "/api/collections", vault = "personal").code).isEqualTo(404)
+    assertThat(asAlly("GET", "/api/photos?vault=personal").code).isEqualTo(404)
+    for ((m, path) in listOf("GET" to "/api/photos/$t", "GET" to "/blobs/$t", "GET" to "/api/photos/$t/history", "DELETE" to "/api/photos/$t", "POST" to "/api/photos/$t/restore")) {
+      assertThat(asAlly(m, path).code).describedAs("$m $path").isEqualTo(404)
+    }
+    assertThat(asAlly("PATCH", "/api/photos/$t", mapOf("note" to "hi")).code).isEqualTo(404)
+    assertThat(asAlly("POST", "/api/photos/$t/copy", mapOf("collection" to "mine")).code).isEqualTo(404)
+    assertThat(asAlly("POST", "/api/photos/batch", mapOf("op" to "move", "tokens" to listOf(t), "collection" to "mine")).code).isEqualTo(404)
+    assertThat(asAlly("POST", "/api/photos/$t/intents", mapOf("transform" to "barcodes")).code).isEqualTo(404)
+
+    // Feeds carry her vault only; shared, server-wide state is not hers to touch.
+    publisher.publishAll()
+    assertThat(obj(asAlly("GET", "/_feeds/fetch/photos?limit=100")).list("entries").map { it["token"] }).containsExactly(hers["token"])
+    assertThat(obj(asAlly("GET", "/_feeds/fetch/vaults?limit=100")).list("entries").map { it["slug"] }).containsExactly("ally")
+    assertThat(api("GET", "/_feeds/fetch/photos?limit=100").list("entries")).hasSize(2)   // the operator: everything
+    for ((m, path, body) in listOf(
+      Triple("GET", "/_feeds/fetch/photos?consumer=x", null),
+      Triple("GET", "/_feeds/cursors/x?feed=photos", null),
+      Triple("PUT", "/_feeds/cursors/x", mapOf("feed" to "photos", "cursor" to 1)),
+      Triple("POST", "/_feeds/photos/cursors/x/commit", mapOf("cursor" to 1)),
+      Triple("GET", "/_feeds/blobs/${theirs["sha256"]}", null),
+      Triple("POST", "/_feeds/receive/records", mapOf("entries" to listOf<Any>())),
+      Triple("GET", "/api/tokens", null),
+      Triple("POST", "/api/vaults", mapOf("name" to "more")),
+      Triple("PUT", "/api/transforms/mine", mapOf("kind" to "extract")),
+      Triple("POST", "/api/transforms/run", null),
+      Triple("GET", "/_admin/", null),
+    )) {
+      assertThat(asAlly(m, path, body).code).describedAs("$m $path").isEqualTo(403)
+    }
+
+    // The operator sees her vault like any other.
+    assertThat(api("GET", "/api/photos", vault = "ally").list("photos").map { it["token"] }).containsExactly(hers["token"])
+    assertThat(api("GET", "/api/vaults").list("vaults").map { it["slug"] }).containsExactlyInAnyOrder("personal", "ally")
+
+    // Shared with her to view: she can look, by name and by token, and cannot change anything.
+    val shared = api("PUT", "/api/vaults/personal/members", mapOf("principal" to "ally@else.com", "role" to "viewer"))
+    assertThat(shared.list("members").map { it["principal"] to it["role"] }).containsExactly("ally@else.com" to "viewer")
+    assertThat(obj(asAlly("GET", "/api/vaults")).list("vaults").map { it["slug"] to it["role"] }).containsExactlyInAnyOrder("ally" to "owner", "personal" to "viewer")
+    assertThat(obj(asAlly("GET", "/api/photos", vault = "personal")).list("photos").map { it["token"] }).containsExactly(t)
+    assertThat(asAlly("GET", "/api/photos/$t").code).isEqualTo(200)
+    assertThat(asAlly("GET", "/blobs/$t").code).isEqualTo(200)
+    assertThat(obj(asAlly("GET", "/api/records/stock/beans", vault = "personal"))["v"]).isEqualTo(mapOf("qty" to 4L))
+    assertThat(asAlly("PATCH", "/api/photos/$t", mapOf("note" to "hi")).code).isEqualTo(403)
+    assertThat(asAlly("POST", "/api/photos?collection=pantry", raw = jpeg(), vault = "personal").code).isEqualTo(403)
+    assertThat(asAlly("PUT", "/api/records/stock/beans", mapOf("qty" to 0), vault = "personal").code).isEqualTo(403)
+    assertThat(asAlly("PUT", "/api/vaults/personal/members", mapOf("principal" to "bob@x.com", "role" to "viewer")).code).describedAs("not hers to share").isEqualTo(403)
+    // Requests that name no vault still land in her own.
+    assertThat(obj(asAlly("GET", "/api/photos")).list("photos").map { it["token"] }).containsExactly(hers["token"])
+
+    // As an editor she can change things there.
+    api("PUT", "/api/vaults/personal/members", mapOf("principal" to "ally@else.com", "role" to "editor"))
+    assertThat(asAlly("PATCH", "/api/photos/$t", mapOf("note" to "hi")).code).isEqualTo(200)
+
+    // She shares her own vault with someone who has not signed in yet; a vault keeps an owner.
+    val mine = obj(asAlly("PUT", "/api/vaults/ally/members", mapOf("principal" to "bob@x.com", "role" to "editor")))
+    assertThat(mine.list("members").map { it["principal"] to it["role"] }).containsExactly("ally@else.com" to "owner", "bob@x.com" to "editor")
+    assertThat(asAlly("DELETE", "/api/vaults/ally/members?principal=ally@else.com").code).isEqualTo(409)
+    assertThat(asAlly("PUT", "/api/vaults/ally/members", mapOf("principal" to "ally@else.com", "role" to "viewer")).code).isEqualTo(409)
+
+    // Taken away again: gone, as if it never was.
+    assertThat(call("DELETE", "/api/vaults/personal/members?principal=ally@else.com").code).isEqualTo(200)
+    assertThat(asAlly("GET", "/api/photos/$t").code).isEqualTo(404)
+    assertThat(asAlly("GET", "/api/photos?vault=personal").code).isEqualTo(404)
   }
 }

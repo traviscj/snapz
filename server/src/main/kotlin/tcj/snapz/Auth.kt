@@ -71,6 +71,7 @@ class SnapzAuthenticator @Inject constructor(
       capabilities = buildSet {
         if (mayCall) add(USER)
         if (resolved.vault == null && !resolved.readOnly && resolved.admin) add(ADMIN)
+        if (resolved.admin) add(OPERATOR)
         resolved.vault?.let { add(vaultCapability(it)) }
         if (resolved.readOnly) add(READ_ONLY)
       },
@@ -330,7 +331,7 @@ class TokenLoginAction @Inject constructor(
   fun login(@RequestBody req: TokenLoginReq): MeDto {
     val resolved = tokens.resolve(req.token.trim()) ?: throw UnauthenticatedException("bad token")
     httpCall.get().setResponseHeader("Set-Cookie", sessions.start(resolved.principal, "web (token login)", resolved.vault, resolved.readOnly, resolved.admin))
-    return MeDto(resolved.principal, true, resolved.vault, resolved.readOnly, resolved.vault == null && !resolved.readOnly && resolved.admin)
+    return MeDto(resolved.principal, true, resolved.vault, resolved.readOnly, resolved.vault == null && !resolved.readOnly && resolved.admin, resolved.admin)
   }
 }
 
@@ -352,7 +353,7 @@ class LogoutAction @Inject constructor(
 }
 
 /** [vault]: slug this credential is pinned to, if any. [admin]: may manage vaults and tokens. */
-data class MeDto(val principal: String, val authenticated: Boolean, val vault: String? = null, val read_only: Boolean = false, val admin: Boolean = true)
+data class MeDto(val principal: String, val authenticated: Boolean, val vault: String? = null, val read_only: Boolean = false, val admin: Boolean = true, val operator: Boolean = true)
 
 /** Auth-mode probe for clients: is OIDC available, and (if a credential was sent) who am I. */
 data class AuthInfoDto(val oidc: Boolean, val principal: String?)
@@ -376,6 +377,6 @@ class MeAction @Inject constructor(
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
   fun me(): MeDto {
     val caps = caller.get()?.capabilities.orEmpty()
-    return MeDto(caller.get()?.principal ?: "?", true, caps.firstOrNull { it.startsWith("vault:") }?.removePrefix("vault:"), READ_ONLY in caps, ADMIN in caps)
+    return MeDto(caller.get()?.principal ?: "?", true, caps.firstOrNull { it.startsWith("vault:") }?.removePrefix("vault:"), READ_ONLY in caps, ADMIN in caps, OPERATOR in caps)
   }
 }

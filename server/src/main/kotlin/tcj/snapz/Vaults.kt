@@ -10,15 +10,18 @@ import misk.MiskCaller
 import misk.exceptions.BadRequestException
 import misk.exceptions.ConflictException
 import misk.exceptions.NotFoundException
+import misk.exceptions.UnauthenticatedException
 import misk.exceptions.UnauthorizedException
 import misk.scope.ActionScoped
 import misk.security.authz.Authenticated
 import misk.web.Delete
+import misk.web.DispatchMechanism
 import misk.web.Get
 import misk.web.HttpCall
 import misk.web.Patch
 import misk.web.PathParam
 import misk.web.Post
+import misk.web.Put
 import misk.web.QueryParam
 import misk.web.RequestBody
 import misk.web.RequestContentType
@@ -46,6 +49,9 @@ import misk.web.mediatype.MediaTypes
 
 data class Vault(val id: Long, val slug: String)
 
+/** Globally unique and permanent; the `v` prefix keeps it from ever looking like a slug someone chose. */
+fun newVaultToken() = "v" + randomToken(20)
+
 data class VaultDto(
   val slug: String,
   val name: String,
@@ -60,6 +66,11 @@ data class VaultDto(
   val updated_at: String,
   val deleted_at: String?,
   val feed_sync_id: Long?,
+  /** Globally unique, permanent name of the vault. */
+  val token: String? = null,
+  /** The caller's role here: owner, editor, viewer; or operator for someone who runs the server. */
+  val role: String? = null,
+  @Transient val id: Long = 0,
 )
 
 @Singleton
@@ -90,6 +101,8 @@ class VaultStore @Inject constructor(
     updated_at = iso(rs.getLong("updated_at_ms")),
     deleted_at = isoOrNull(rs.longOrNull("deleted_at_ms")),
     feed_sync_id = rs.longOrNull("feed_sync_id"),
+    token = rs.getString("token"),
+    id = rs.getLong("id"),
   )
 
   fun list(only: Long? = null): List<VaultDto> = db.tx { c ->
@@ -100,8 +113,9 @@ class VaultStore @Inject constructor(
   private fun get(c: Connection, slug: String): VaultDto =
     c.select("$select WHERE v.slug = ? AND v.deleted_at_ms IS NULL", listOf(slug), ::dto).firstOrNull() ?: throw NotFoundException("no vault '$slug'")
 
+  /** By slug, or by token (the name that never changes). */
   fun find(c: Connection, slug: String): Vault? =
-    c.select("SELECT id FROM vaults WHERE slug = ? AND deleted_at_ms IS NULL", listOf(slug)) { Vault(it.getLong(1), slug) }.firstOrNull()
+    c.select("SELECT id, slug FROM vaults WHERE (slug = ? OR token = ?) AND deleted_at_ms IS NULL", listOf(slug, slug)) { Vault(it.getLong(1), it.getString(2)) }.firstOrNull()
 
   fun require(slug: String): Vault = db.tx { c -> find(c, slug) } ?: throw NotFoundException("no vault '$slug'")
 
@@ -114,8 +128,8 @@ class VaultStore @Inject constructor(
     return db.tx { c ->
       val id = try {
         c.insert(
-          "INSERT INTO vaults (slug, name, description, icon, created_at_ms, updated_at_ms, shard) VALUES (?,?,?,?,?,?,?)",
-          listOf(s, name, description, icon, now, now, shardOf("vault:$s", config.snapz.feed_shards)),
+          "INSERT INTO vaults (slug, name, description, icon, created_at_ms, updated_at_ms, shard, token) VALUES (?,?,?,?,?,?,?,?)",
+          listOf(s, name, description, icon, now, now, shardOf("vault:$s", config.snapz.feed_shards), newVaultToken()),
         )
       } catch (e: SQLIntegrityConstraintViolationException) {
         throw ConflictException("vault '$s' already exists")
@@ -176,8 +190,8 @@ class VaultStore @Inject constructor(
     db.tx { c ->
       if (find(c, slug) == null) {
         c.insert(
-          "INSERT INTO vaults (slug, name, icon, created_at_ms, updated_at_ms, shard) VALUES (?,?,?,?,?,?)",
-          listOf(slug, slug.replaceFirstChar { it.uppercase() }, "🔐", now, now, shardOf("vault:$slug", config.snapz.feed_shards)),
+          "INSERT INTO vaults (slug, name, icon, created_at_ms, updated_at_ms, shard, token) VALUES (?,?,?,?,?,?,?)",
+          listOf(slug, slug.replaceFirstChar { it.uppercase() }, "🔐", now, now, shardOf("vault:$slug", config.snapz.feed_shards), newVaultToken()),
         )
       }
       c.select("SELECT id FROM vaults WHERE deleted_at_ms IS NULL") { it.getLong(1) }.forEach { ensureInbox(c, it) }
@@ -211,29 +225,79 @@ class VaultContext @Inject constructor(
   private val caller: @JvmSuppressWildcards ActionScoped<MiskCaller?>,
   private val vaults: VaultStore,
   private val photos: PhotoStore,
+  private val users: UserStore,
+  private val members: MemberStore,
 ) {
+  private fun caps() = caller.get()?.capabilities.orEmpty()
+
   /** Slug the caller's token is pinned to, if any. */
-  fun pinned(): String? = caller.get()?.capabilities?.firstOrNull { it.startsWith(PIN) }?.removePrefix(PIN)
+  fun pinned(): String? = caps().firstOrNull { it.startsWith(PIN) }?.removePrefix(PIN)
+
+  /** Runs the server: sees every vault. Everyone else is a member of some vaults. */
+  fun operator(): Boolean = OPERATOR in caps()
+
+  fun requireOperator() {
+    if (!operator()) throw UnauthorizedException("this is for the people who run the server")
+  }
+
+  fun principal(): String = caller.get()?.principal ?: throw UnauthenticatedException()
+
+  fun userId(): Long = users.ensure(principal())
 
   private fun requested(): String? {
     val call = httpCall.get()
     return (call.requestHeaders[VAULT_HEADER] ?: call.url.queryParameter("vault"))?.trim()?.takeIf { it.isNotEmpty() }
   }
 
-  /** The vault the request named or the token is pinned to; null = "all of them" (unpinned callers only). */
+  /** A viewer may look; anything that is not a GET changes something. */
+  private fun admit(m: Membership): Vault {
+    if (m.role == Role.VIEWER && httpCall.get().dispatchMechanism != DispatchMechanism.GET) {
+      throw UnauthorizedException("you can view vault '${m.vault.slug}' but not change it")
+    }
+    return m.vault
+  }
+
+  /**
+   * The vault the request is about. Operators: the one named, or null for "all of them". A pinned
+   * token: its vault. A member: the one named among their own (anything else does not exist), or
+   * their default; never null, so nothing a member asks for spans vaults.
+   */
   fun explicit(): Vault? {
     val pin = pinned()
     val req = requested()
-    if (pin != null && req != null && req != pin) throw UnauthorizedException("this token is limited to vault '$pin'")
-    return (req ?: pin)?.let(vaults::require)
+    if (pin != null) {
+      if (req != null && req != pin) throw UnauthorizedException("this token is limited to vault '$pin'")
+      return vaults.require(pin)
+    }
+    if (operator()) return req?.let(vaults::require)
+    val uid = userId()
+    return admit(if (req != null) members.find(uid, req) ?: throw NotFoundException("no vault '$req'") else members.default(principal(), uid))
   }
 
   fun current(): Vault = explicit() ?: vaults.default()
 
-  /** For photos named by token: 404 (not 403) when it lives outside a pinned caller's vault. */
+  /** The caller's membership of a vault named in a path; operators are owners of everything. */
+  fun membership(name: String): Membership {
+    if (pinned() != null) throw UnauthorizedException("a vault-pinned token can't manage vaults")
+    if (operator()) return Membership(vaults.require(name), Role.OWNER)
+    return members.find(userId(), name) ?: throw NotFoundException("no vault '$name'")
+  }
+
+  /** Something named by token lives in vault [slug]: 404 (not 403) unless the caller can reach that vault. */
+  fun reach(slug: String, what: String) {
+    val pin = pinned()
+    if (pin != null) {
+      if (slug != pin) throw NotFoundException(what)
+      return
+    }
+    if (operator()) return
+    val vault = vaults.require(slug)
+    admit(members.of(userId(), vault.id) ?: throw NotFoundException(what))
+  }
+
   fun photo(token: String): String {
-    val pin = pinned() ?: return token
-    if (photos.vaultOf(token) != pin) throw NotFoundException("no photo '$token'")
+    if (pinned() == null && operator()) return token
+    reach(photos.vaultOf(token), "no photo '$token'")
     return token
   }
 
@@ -243,16 +307,58 @@ class VaultContext @Inject constructor(
 data class VaultReq(val slug: String?, val name: String?, val description: String?, val icon: String?)
 data class VaultList(val default: String, val vaults: List<VaultDto>)
 
+data class MemberReq(val principal: String, val role: String?)
+data class MemberList(val vault: String, val members: List<MemberDto>)
+
 class VaultActions @Inject constructor(
   private val store: VaultStore,
   private val ctx: VaultContext,
   private val config: SnapzConfig,
+  private val members: MemberStore,
 ) : WebAction {
-  /** A pinned caller sees just its own vault. */
+  private fun owned(slug: String): Vault {
+    val m = ctx.membership(slug)
+    if (m.role != Role.OWNER) throw UnauthorizedException("only an owner of '$slug' manages who can see it")
+    return m.vault
+  }
+
+  /** Who can reach a vault. Any member may look; owners (and operators) change it. */
+  @Get("/api/vaults/{slug}/members")
+  @Authenticated(capabilities = [USER])
+  @ResponseContentType(MediaTypes.APPLICATION_JSON)
+  fun members(@PathParam slug: String): MemberList = ctx.membership(slug).vault.let { MemberList(it.slug, members.members(it.id)) }
+
+  /** Share: give someone (by the email they sign in with) a role, or change it. They need not have signed in yet. */
+  @Put("/api/vaults/{slug}/members")
+  @Authenticated(capabilities = [USER])
+  @RequestContentType(MediaTypes.APPLICATION_JSON)
+  @ResponseContentType(MediaTypes.APPLICATION_JSON)
+  fun share(@PathParam slug: String, @RequestBody req: MemberReq): MemberList {
+    val vault = owned(slug)
+    members.put(vault, req.principal, req.role ?: Role.VIEWER)
+    return MemberList(vault.slug, members.members(vault.id))
+  }
+
+  @Delete("/api/vaults/{slug}/members")
+  @Authenticated(capabilities = [USER])
+  @ResponseContentType(MediaTypes.APPLICATION_JSON)
+  fun unshare(@PathParam slug: String, @QueryParam principal: String): MemberList {
+    val vault = owned(slug)
+    members.remove(vault, principal)
+    return MemberList(vault.slug, members.members(vault.id))
+  }
+
+  /** Operators see every vault; a pinned token its own; a member the ones they belong to, with their role. */
   @Get("/api/vaults")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
-  fun list() = VaultList(config.snapz.default_vault, store.list(ctx.pinned()?.let { store.require(it).id }))
+  fun list(): VaultList {
+    ctx.pinned()?.let { return VaultList(it, store.list(store.require(it).id)) }
+    if (ctx.operator()) return VaultList(config.snapz.default_vault, store.list().map { it.copy(role = "operator") })
+    val home = ctx.current()   // makes their own vault on first use
+    val roles = members.roles(ctx.userId())
+    return VaultList(home.slug, store.list().filter { it.id in roles }.map { it.copy(role = roles[it.id], is_default = it.id == home.id) })
+  }
 
   @Post("/api/vaults")
   @Authenticated(capabilities = [ADMIN])

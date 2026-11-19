@@ -104,8 +104,8 @@ class Replica @Inject constructor(
     find(slug)?.let { return it }
     baseSlug(slug)?.let(::find)?.let { return it }
     return c.insert(
-      "INSERT INTO vaults (slug, name, created_at_ms, updated_at_ms, deleted_at_ms, shard) VALUES (?,?,0,0,?,?)",
-      listOf(slug, baseSlug(slug) ?: slug, if (baseSlug(slug) != null) 0L else null, shardOf("vault:$slug", shards)),
+      "INSERT INTO vaults (slug, name, created_at_ms, updated_at_ms, deleted_at_ms, shard, token) VALUES (?,?,0,0,?,?,?)",
+      listOf(slug, baseSlug(slug) ?: slug, if (baseSlug(slug) != null) 0L else null, shardOf("vault:$slug", shards), newVaultToken()),
     )
   }
 
@@ -140,8 +140,8 @@ class Replica @Inject constructor(
     }.firstOrNull()
     if (cur == null) {
       c.insert(
-        "INSERT INTO vaults (slug, name, description, icon, created_at_ms, updated_at_ms, shard) VALUES (?,?,?,?,?,?,?)",
-        listOf(slug) + want + listOf(e.ms("created_at"), updated, shardOf("vault:$slug", shards)),
+        "INSERT INTO vaults (slug, name, description, icon, created_at_ms, updated_at_ms, shard, token) VALUES (?,?,?,?,?,?,?,?)",
+        listOf(slug) + want + listOf(e.ms("created_at"), updated, shardOf("vault:$slug", shards), newVaultToken()),
       )
       return Outcome.APPLIED
     }
@@ -326,6 +326,7 @@ class ReplicaActions @Inject constructor(
   @Get("/_feeds/blobs/{sha256}")
   @Authenticated(capabilities = [USER])
   fun get(@PathParam sha256: String): Response<ResponseBody> {
+    ctx.requireOperator()
     if (ctx.pinned() != null) throw UnauthorizedException("a vault-pinned token can't read blobs by hash")
     if (!SHA256.matches(sha256)) throw BadRequestException("not a sha256")
     val file = blobs.original(sha256)
