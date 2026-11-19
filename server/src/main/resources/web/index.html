@@ -118,6 +118,7 @@ td.wrap{white-space:normal;word-break:break-all;max-width:520px}
   <span class="tab" data-tab="tokens">tokens</span>
   <span class="tab" data-tab="info">info</span>
   <span class="sp"></span>
+  <a id="applink" class="hide" title="open the Snapz app pointed at this server">open in app</a>
   <span id="who" class="dim"></span>
   <button id="logout" class="hide">logout</button>
 </div>
@@ -1006,6 +1007,13 @@ function setTab(tab, push = true) {
 }
 document.querySelectorAll("#top .tab").forEach(t => t.onclick = () => { if (S.me) setTab(t.dataset.tab); });
 document.addEventListener("keydown", ev => { if (S.me && S.tab === "photos") photoKeys(ev); });
+
+// On a phone: a link that opens the Snapz app and offers to point it at this server.
+if (matchMedia("(pointer:coarse)").matches) {
+  const a = $("#applink");
+  a.href = `snapz://${location.host}${location.protocol === "http:" ? "?insecure=1" : ""}`;
+  a.classList.remove("hide");
+}
 
 async function boot() {
   // Ask the open endpoint first: a visitor who is not signed in should not produce a 401 on every
