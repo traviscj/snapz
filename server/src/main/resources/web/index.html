@@ -180,7 +180,7 @@ const S = {
   allColls: {},                         // other vaults' collections, for cross-vault move/copy
   collections: [], coll: null,          // coll: slug | null (=all) | "~trash"
   photos: [], next: null, loading: false, sel: new Set(), cur: -1, anchor: -1,
-  view: localStorage.snapzView || "grid", tile: +(localStorage.snapzTile || 112), barcode: "",
+  view: localStorage.snapzView || "grid", tile: +(localStorage.snapzTile || 112), barcode: "", q: "",
   recNs: null,
   openTok: null,                        // photo shown in the detail pane (also in the URL)
   feedCur: { photos: 0, collections: 0, results: 0, vaults: 0 }, // live-refresh positions in the change feeds
@@ -204,6 +204,7 @@ function urlFor() {
   const q = new URLSearchParams();
   if (S.view === "table") q.set("view", "table");
   if (S.barcode) q.set("bc", S.barcode);
+  if (S.q) q.set("q", S.q);
   const qs = q.toString();
   return h + (qs ? "?" + qs : "");
 }
@@ -219,7 +220,7 @@ function parseUrl() {
   const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
   const q = new URLSearchParams(qs || "");
   const vault = parts[0]?.startsWith("@") ? parts.shift().slice(1) : null;
-  const out = { vault, tab: "photos", coll: null, openTok: null, view: q.get("view") === "table" ? "table" : null, barcode: q.get("bc") || "", recNs: null };
+  const out = { vault, tab: "photos", coll: null, openTok: null, view: q.get("view") === "table" ? "table" : null, barcode: q.get("bc") || "", find: q.get("q") || "", recNs: null };
   if (TABS.includes(parts[0])) {
     out.tab = parts[0];
     if (out.tab === "photos") { out.coll = !parts[1] || parts[1] === "~all" ? null : parts[1]; out.openTok = parts[2] || null; }
@@ -233,7 +234,7 @@ function applyUrl() {
   S.vault = S.vaults.some(v => v.slug === want) ? want : (S.vaults[0]?.slug ?? S.defaultVault);
   if (u.vault && S.vault !== u.vault) say(`no vault '${u.vault}'`, "warn");
   renderVaultPicker();
-  S.inbox = null; S.coll = u.coll; S.openTok = u.openTok; S.barcode = u.barcode;
+  S.inbox = null; S.coll = u.coll; S.openTok = u.openTok; S.barcode = u.barcode; S.q = u.find;
   if (u.view) S.view = u.view; else if (location.hash.includes("/photos")) S.view = "grid";
   if (u.recNs) S.recNs = u.recNs;
   S.sel.clear(); S.cur = -1; S.anchor = -1;
@@ -303,7 +304,7 @@ function renderVaultPicker() {
 }
 function selectVault(slug) {
   if (slug === S.vault) return;
-  S.vault = slug; S.coll = null; S.openTok = null; S.recNs = null; S.inbox = null; S.sug = {}; S.sel.clear(); S.cur = -1; S.anchor = -1; S.barcode = "";
+  S.vault = slug; S.coll = null; S.openTok = null; S.recNs = null; S.inbox = null; S.sug = {}; S.sel.clear(); S.cur = -1; S.anchor = -1; S.barcode = ""; S.q = "";
   renderVaultPicker();
   setTab(S.tab === "vaults" ? "photos" : S.tab);
 }
@@ -422,6 +423,7 @@ function photosShell() {
         <button id="b-none" title="Esc">clear</button><button id="b-all" title="a">all</button>
         <span id="b-pend" class="sug" style="margin:0"></span>
         <span class="sp"></span>
+        <input id="b-q" placeholder="find: note, plate, serial, date…" size="24" value="${esc(S.q)}" title="matches notes, codes, and what transforms read off the photo (meta)">
         <input id="b-bc" placeholder="barcode =" size="15" value="${esc(S.barcode)}">
         <button id="b-view" title="v">${S.view === "grid" ? "table" : "grid"}</button>
         <button id="b-sm" title="-">−</button><button id="b-lg" title="+">+</button>
@@ -447,6 +449,7 @@ function photosShell() {
   $("#b-cam").onclick = () => $("#b-shot").click();
   $("#b-shot").onchange = ev => { uploadFiles([...ev.target.files]); ev.target.value = ""; };
   $("#b-bc").onchange = ev => { S.barcode = ev.target.value.trim(); syncUrl(); loadPhotos(true); };
+  $("#b-q").onchange = ev => { S.q = ev.target.value.trim(); syncUrl(); loadPhotos(true); };
   $("#b-purge").onclick = async () => {
     if (!confirm("Permanently delete everything in the trash? This cannot be undone.")) return;
     const r = await run("purge", () => api("POST", "/api/admin/purge?older_than_days=0"));
@@ -544,6 +547,7 @@ async function loadPhotos(reset) {
     const q = new URLSearchParams({ limit: "300" });
     if (inTrash()) q.set("deleted", "true"); else if (S.coll) q.set("collection", S.coll);
     if (S.barcode) q.set("barcode", S.barcode);
+    if (S.q) q.set("q", S.q);
     if (!reset && S.next) q.set("before", S.next);
     const page = await api("GET", "/api/photos?" + q);
     S.photos = reset ? page.photos : S.photos.concat(page.photos);
@@ -575,10 +579,10 @@ function renderPhotos() {
     content.innerHTML = `<div id="grid">` + S.photos.map((p, i) => `
       <div class="t${S.sel.has(p.token) ? " sel" : ""}${i === S.cur ? " cur" : ""}${p.deleted_at ? " del" : ""}${S.fresh.has(p.token) ? " chg" : ""}" data-i="${i}">
         <img loading="lazy" src="${esc(p.thumb_url)}" alt="">
-        ${p.barcodes.length ? `<span class="bc">${esc(p.barcodes.join(" "))}</span>` : ""}
+        ${p.barcodes.length || textItems(p).length ? `<span class="bc" title="${esc(textItems(p).map(t => t.kind + " " + t.value).join("\n"))}">${esc([...p.barcodes, ...textItems(p).filter(t => ["plate", "serial", "model", "vin"].includes(t.kind)).map(t => t.value)].join(" "))}</span>` : ""}
         ${p.note && !S.sel.has(p.token) && !S.sug[p.token] ? `<span class="nt" title="${esc(p.note)}">n</span>` : ""}
         ${S.sug[p.token]?.[0] && !S.sel.has(p.token) ? `<span class="sg">${esc(S.sug[p.token][0].collection)} ${pct(S.sug[p.token][0].p)}</span>` : ""}
-        <span class="cap">${p.meta?.action ? `<b class="warn">${esc(p.meta.action)}${p.meta.qty != null ? " " + esc(p.meta.qty) : ""}</b> ` : ""}${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
+        <span class="cap">${fullPct(p) ? `<b class="${p.meta.fullness <= 0.2 ? "bad" : p.meta.fullness <= 0.5 ? "warn" : "ok"}" title="how full${p.meta.fullness_of ? ": " + esc(p.meta.fullness_of) : ""}">${fullPct(p)}</b> ` : ""}${p.meta?.action ? `<b class="warn">${esc(p.meta.action)}${p.meta.qty != null ? " " + esc(p.meta.qty) : ""}</b> ` : ""}${esc(fmtTs(p.taken_at).slice(5, 16))}${showColl ? " " + esc(p.collection) : ""}</span>
       </div>`).join("") + `</div>`;
   } else {
     content.innerHTML = `<table><thead><tr><th></th><th>taken</th><th class="n">age</th>${showColl ? "<th>collection</th>" : ""}<th>action</th><th>token</th><th class="n">w×h</th><th class="n">size</th><th>barcodes</th><th>note</th><th class="n">fsi</th></tr></thead><tbody>` +
@@ -627,6 +631,8 @@ function showDetail(p) {
   const rows = [
     ["token", p.token], ["vault", p.vault], ["collection", p.collection],
     p.meta?.action ? ["action", p.meta.action + (p.meta.qty != null ? " × " + p.meta.qty : "")] : null, ["taken", `${fmtTs(p.taken_at)} (${age(p.taken_at)})`],
+    fullPct(p) ? ["fullness", fullPct(p) + (p.meta.fullness_of ? " of " + p.meta.fullness_of : "")] : null,
+    ...textItems(p).map(t => [t.kind, t.value + (t.label ? `  (${t.label})` : "")]),
     ["uploaded", fmtTs(p.created_at)], ["updated", fmtTs(p.updated_at)],
     p.deleted_at ? ["deleted", fmtTs(p.deleted_at)] : null,
     ["dims", `${p.width ?? "?"}×${p.height ?? "?"}`], ["size", `${fmtBytes(p.bytes)} ${p.content_type}`],
@@ -758,7 +764,11 @@ async function initLive() {
   const st = await api("GET", "/_feeds/status");
   for (const f of st.feeds) if (f.feed in S.feedCur) S.feedCur[f.feed] = f.sequence;
 }
-const matchesView = e => (inTrash() ? !!e.deleted_at : !e.deleted_at && (!S.coll || e.collection === S.coll)) && (!S.barcode || e.barcodes.includes(S.barcode));
+const matchesView = e => (inTrash() ? !!e.deleted_at : !e.deleted_at && (!S.coll || e.collection === S.coll)) && (!S.barcode || e.barcodes.includes(S.barcode))
+  && (!S.q || JSON.stringify([e.note, e.barcodes, e.meta]).toLowerCase().includes(S.q.toLowerCase()));
+// How full, as a transform read it: "17%". And the identifying text it found, most useful first.
+const fullPct = p => p.meta?.fullness == null ? "" : Math.round(p.meta.fullness * 100) + "%";
+const textItems = p => Array.isArray(p.meta?.text) ? p.meta.text.filter(t => t && t.value) : [];
 async function drainFeed(feed) {
   const out = [];
   for (;;) {

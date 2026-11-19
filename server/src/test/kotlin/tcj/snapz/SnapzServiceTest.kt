@@ -1301,4 +1301,27 @@ class SnapzServiceTest {
     assertThat(call("GET", "/invite/${third["code"]}/setup", token = null).code).isEqualTo(404)
     assertThat(call("POST", "/api/vaults/personal/invites", mapOf("email" to "not-an-email")).code).isEqualTo(400)
   }
+
+  @Test
+  @Suppress("UNCHECKED_CAST")
+  fun `find matches notes, codes and what transforms read off a photo`() {
+    api("POST", "/api/collections", mapOf("name" to "garage"))
+    val car = upload("garage", jpeg(color = Color.RED), "&note=the+neighbour%27s+car")
+    val fridge = upload("garage", jpeg(color = Color.BLUE))
+    val milk = upload("garage", jpeg(color = Color.GREEN), "&meta=" + java.net.URLEncoder.encode("""{"barcodes":[{"symbology":"ean13","value":"0123456789012"}]}""", "UTF-8"))
+    // What the vision worker writes back: meta.text and meta.fullness.
+    api("PATCH", "/api/photos/${car["token"]}", mapOf("meta" to mapOf("text" to listOf(mapOf("kind" to "plate", "value" to "KZM4827", "label" to null)))))
+    api("PATCH", "/api/photos/${fridge["token"]}", mapOf("meta" to mapOf("text" to listOf(mapOf("kind" to "serial", "value" to "7XK29-4471-QZ", "label" to "S/N"), mapOf("kind" to "date", "value" to "2027-03-15", "label" to "EXP")))))
+    api("PATCH", "/api/photos/${milk["token"]}", mapOf("meta" to (milk["meta"] as Map<String, Any?>) + mapOf("fullness" to 0.17, "fullness_of" to "milk")))
+    fun find(q: String) = api("GET", "/api/photos?q=" + java.net.URLEncoder.encode(q, "UTF-8")).list("photos").map { it["token"] }
+    assertThat(find("kzm4827")).containsExactly(car["token"])
+    assertThat(find("neighbour")).containsExactly(car["token"])
+    assertThat(find("4471")).containsExactly(fridge["token"])
+    assertThat(find("2027-03")).containsExactly(fridge["token"])
+    assertThat(find("0123456789012")).containsExactly(milk["token"])
+    assertThat(find("milk")).containsExactly(milk["token"])
+    assertThat(find("nothing-like-this")).isEmpty()
+    assertThat(find("%")).describedAs("wildcards are not the caller's to use").hasSize(3)
+    assertThat(api("GET", "/api/photos?q=4471&collection=garage").list("photos")).hasSize(1)
+  }
 }

@@ -369,7 +369,8 @@ class PhotoStore @Inject constructor(
    * Newest first by (taken_at, id). [before] is the opaque `next_before` of the previous page.
    * [deleted]: false = live only, true = trash only.
    */
-  fun list(vaultId: Long, collection: String?, before: String?, limit: Int, barcode: String?, deleted: Boolean): PhotoPage = db.tx { c ->
+  /** [q]: anything the photo says about itself — its note, its codes, and what transforms read off it (meta), matched as a substring. */
+  fun list(vaultId: Long, collection: String?, before: String?, limit: Int, barcode: String?, deleted: Boolean, q: String? = null): PhotoPage = db.tx { c ->
     val conds = mutableListOf(if (deleted) "p.deleted_at_ms IS NOT NULL" else "p.deleted_at_ms IS NULL", "c.vault_id = ?")
     val args = mutableListOf<Any?>(vaultId)
     if (collection != null) {
@@ -379,6 +380,11 @@ class PhotoStore @Inject constructor(
     if (!barcode.isNullOrBlank()) {
       conds += "p.barcodes LIKE ?"
       args += "%,${barcode.replace("%", "").replace("_", "")},%"
+    }
+    if (!q.isNullOrBlank()) {
+      val like = "%" + q.trim().lowercase().replace("\\", "").replace("%", "").replace("_", "\\_") + "%"
+      conds += "(LOWER(p.note) LIKE ? OR LOWER(p.barcodes) LIKE ? OR LOWER(p.meta) LIKE ?)"
+      args.addAll(listOf(like, like, like))
     }
     if (before != null) {
       val parts = before.split('_').mapNotNull { it.toLongOrNull() }

@@ -256,6 +256,24 @@ A chain applies to photos entering the collection from then on. For the ones alr
 `scripts/transform_examples.py` has both, implemented with macOS `sips`. Rewrites that change
 geometry should pass `current=False`: detection boxes are fractions of the image they were found in.
 
+### reading photos with a vision model
+
+`scripts/vision_transforms.py` is a worker with two extract transforms that ask a vision model
+(anything that speaks the OpenAI chat-completions API with image input; a local llama.cpp /
+llama-swap / Ollama server keeps the photos on your network):
+
+| transform | what it writes |
+|---|---|
+| `important-text` | `meta.text`: `[{kind, value, label}]` for license plates, serial / model / part numbers, VINs, dates (as `YYYY-MM-DD`), lot codes, phones, URLs, prices |
+| `fullness` | `meta.fullness` (0..1) and `meta.fullness_of`: how full the bottle, jug or jar in the picture is; null when the level can't be seen |
+
+    VISION_URL=http://localhost:8080/v1 VISION_MODEL=qwen3-vl uv run --with pillow scripts/vision_transforms.py --follow
+    scripts/vision_transforms.py --try plate.jpg milk.jpg      # ask about local files, no server
+
+Attach either to a collection (it then runs on everything filed there) or run one on a single
+photo. `GET /api/photos?q=kzm4827` (and the find box in the web UI) matches notes, codes and
+whatever transforms read off a photo; tiles show the fullness and the identifying text.
+
 ## inbox
 
 Shoot into `inbox` (created at startup) to decide later. `GET /api/inbox` ranks every other

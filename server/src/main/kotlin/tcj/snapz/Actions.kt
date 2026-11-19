@@ -123,7 +123,8 @@ class PhotoActions @Inject constructor(
     @QueryParam limit: Int?,
     @QueryParam barcode: String?,
     @QueryParam deleted: Boolean?,
-  ) = store.list(ctx.current().id, collection, before, limit ?: 200, barcode, deleted == true)
+    @QueryParam q: String?,
+  ) = store.list(ctx.current().id, collection, before, limit ?: 200, barcode, deleted == true, q)
 
   /**
    * Upload: the request body IS the image bytes (any Content-Type; the format is sniffed).
