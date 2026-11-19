@@ -1,10 +1,14 @@
 # Copy to deploy/snapz.yaml (gitignored). Layered over snapz-common.yaml via SNAPZ_CONFIG.
 # Holds the secrets: chmod 600.
+# Give snapz its own database user, never root:
+#   CREATE DATABASE snapz CHARACTER SET utf8mb4;
+#   CREATE USER 'snapz'@'%' IDENTIFIED BY '<long random>';
+#   GRANT ALL ON snapz.* TO 'snapz'@'%';
 data_source:
   host: host.docker.internal
   database: snapz
-  username: root
-  password: ""
+  username: snapz
+  password: CHANGEME
 
 snapz:
   blob_dir: /data/blobs
@@ -19,5 +23,7 @@ snapz:
     # Other client ids whose issuer-signed JWTs are accepted as bearer tokens (client_id always is):
     # bearer_audiences: []
   # Optional break-glass token for first boot / when SSO is down. Remove once a script token exists.
+  # With an https public_url the server refuses to start on a token shorter than 32 chars
+  # (openssl rand -hex 24).
   # bootstrap_tokens:
   #   - { token: CHANGEME-long-random, principal: bootstrap }

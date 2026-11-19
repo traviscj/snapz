@@ -112,7 +112,7 @@ class SnapzServiceTest {
 
   private fun url(path: String) = jetty.httpServerUrl.resolve(path)!!
 
-  private fun call(method: String, path: String, body: Any? = null, token: String? = "test-token", cookie: String? = null, raw: ByteArray? = null, vault: String? = null): Response {
+  private fun call(method: String, path: String, body: Any? = null, token: String? = "test-token", cookie: String? = null, raw: ByteArray? = null, vault: String? = null, headers: Map<String, String> = mapOf()): Response {
     val rb = when {
       raw != null -> raw.toRequestBody("application/octet-stream".toMediaType())
       body is String -> body.toRequestBody(jsonType)
@@ -124,6 +124,7 @@ class SnapzServiceTest {
     token?.let { req.header("Authorization", "Bearer $it") }
     cookie?.let { req.header("Cookie", it) }
     vault?.let { req.header("X-Snapz-Vault", it) }
+    headers.forEach { (k, v) -> req.header(k, v) }
     return http.newCall(req.build()).execute()
   }
 
@@ -896,5 +897,45 @@ class SnapzServiceTest {
     val p = upload("c", tagged)
     // jpeg() is 64x48 stored; displayed rotated it's 48x64
     assertThat(p["width"] to p["height"]).isEqualTo(48L to 64L)
+  }
+
+  @Test
+  fun `security headers, cross-site cookie writes refused, weak deployments refused`() {
+    // Every reply says what the page may load; image bytes are sandboxed.
+    val page = call("GET", "/", token = null)
+    assertThat(page.header("X-Content-Type-Options")).isEqualTo("nosniff")
+    assertThat(page.header("X-Frame-Options")).isEqualTo("DENY")
+    assertThat(page.header("Content-Security-Policy")).contains("frame-ancestors 'none'").contains("connect-src 'self'")
+    assertThat(page.header("Strict-Transport-Security")).isNull()   // this test server is plain http
+    assertThat(call("GET", "/api/me", token = null).header("X-Content-Type-Options")).isEqualTo("nosniff")   // 401s too
+    api("POST", "/api/collections", mapOf("name" to "c"))
+    val p = upload("c", jpeg())
+    val blob = call("GET", p["url"] as String)
+    assertThat(blob.code).isEqualTo(200)
+    assertThat(blob.header("Content-Security-Policy")).contains("sandbox")
+    assertThat(blob.header("X-Content-Type-Options")).isEqualTo("nosniff")
+
+    // A cookie session: same-origin writes work, writes a browser labels cross-site do not.
+    val login = call("POST", "/auth/token-login", mapOf("token" to "test-token"), token = null)
+    val cookie = login.header("Set-Cookie")!!.substringBefore(';')
+    fun write(headers: Map<String, String>, token: String? = null) =
+      call("POST", "/api/collections", mapOf("name" to "x${headers.hashCode()}${token != null}"), token = token, cookie = cookie, headers = headers).code
+    assertThat(write(mapOf())).isEqualTo(200)
+    assertThat(write(mapOf("Sec-Fetch-Site" to "same-origin"))).isEqualTo(200)
+    assertThat(write(mapOf("Sec-Fetch-Site" to "cross-site"))).isEqualTo(401)
+    assertThat(write(mapOf("Sec-Fetch-Site" to "same-site"))).isEqualTo(401)
+    assertThat(write(mapOf("Origin" to "https://evil.example"))).isEqualTo(401)
+    assertThat(write(mapOf("Origin" to "http://${url("/").host}:${url("/").port}"))).isEqualTo(200)
+    // Reads are not writes, and a bearer token is not a browser.
+    assertThat(call("GET", "/api/me", token = null, cookie = cookie, headers = mapOf("Sec-Fetch-Site" to "cross-site")).code).isEqualTo(200)
+    assertThat(write(mapOf("Sec-Fetch-Site" to "cross-site"), token = "test-token")).isEqualTo(200)
+
+    // Posture: a short static token is tolerated on a dev box and fatal on an https deployment.
+    val base = MiskConfig.load<SnapzConfig>("snapz", TESTING, listOf<String>())
+    fun with(url: String, token: String) = base.copy(snapz = base.snapz.copy(public_url = url, bootstrap_tokens = listOf(BootstrapToken(token, "x"))))
+    assertThat(Posture.check(with("http://localhost:8788", "dev-token")).none { it.fatal }).isTrue()
+    assertThat(Posture.check(with("https://snapz.example.net", "dev-token")).any { it.fatal }).isTrue()
+    assertThat(Posture.check(with("https://snapz.example.net", "x".repeat(40))).none { it.fatal }).isTrue()
+    assertThat(Posture.check(with("https://snapz.example.net", "x".repeat(40))).map { it.message }).anyMatch { it.contains("bootstrap token(s) in config") }
   }
 }

@@ -1,0 +1,10 @@
+# Caddy in front of snapz (LAN / tailnet deployment). Stock Caddy has no rate limiter; on a public
+# host use nginx-snapz.conf.example or build Caddy with a rate-limit plugin.
+snapz.example.net {
+	request_body {
+		max_size 64MB
+	}
+	@internal path /_status /_readiness /_liveness /_admin*
+	respond @internal 404
+	reverse_proxy 127.0.0.1:8788
+}

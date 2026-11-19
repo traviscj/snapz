@@ -575,6 +575,7 @@ class InfoAction @Inject constructor(private val config: SnapzConfig, private va
         "oidc_allowed_emails" to s.oidc?.allowed_emails?.size,
         "oidc_allowed_groups" to s.oidc?.allowed_groups,
         "bootstrap_tokens" to s.bootstrap_tokens.size,
+        "posture" to Posture.check(config).map { it.message },
         "session_ttl_days" to s.session_ttl_days,
         "max_upload_bytes" to s.max_upload_bytes,
         "thumb_px" to s.thumb_px,

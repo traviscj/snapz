@@ -6,11 +6,21 @@ import misk.jdbc.JdbcModule
 import misk.jdbc.SchemaMigratorService
 import misk.security.authz.AccessControlModule
 import misk.security.authz.MiskCallerAuthenticator
+import misk.logging.getLogger
+import misk.web.NetworkInterceptor
 import misk.web.WebActionModule
 
 /** Everything except deployment + web server wiring, which differ between app and tests. */
 class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
   override fun configure() {
+    // A deployment that would hand out a master key does not start; the rest is said loudly.
+    val findings = Posture.check(config)
+    findings.filter { !it.fatal }.forEach { logger.warn { "posture: ${it.message}" } }
+    findings.filter { it.fatal }.let { fatal ->
+      check(fatal.isEmpty()) { "refusing to start: " + fatal.joinToString("; ") { it.message } }
+    }
+    multibind<NetworkInterceptor.Factory>().to<SecurityHeaders>()
+
     // Without this, @Authenticated is decorative: misk only enforces it via AccessInterceptor.
     install(AccessControlModule())
     multibind<MiskCallerAuthenticator>().to<SnapzAuthenticator>()
@@ -39,3 +49,5 @@ class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
     install(WebActionModule.create<InboxAction>())
   }
 }
+
+private val logger = getLogger<SnapzModule>()

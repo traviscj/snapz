@@ -269,3 +269,32 @@ You need an OIDC client whose callback is `<public_url>/auth/callback`, a TLS re
 front of port 8788, a `snapz` MySQL database, and a blob directory that gets backed up. If the
 identity provider is only reachable on your LAN/VPN, signing in from the phone needs that network;
 capture itself works anywhere (offline queue).
+
+### hardening
+
+What the server does by itself:
+
+- Every response carries `X-Content-Type-Options: nosniff`, a Content-Security-Policy (the page may
+  only talk to its own origin; image bytes are served `sandbox`ed), `X-Frame-Options: DENY`, and
+  HSTS when `public_url` is https.
+- Cookie sessions are `HttpOnly; SameSite=Lax` (`Secure` under https), and a write that arrives on
+  the cookie and that the browser labels cross-site (`Sec-Fetch-Site`, else `Origin` vs `Host`) is
+  treated as unauthenticated. Bearer tokens are unaffected.
+- Uploads must sniff as an image, whatever `Content-Type` says.
+- With an https `public_url` it refuses to start on a bootstrap token shorter than 32 characters,
+  and logs (and lists under `posture` in `GET /api/info`) what else it thinks is wrong: bootstrap
+  tokens still present, `root` or passwordless database access, no OIDC.
+
+What the deployment has to do (templates in `deploy/`):
+
+- **Proxy**: `nginx-snapz.conf.example` (public host: body-size limit, rate limits on `/auth/` and
+  the API, misk's `/_status` endpoints hidden) or `Caddyfile.example` (LAN/tailnet).
+- **Database**: its own user, not root (`snapz.yaml.example`).
+- **Backups**: `deploy/backup.sh` dumps the database and copies the blob directory; run it nightly
+  from cron and restore from it once before trusting it.
+- **Tokens**: give scripts vault-pinned, read-only or expiring tokens (`ttl_days`) rather than the
+  full-access kind, and delete the bootstrap token once one exists.
+
+Not done: encryption at rest (vaults are namespaces, not encryption; use an encrypted volume for
+the blob directory and database if the host is not yours alone), and per-token rate limits inside
+the app.

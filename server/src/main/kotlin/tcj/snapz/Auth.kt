@@ -57,6 +57,7 @@ class SnapzAuthenticator @Inject constructor(
   override fun getAuthenticatedCaller(): MiskCaller? {
     val call = httpCall.get()
     val token = call.presentedToken() ?: return null
+    if (call.isCrossSiteWrite()) return null
     val resolved = tokens.resolve(token) ?: oidc.bearer(token) ?: return null
     // Read-only: reads, plus the one write a stateless feed consumer needs (its own cursor).
     val mayCall = !resolved.readOnly || call.dispatchMechanism == DispatchMechanism.GET ||
