@@ -169,6 +169,36 @@ class TransformStore @Inject constructor(
       .count { lineage.advanceChain(c, it, cid, null) != null }
   }
 
+  /**
+   * Run one transform over a collection, whether or not it is in the collection's chain.
+   *
+   * - incremental (the default): only photos it has not dealt with as they are now. A photo is
+   *   left alone when this transform already has a request for the photo's current bytes that is
+   *   still waiting or ended in anything but an error. So new photos, photos whose bytes changed
+   *   since, and earlier failures get it; nothing is done twice.
+   * - all: every live photo, again. For an extract that replaces what it wrote before (meta keys
+   *   are overwritten); for a rewrite it adds a new version.
+   *
+   * Returns (queued, left alone).
+   */
+  fun apply(vaultId: Long, collection: String, transform: String, all: Boolean, params: Map<String, Any?>?, by: String?): Pair<Int, Int> = db.tx { c ->
+    requireTransform(c, transform)
+    val cid = collections.idOf(c, vaultId, collection)
+    val live = c.select("SELECT p.id FROM photos p WHERE p.collection_id = ? AND p.deleted_at_ms IS NULL ORDER BY p.id", listOf(cid)) { it.getLong(1) }
+    val done = if (all) setOf() else c.select(
+      """
+      SELECT DISTINCT p.id FROM photos p JOIN transform_intents i ON i.photo_id = p.id AND i.transform = ? AND i.version_id <=> p.current_version_id
+      WHERE p.collection_id = ? AND p.deleted_at_ms IS NULL
+        AND NOT EXISTS (SELECT 1 FROM transform_results r WHERE r.intent_id = i.id AND r.status = 'error')
+      """.trimIndent(),
+      listOf(transform, cid),
+    ) { it.getLong(1) }.toSet()
+    val todo = live.filter { it !in done }
+    val text = params?.let(json::write)
+    todo.forEach { lineage.addIntent(c, it, transform, text, "manual", null, null, by) }
+    todo.size to live.size - todo.size
+  }
+
   // ---- intents + results
 
   private val intentSelect = """

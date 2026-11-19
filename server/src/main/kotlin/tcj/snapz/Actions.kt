@@ -367,6 +367,9 @@ class FeedActions @Inject constructor(private val feedz: Feedz, private val ctx:
 
 // ------------------------------------------------------------------------------------ tokens
 
+/** [queued] photos got a new request; [skipped] were already handled as they are (incremental only). */
+data class ApplyResp(val collection: String, val transform: String, val mode: String, val queued: Int, val skipped: Int)
+
 data class TokenReq(val name: String, val vault: String?, val read_only: Boolean?, val ttl_days: Int?)
 data class TokenCreated(val id: Long, val name: String, val token: String)
 data class TokenList(val tokens: List<TokenDto>)
@@ -472,6 +475,21 @@ class TransformActions @Inject constructor(
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
   fun backfill(@PathParam slug: String, @QueryParam all: Boolean?) = mapOf("started" to store.backfill(ctx.current().id, slug, all == true))
+
+  /**
+   * Run one transform over the collection (it need not be in the chain).
+   * mode=incremental (default): only photos it has not handled as they are now.
+   * mode=all: every photo again, replacing what it wrote before.
+   */
+  @Post("/api/collections/{slug}/transforms/{name}/run")
+  @Authenticated(capabilities = [USER])
+  @ResponseContentType(JSON)
+  fun apply(@PathParam slug: String, @PathParam name: String, @QueryParam mode: String?): ApplyResp {
+    val m = mode ?: "incremental"
+    if (m != "incremental" && m != "all") throw BadRequestException("mode is incremental or all")
+    val (queued, skipped) = store.apply(ctx.current().id, slug, name.unescaped(), m == "all", null, caller.get()?.principal)
+    return ApplyResp(slug, name.unescaped(), m, queued, skipped)
+  }
 
   /** Versions (the tree), plus every intent and its results: the photo's processing history. */
   @Get("/api/photos/{token}/history")

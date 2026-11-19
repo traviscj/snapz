@@ -271,7 +271,15 @@ llama-swap / Ollama server keeps the photos on your network):
     scripts/vision_transforms.py --try plate.jpg milk.jpg      # ask about local files, no server
 
 Attach either to a collection (it then runs on everything filed there) or run one on a single
-photo. `GET /api/photos?q=kzm4827` (and the find box in the web UI) matches notes, codes and
+photo. To run a transform over what is already in a collection, whether or not it is in the chain:
+
+    POST /api/collections/{slug}/transforms/{name}/run                  incremental (default)
+    POST /api/collections/{slug}/transforms/{name}/run?mode=all         everything, again
+
+Incremental leaves alone every photo the transform has already handled as it is now (a request for
+the photo's current bytes that is waiting or did not fail): new photos, photos whose bytes changed
+since, and earlier failures get it. `all` re-runs it everywhere; an extract's new answer replaces
+what it wrote before. The web UI has both under transforms → run one. `GET /api/photos?q=kzm4827` (and the find box in the web UI) matches notes, codes and
 whatever transforms read off a photo; tiles show the fullness and the identifying text.
 
 ## inbox

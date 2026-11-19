@@ -206,6 +206,11 @@ class Snapz:
         """Start the collection's chain on photos already in it (all=True: re-run on every photo)."""
         return self.call("POST", f"/api/collections/{self._q(collection)}/transforms/run", query={"all": "true" if all else None})["started"]
 
+    def apply_transform(self, collection, transform, mode="incremental"):
+        """Run one transform over a collection (it need not be in the chain). mode="incremental": only photos it has
+        not handled as they are now; mode="all": every photo again. Returns {"queued": n, "skipped": m, ...}."""
+        return self.call("POST", f"/api/collections/{self._q(collection)}/transforms/{self._q(transform)}/run", query={"mode": mode})
+
     def request_transform(self, token, transform, params=None):
         return self.call("POST", f"/api/photos/{token}/intents", {"transform": transform, "params": params})
 

@@ -1018,7 +1018,19 @@ async function transformsTab() {
     $("#x-chains").innerHTML = `<table><thead><tr><th>collection</th><th>chain</th><th></th></tr></thead><tbody>` +
       chains.map(ch => `<tr><td>${esc(ch.collection)}</td><td>${ch.transforms.map((l, i) => `<span class="chip">${i + 1}. ${esc(l.transform)}<a data-rm="${esc(ch.collection)}" data-i="${i}" title="remove">×</a></span>`).join("→ ") || '<span class="dim">—</span>'}</td>
         <td><select data-add="${esc(ch.collection)}"><option value="">+ add…</option>${lib.transforms.map(t => `<option value="${esc(t.name)}">${esc(t.name)}</option>`).join("")}</select>
-          <button data-bf="${esc(ch.collection)}" ${ch.transforms.length ? "" : "disabled"} title="start the chain on photos already in the collection that it has never run on (shift-click: re-run on every photo)">backfill</button></td></tr>`).join("") + `</tbody></table>`;
+          <button data-bf="${esc(ch.collection)}" ${ch.transforms.length ? "" : "disabled"} title="start the chain on photos already in the collection that it has never run on (shift-click: re-run on every photo)">backfill</button>
+          <span class="dim">│ run one:</span> <select data-ap="${esc(ch.collection)}">${lib.transforms.map(t => `<option value="${esc(t.name)}"${S.applyPick?.[ch.collection] === t.name ? " selected" : ""}>${esc(t.name)}</option>`).join("")}</select>
+          <button data-apm="incremental" data-apc="${esc(ch.collection)}" title="only photos it has not handled as they are now: new ones, changed ones, earlier failures">new</button>
+          <button data-apm="all" data-apc="${esc(ch.collection)}" class="danger" title="every photo again, replacing what it wrote before">all</button></td></tr>`).join("") + `</tbody></table>`;
+    // Run one transform over a collection, in or out of its chain.
+    $("#x-chains").querySelectorAll("[data-ap]").forEach(sel => sel.onchange = () => { (S.applyPick ||= {})[sel.dataset.ap] = sel.value; });
+    $("#x-chains").querySelectorAll("[data-apm]").forEach(b => b.onclick = async () => {
+      const coll = b.dataset.apc, name = $("#x-chains").querySelector(`select[data-ap="${CSS.escape(coll)}"]`).value, mode = b.dataset.apm;
+      if (!name) return;
+      if (mode === "all" && !confirm(`Run ${name} again on every photo in '${coll}'? What it wrote before is replaced.`)) return;
+      const r = await run(`${name} on ${coll}`, () => api("POST", `/api/collections/${encodeURIComponent(coll)}/transforms/${encodeURIComponent(name)}/run?mode=${mode}`));
+      say(`${name} on ${coll}: queued ${r.queued}` + (mode === "incremental" ? `, ${r.skipped} already done` : ""), "ok"); poller?.tick();
+    });
     const put = (coll, names) => run(`set ${coll} chain`, () => api("PUT", `/api/collections/${encodeURIComponent(coll)}/transforms`, { transforms: names.map(n => ({ transform: n })) })).then(() => poller?.tick());
     const namesOf = coll => chains.find(c => c.collection === coll).transforms.map(l => l.transform);
     $("#x-chains").querySelectorAll("[data-bf]").forEach(b => b.onclick = async ev => {

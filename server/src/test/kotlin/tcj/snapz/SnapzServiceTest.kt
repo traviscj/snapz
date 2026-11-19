@@ -1324,4 +1324,43 @@ class SnapzServiceTest {
     assertThat(find("%")).describedAs("wildcards are not the caller's to use").hasSize(3)
     assertThat(api("GET", "/api/photos?q=4471&collection=garage").list("photos")).hasSize(1)
   }
+
+  @Test
+  fun `one transform over a collection, incrementally or all over again`() {
+    api("POST", "/api/collections", mapOf("name" to "garage"))
+    api("PUT", "/api/transforms/reader", mapOf("kind" to "extract", "description" to "test worker"))
+    val a = upload("garage", jpeg(color = Color.RED))
+    val b = upload("garage", jpeg(color = Color.BLUE))
+    val gone = upload("garage", jpeg(color = Color.GREEN))
+    api("DELETE", "/api/photos/${gone["token"]}")
+    fun apply(mode: String? = null) = api("POST", "/api/collections/garage/transforms/reader/run" + (mode?.let { "?mode=$it" } ?: ""))
+    fun pending() = api("GET", "/api/intents?transform=reader").list("intents")
+    fun answer(intent: Map<String, Any?>, status: String = "ok", n: Int = 1) =
+      api("POST", "/api/intents/${intent["token"]}/results", mapOf("status" to status, "data" to mapOf("n" to n), "meta_patch" to mapOf("read" to n), "error" to if (status == "error") "boom" else null))
+
+    // Nothing has run: both live photos get it; the one in the trash does not.
+    assertThat(apply()).containsEntry("queued", 2L).containsEntry("skipped", 0L).containsEntry("mode", "incremental")
+    assertThat(pending().map { it["photo"] }).containsExactlyInAnyOrder(a["token"], b["token"])
+    // Asking again while those wait queues nothing more.
+    assertThat(apply()).containsEntry("queued", 0L).containsEntry("skipped", 2L)
+    val (ia, ib) = pending().let { p -> p.first { it["photo"] == a["token"] } to p.first { it["photo"] == b["token"] } }
+    answer(ia)
+    answer(ib, status = "error")
+    // Incremental: what is done stays done, the failure is tried again, a new photo is picked up.
+    val c = upload("garage", jpeg(color = Color.YELLOW))
+    assertThat(apply("incremental")).containsEntry("queued", 2L).containsEntry("skipped", 1L)
+    assertThat(pending().map { it["photo"] }).containsExactlyInAnyOrder(b["token"], c["token"])
+    pending().forEach { answer(it) }
+    assertThat(apply()).containsEntry("queued", 0L).containsEntry("skipped", 3L)
+
+    // All: every live photo again, and the new answer replaces what was written before.
+    assertThat(apply("all")).containsEntry("queued", 3L).containsEntry("skipped", 0L)
+    pending().forEach { answer(it, n = 2) }
+    assertThat(meta(api("GET", "/api/photos/${a["token"]}"))).containsEntry("read", 2L)
+    assertThat(apply()).containsEntry("queued", 0L)
+
+    assertThat(call("POST", "/api/collections/garage/transforms/reader/run?mode=sometimes").code).isEqualTo(400)
+    assertThat(call("POST", "/api/collections/garage/transforms/no-such/run").code).isEqualTo(404)
+    assertThat(call("POST", "/api/collections/nowhere/transforms/reader/run").code).isEqualTo(404)
+  }
 }
