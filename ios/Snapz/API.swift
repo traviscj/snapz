@@ -107,6 +107,54 @@ struct API {
 
     func vaults() async throws -> VaultList { try await get("/api/vaults") }
 
+    // People and names: these name a vault in the path, so no vault header.
+    private func vaultPath(_ slug: String, _ rest: String = "") -> String {
+        "/api/vaults/\(slug.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? slug)\(rest)"
+    }
+
+    func createVault(name: String, slug: String?) async throws -> VaultInfo {
+        var body: [String: Any] = ["name": name]
+        if let slug, !slug.isEmpty { body["slug"] = slug }
+        return try await with(vault: nil).send("POST", "/api/vaults", json: body)
+    }
+
+    /// Call a vault something else; only this account's view changes.
+    func renameVault(_ slug: String, to: String) async throws {
+        let _: [String: Bool] = try await with(vault: nil).send("PUT", vaultPath(slug, "/alias"), json: ["slug": to])
+    }
+
+    func members(of slug: String) async throws -> [Member] {
+        let l: MemberList = try await with(vault: nil).get(vaultPath(slug, "/members"))
+        return l.members
+    }
+
+    func share(_ slug: String, with principal: String, role: String) async throws -> [Member] {
+        let l: MemberList = try await with(vault: nil).send("PUT", vaultPath(slug, "/members"), json: ["principal": principal, "role": role])
+        return l.members
+    }
+
+    func unshare(_ slug: String, principal: String) async throws -> [Member] {
+        var r = with(vault: nil).request("DELETE", vaultPath(slug, "/members"), query: ["principal": principal])
+        r.timeoutInterval = 30
+        return try API.decoder.decode(MemberList.self, from: try await send(r)).members
+    }
+
+    func invites(of slug: String) async throws -> [Invite] {
+        let l: InviteList = try await with(vault: nil).get(vaultPath(slug, "/invites"))
+        return l.invites
+    }
+
+    /// Makes their sign-in account if they have none, shares the vault, and returns the link to send.
+    func invite(to slug: String, email: String, role: String, name: String?) async throws -> Invite {
+        var body: [String: Any] = ["email": email, "role": role]
+        if let name, !name.isEmpty { body["name"] = name }
+        return try await with(vault: nil).send("POST", vaultPath(slug, "/invites"), json: body)
+    }
+
+    func withdrawInvite(_ code: String) async throws {
+        let _: [String: Bool] = try await with(vault: nil).send("DELETE", "/api/invites/\(code)")
+    }
+
     func collections() async throws -> [PhotoCollection] {
         let l: CollectionList = try await get("/api/collections")
         return l.collections

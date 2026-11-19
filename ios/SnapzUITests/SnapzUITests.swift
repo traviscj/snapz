@@ -270,3 +270,55 @@ final class SnapzServersUITests: XCTestCase {
         XCTAssertTrue(again.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "\(port2)")).firstMatch.exists, "second server not in settings")
     }
 }
+
+/// People: share a vault with someone, invite someone new, take both back. Needs the usual
+/// TEST_RUNNER_SNAPZ_URL/_TOKEN of a server run by the token's owner.
+final class SnapzPeopleUITests: XCTestCase {
+    func testShareInviteAndRemove() throws {
+        continueAfterFailure = false
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["SNAPZ_URL"], let token = env["SNAPZ_TOKEN"] else { throw XCTSkip("set TEST_RUNNER_SNAPZ_URL and TEST_RUNNER_SNAPZ_TOKEN") }
+        let app = XCUIApplication()
+        app.launchEnvironment["SNAPZ_DEBUG_TOKEN"] = token
+        app.launchArguments += ["-serverURL", url]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["pantry"].waitForExistence(timeout: 10), "collections did not load")
+
+        let menu = app.descendants(matching: .any).matching(identifier: "vault-menu").firstMatch
+        XCTAssertTrue(menu.waitForExistence(timeout: 5))
+        menu.tap()
+        app.buttons["People…"].tap()
+        let email = app.textFields["email"]
+        XCTAssertTrue(email.waitForExistence(timeout: 5), "people sheet did not open")
+
+        // Share with someone who (as far as this test goes) already signs in.
+        let who = "uitest-\(Int(Date().timeIntervalSince1970))@example.com"
+        email.tap(); email.typeText(who)
+        app.buttons["Share"].tap()
+        let row = app.staticTexts[who]
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "shared member not listed")
+
+        // Invite someone new: a link to send shows up.
+        let guest = "guest-\(Int(Date().timeIntervalSince1970))@example.com"
+        email.tap(); email.typeText(guest)
+        app.buttons["Invite"].tap()
+        XCTAssertTrue(app.buttons["Send link"].waitForExistence(timeout: 8), "no invitation link")
+        if let dir = env["SNAPZ_SHOTS"] {
+            try? XCUIScreen.main.screenshot().pngRepresentation.write(to: URL(fileURLWithPath: dir).appendingPathComponent("people.png"))
+        }
+
+        // Take both back.
+        for address in [who, guest] {
+            let r = app.staticTexts.matching(NSPredicate(format: "label == %@", address)).firstMatch
+            while r.exists {
+                r.swipeLeft()
+                let b = app.buttons["Remove"].exists ? app.buttons["Remove"] : app.buttons["Withdraw"]
+                if !b.waitForExistence(timeout: 2) { break }
+                b.tap()
+                sleep(1)
+            }
+        }
+        XCTAssertFalse(app.staticTexts[who].exists, "member still listed after removal")
+        app.buttons["Done"].tap()
+    }
+}

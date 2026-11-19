@@ -9,7 +9,38 @@ struct VaultInfo: Codable, Identifiable, Hashable {
     let isDefault: Bool
     let collectionCount: Int
     let photoCount: Int
+    /// The vault's permanent, globally unique name; `slug` is only what this account calls it.
+    let token: String?
+    /// owner | editor | viewer, or operator for the people who run the server.
+    let role: String?
+
+    /// Owners (and operators) decide who else can see a vault.
+    var canShare: Bool { role == nil || role == "owner" || role == "operator" }
 }
+
+/// Someone who can reach a vault.
+struct Member: Codable, Identifiable, Hashable {
+    var id: String { principal }
+    let principal: String
+    let role: String
+}
+
+struct MemberList: Codable { let members: [Member] }
+
+/// An invitation not yet (or already) used: `url` is what gets sent to the person.
+struct Invite: Codable, Identifiable, Hashable {
+    var id: String { code }
+    let code: String
+    let url: String
+    let email: String
+    let role: String
+    let expiresAt: Date
+    let acceptedAt: Date?
+    /// created | existing | manual: what happened to their sign-in account.
+    let account: String?
+}
+
+struct InviteList: Codable { let invites: [Invite] }
 
 struct VaultList: Codable {
     let `default`: String
@@ -112,7 +143,7 @@ struct InboxResponse: Codable {
 
 struct CollectionList: Codable { let collections: [PhotoCollection] }
 struct PhotoPage: Codable { let photos: [Photo]; let nextBefore: String? }
-struct Me: Codable { let principal: String; let vault: String? }
+struct Me: Codable { let principal: String; let vault: String?; let admin: Bool?; let `operator`: Bool? }
 struct AuthInfo: Codable { let oidc: Bool; let principal: String? }
 struct DeviceToken: Codable { let token: String; let principal: String }
 struct BatchResult: Codable { let photos: [Photo] }

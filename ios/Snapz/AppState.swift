@@ -145,6 +145,10 @@ final class AppState: ObservableObject {
         do {
             let l = try await api.with(vault: nil).vaults()
             vaults = l.vaults
+            if let me = try? await api.with(vault: nil).me() {
+                isAdmin = me.admin ?? true
+                isMember = me.operator == false
+            }
             if vault == nil || !l.vaults.contains(where: { $0.slug == vault }) {
                 vault = l.vaults.contains(where: { $0.slug == l.default }) ? l.default : l.vaults.first?.slug
                 configureQueue()
@@ -192,6 +196,33 @@ final class AppState: ObservableObject {
         do {
             let me = try await API(base: baseURL, token: t).me()
             adopt(token: t, principal: me.principal)
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    /// Runs the server: may invite new people. (Older servers have no such notion: everyone is.)
+    @Published private(set) var isAdmin = false
+    /// An ordinary account: sees its own vaults and shared ones, and may rename its view of them.
+    @Published private(set) var isMember = false
+
+    func createVault(name: String) async {
+        guard let api else { return }
+        do {
+            let v = try await api.createVault(name: name, slug: nil)
+            await refreshVaults()
+            await selectVault(v.slug)
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    func renameVault(_ slug: String, to: String) async {
+        guard let api else { return }
+        do {
+            try await api.renameVault(slug, to: to)
+            if vault == slug { vault = to; configureQueue() }
+            await refreshVaults()
         } catch {
             self.error = error.localizedDescription
         }

@@ -147,12 +147,25 @@ struct MainView: View {
 /// The vault switcher: title of the main screen. One vault = plain label.
 struct VaultMenu: View {
     @EnvironmentObject private var app: AppState
+    @State private var people: VaultInfo?
+    @State private var renaming = false
+    @State private var creating = false
+    @State private var text = ""
 
     var body: some View {
         Menu {
             ForEach(app.vaults) { v in
                 Button { Task { await app.selectVault(v.slug) } } label: {
                     Label("\(v.icon ?? "▣") \(v.slug) · \(v.photoCount)", systemImage: v.slug == app.vault ? "checkmark" : "")
+                }
+            }
+            if let v = app.currentVault {
+                Section {
+                    Button { people = v } label: { Label("People…", systemImage: "person.2") }
+                    if app.isMember {
+                        Button { text = v.slug; renaming = true } label: { Label("Rename…", systemImage: "pencil") }
+                    }
+                    Button { text = ""; creating = true } label: { Label("New vault…", systemImage: "plus") }
                 }
             }
             if app.servers.count > 1 {
@@ -168,11 +181,32 @@ struct VaultMenu: View {
             HStack(spacing: 4) {
                 Text("\(app.currentVault?.icon ?? "") \(app.vault ?? "snapz")").font(.headline.monospaced())
                 if app.servers.count > 1 { Text("@\(URL(string: app.serverURL)?.host?.split(separator: ".").first.map(String.init) ?? "")").font(.caption.monospaced()).foregroundStyle(.secondary) }
-                if app.vaults.count > 1 || app.servers.count > 1 { Image(systemName: "chevron.down").font(.caption2.weight(.bold)) }
+                Image(systemName: "chevron.down").font(.caption2.weight(.bold))
             }
         }
-        .disabled(app.vaults.count < 2 && app.servers.count < 2)
+        .disabled(app.vaults.isEmpty)
         .accessibilityIdentifier("vault-menu")
+        .sheet(item: $people) { PeopleView(vault: $0) }
+        .alert("Your name for this vault", isPresented: $renaming) {
+            TextField("slug", text: $text).rawTextEntry()
+            Button("Rename") {
+                let to = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if let from = app.vault, !to.isEmpty, to != from { Task { await app.renameVault(from, to: to) } }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Letters, digits, - and _. Only your view changes; nobody else's name for it does.")
+        }
+        .alert("New vault", isPresented: $creating) {
+            TextField("name", text: $text)
+            Button("Create") {
+                let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty { Task { await app.createVault(name: name) } }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("A separate set of collections, photos and records.")
+        }
     }
 }
 
