@@ -24,11 +24,15 @@ import misk.web.Response
 import misk.web.ResponseBody
 import misk.web.ResponseContentType
 import misk.web.actions.WebAction
+import misk.exceptions.WebActionException
 import misk.web.mediatype.MediaTypes
 import okhttp3.Headers
 import okio.BufferedSink
 import okio.ByteString
 import okio.source
+import tcj.feedz.FeedPage
+import tcj.feedz.Feedz
+import tcj.feedz.FeedzException
 
 private const val JSON = MediaTypes.APPLICATION_JSON
 
@@ -276,16 +280,28 @@ class RecordActions @Inject constructor(private val store: RecordStore, private 
 
 // ------------------------------------------------------------------------------------- feeds
 
-data class PublishingReq(val enabled: Boolean)
 data class CursorReq(val feed: String, val cursor: Long, val shard: Int?, val shard_count: Int?)
 data class CursorResp(val consumer: String, val feed: String, val shard: Int, val cursor: Long)
 
-class FeedActions @Inject constructor(private val feeds: FeedService, private val publisher: FeedPublisher, private val ctx: VaultContext) : WebAction {
+/** misk-feedz says what went wrong and with which status; misk's stock 4xx exceptions reply with a bare word. */
+private inline fun <T> feedz(block: () -> T): T = try {
+  block()
+} catch (e: FeedzException) {
+  throw WebActionException(e.status, e.message ?: "error", e.message ?: "error")
+}
+
+/**
+ * Status, publishing and cursor operations are misk-feedz's own endpoints (`/_feeds/status`,
+ * `/_feeds/{feed}/cursors/{consumer}/...`, the page at `/_admin/feedz/`). What is snapz's is the
+ * fetch, because a feed here is scoped by vault, and the get/put cursor pair the scripts use.
+ */
+class FeedActions @Inject constructor(private val feedz: Feedz, private val ctx: VaultContext) : WebAction {
   /**
-   * The feed endpoint (feedz-compatible reply shape): {"entries": [...], "cursor": N}.
-   * Poll with after=<cursor>. Optional filters: collection= (photos), ns= (records),
-   * transform= (intents, results). With a vault named (header, ?vault=, or a pinned token) the
-   * feed carries that vault only; otherwise every vault, each entry saying which.
+   * The feed endpoint: {"feed", "entries": [...], "cursor": N}. Poll with after=<cursor>, or name a
+   * `consumer` to read from its server-side cursor (then commit the page's cursor). Optional
+   * filters: collection= (photos), ns= (records), transform= (intents, results). With a vault named
+   * (header, ?vault=, or a pinned token) the feed carries that vault only; otherwise every vault,
+   * each entry saying which.
    */
   @Get("/_feeds/fetch/{feed}")
   @Authenticated(capabilities = [USER])
@@ -296,58 +312,54 @@ class FeedActions @Inject constructor(private val feeds: FeedService, private va
     @QueryParam limit: Int?,
     @QueryParam shard: Int?,
     @QueryParam shard_count: Int?,
+    @QueryParam consumer: String?,
     @QueryParam collection: String?,
     @QueryParam ns: String?,
     @QueryParam transform: String?,
-  ) = feeds.fetch(feed, after ?: 0, limit ?: 100, shard, shard_count, ctx.explicit(), ctx.current(), collection, ns, transform)
+  ): FeedPage = feedz {
+    val params = buildMap {
+      ctx.explicit()?.let { put(FeedParams.VAULT_ID, it.id.toString()) }
+      put(FeedParams.CURRENT_VAULT_ID, ctx.current().id.toString())
+      collection?.let { put(FeedParams.COLLECTION, it) }
+      ns?.let { put(FeedParams.NS, it) }
+      transform?.let { put(FeedParams.TRANSFORM, it) }
+    }
+    if (consumer == null) return@feedz feedz.fetch(feed, after ?: 0, limit ?: 100, shard, shard_count, params)
+    if (after != null) throw BadRequestException("after and consumer are exclusive: a consumer's position is its cursor")
+    feedz.fetchFor(consumer, feed, limit ?: 100, shard ?: 0, shard_count ?: 1, params)
+  }
 
-  @Get("/_feeds/status")
-  @Authenticated(capabilities = [USER])
-  @ResponseContentType(JSON)
-  fun status() = feeds.status()
-
-  /** Server-side cursor storage so consumer scripts can be stateless. Unknown consumer = position 0. */
+  /**
+   * Where a consumer stands, for scripts that fetch with after=. Unknown consumer = 0, and nothing
+   * is created. A cursor an operator has disabled answers 409, so its consumer stops instead of
+   * working on pages it will not be allowed to commit.
+   */
   @Get("/_feeds/cursors/{consumer}")
   @Authenticated(capabilities = [USER])
   @ResponseContentType(JSON)
-  fun cursor(@PathParam consumer: String, @QueryParam feed: String, @QueryParam shard: Int?) =
-    consumer.unescaped().let { CursorResp(it, feed, shard ?: 0, feeds.cursor(it, feed, shard ?: 0)) }
+  fun cursor(@PathParam consumer: String, @QueryParam feed: String, @QueryParam shard: Int?): CursorResp = feedz {
+    val name = consumer.unescaped()
+    val cur = feedz.cursors.get(name, feed, shard ?: 0)
+    if (cur != null && !cur.enabled) throw WebActionException(409, "cursor $name/$feed is disabled", "cursor $name/$feed is disabled")
+    CursorResp(name, feed, shard ?: 0, cur?.position ?: 0)
+  }
 
+  /**
+   * A consumer sets its own position: forward is a commit (refused while the cursor is disabled),
+   * backward is a rewind of its own cursor. Operators use misk-feedz's seek/enable/disable instead.
+   */
   @Put("/_feeds/cursors/{consumer}")
   @Authenticated(capabilities = [USER])
   @RequestContentType(JSON)
   @ResponseContentType(JSON)
-  fun setCursor(@PathParam consumer: String, @RequestBody req: CursorReq): CursorResp {
+  fun setCursor(@PathParam consumer: String, @RequestBody req: CursorReq): CursorResp = feedz {
     if (req.cursor < 0) throw BadRequestException("cursor must be >= 0")
-    feeds.setCursor(consumer.unescaped(), req.feed, req.shard ?: 0, req.shard_count ?: 1, req.cursor)
-    return CursorResp(consumer.unescaped(), req.feed, req.shard ?: 0, req.cursor)
-  }
-
-  @Delete("/_feeds/cursors/{consumer}")
-  @Authenticated(capabilities = [USER])
-  @ResponseContentType(JSON)
-  fun deleteCursor(@PathParam consumer: String, @QueryParam feed: String): Ok {
-    feeds.deleteCursor(consumer.unescaped(), feed)
-    return Ok()
-  }
-
-  /**
-   * Publish pending rows now instead of waiting for the next tick. `feed=` limits it to one feed;
-   * `force=true` publishes even where publishing is switched off (stepping a paused feed by hand).
-   */
-  @Post("/_feeds/publish")
-  @Authenticated(capabilities = [USER])
-  @ResponseContentType(JSON)
-  fun publish(@QueryParam feed: String?, @QueryParam force: Boolean?) = mapOf("published" to publisher.publishAll(feed, force == true))
-
-  /** The per-feed publish switch. Off = mutations accumulate as pending; consumers see nothing new. */
-  @Put("/_feeds/publishing/{feed}")
-  @Authenticated(capabilities = [ADMIN])
-  @RequestContentType(JSON)
-  @ResponseContentType(JSON)
-  fun setPublishing(@PathParam feed: String, @RequestBody req: PublishingReq): Ok {
-    publisher.setEnabled(feed, req.enabled)
-    return Ok()
+    val name = consumer.unescaped()
+    val shard = req.shard ?: 0
+    val cur = feedz.cursors.open(name, req.feed, shard, req.shard_count ?: 1)
+    if (req.cursor > cur.position) feedz.cursors.commit(name, req.feed, shard, req.cursor)
+    else if (req.cursor < cur.position) feedz.cursors.seek(name, req.feed, shard, req.cursor)
+    CursorResp(name, req.feed, shard, req.cursor)
   }
 }
 

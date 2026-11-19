@@ -42,6 +42,9 @@ const val USER = "snapz_user"
 const val SESSION_COOKIE = "snapz_session"
 const val READ_ONLY = "read_only"
 
+/** misk-feedz: a consumer committing its own cursor. */
+private val CURSOR_COMMIT = Regex("/_feeds/[^/]+/cursors/[^/]+/commit")
+
 /** `Authorization: Bearer <token>` (scripts, iOS) or the session cookie (web). */
 fun HttpCall.presentedToken(): String? {
   val auth = requestHeaders["Authorization"]
@@ -61,7 +64,8 @@ class SnapzAuthenticator @Inject constructor(
     val resolved = tokens.resolve(token) ?: oidc.bearer(token) ?: return null
     // Read-only: reads, plus the one write a stateless feed consumer needs (its own cursor).
     val mayCall = !resolved.readOnly || call.dispatchMechanism == DispatchMechanism.GET ||
-      (call.dispatchMechanism == DispatchMechanism.PUT && call.url.encodedPath.startsWith("/_feeds/cursors/"))
+      (call.dispatchMechanism == DispatchMechanism.PUT && call.url.encodedPath.startsWith("/_feeds/cursors/")) ||
+      (call.dispatchMechanism == DispatchMechanism.POST && CURSOR_COMMIT.matches(call.url.encodedPath))
     return MiskCaller(
       user = resolved.principal,
       capabilities = buildSet {

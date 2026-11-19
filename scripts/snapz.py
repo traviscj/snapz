@@ -453,9 +453,9 @@ def _main():
         print(f"{'feed':<12} {'sequence':>9} {'rows':>7} {'pending':>8}")
         for f in st["feeds"]:
             print(f"{f['feed']:<12} {f['sequence']:>9} {f['rows']:>7} {f['pending']:>8}")
-        print(f"\n{'consumer':<24} {'feed':<12} {'cursor':>8} {'lag':>6}  updated")
+        print(f"\n{'consumer':<24} {'feed':<12} {'cursor':>8} {'lag':>6}  {'state':<5} advanced")
         for c in st["cursors"]:
-            print(f"{c['consumer']:<24} {c['feed']:<12} {c['cursor']:>8} {c.get('lag', ''):>6}  {c['updated_at']}")
+            print(f"{c['consumer']:<24} {c['feed']:<12} {c.get('token') or 0:>8} {c.get('lag', ''):>6}  {'on' if c['enabled'] else 'OFF':<5} {c.get('last_advanced_at') or '-'}")
     elif a.cmd == "ls":
         if a.collection:
             for ph in sz.photos(a.collection):

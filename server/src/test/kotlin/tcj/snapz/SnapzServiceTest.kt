@@ -90,7 +90,7 @@ class SnapzServiceTest {
   @Inject lateinit var jetty: JettyService
   @Inject lateinit var db: Db
   @Inject lateinit var json: Json
-  @Inject lateinit var publisher: FeedPublisher
+  @Inject lateinit var publisher: tcj.feedz.FeedPublisher
   @Inject lateinit var blobs: BlobStore
   @Inject lateinit var runner: TransformRunner
   @Inject lateinit var clock: java.time.Clock
@@ -332,7 +332,22 @@ class SnapzServiceTest {
     val status = api("GET", "/_feeds/status")
     val photos = status.list("feeds").first { it["feed"] == "photos" }
     assertThat(photos).containsEntry("sequence", 5L).containsEntry("pending", 0L).containsEntry("rows", 3L)
-    assertThat(status.list("cursors").single()).containsEntry("consumer", "orders").containsEntry("lag", 2L)
+    assertThat(status.list("cursors").single()).containsEntry("consumer", "orders").containsEntry("token", "3").containsEntry("lag", 2L).containsEntry("enabled", true)
+
+    // the same cursor through misk-feedz: fetch by consumer, commit the page's cursor
+    val mine = api("GET", "/_feeds/fetch/photos?consumer=orders")
+    assertThat(mine.list("entries").map { it["token"] }).isEqualTo(listOf(t1, t2))
+    assertThat(api("POST", "/_feeds/photos/cursors/orders/commit?token=${mine["cursor"]}")).containsEntry("advanced", true)
+    assertThat(api("GET", "/_feeds/cursors/orders?feed=photos")["cursor"]).isEqualTo(5L)
+    assertThat(call("PUT", "/_feeds/cursors/orders", mapOf("feed" to "photos", "cursor" to 99)).code).describedAs("past the head").isEqualTo(400)
+    // a consumer may rewind itself; an operator may switch it off, and then it is told so
+    api("PUT", "/_feeds/cursors/orders", mapOf("feed" to "photos", "cursor" to 0))
+    assertThat(api("GET", "/_feeds/cursors/orders?feed=photos")["cursor"]).isEqualTo(0L)
+    api("POST", "/_feeds/photos/cursors/orders/disable")
+    assertThat(call("GET", "/_feeds/cursors/orders?feed=photos").code).isEqualTo(409)
+    assertThat(call("GET", "/_feeds/fetch/photos?consumer=orders").code).isEqualTo(409)
+    assertThat(call("PUT", "/_feeds/cursors/orders", mapOf("feed" to "photos", "cursor" to 2)).code).isEqualTo(409)
+    assertThat(api("GET", "/_feeds/fetch/photos?after=3").list("entries")).describedAs("stateless fetch is not the cursor's business").hasSize(2)
 
     assertThat(api("GET", "/_feeds/fetch/collections").list("entries").map { it["slug"] }).isEqualTo(listOf("pantry", "work"))
     assertThat(call("GET", "/_feeds/fetch/nope").code).isEqualTo(404)
@@ -342,7 +357,7 @@ class SnapzServiceTest {
   fun `a feed's publish switch holds rows back until re-enabled or stepped`() {
     api("POST", "/api/collections", mapOf("name" to "pantry"))
     publisher.publishAll()
-    api("PUT", "/_feeds/publishing/photos", mapOf("enabled" to false))
+    api("POST", "/_feeds/photos/pause")
     val t1 = upload("pantry", jpeg(color = Color.BLUE))["token"]
     assertThat(publisher.publishAll()).isEqualTo(0)
     val st = api("GET", "/_feeds/status").list("feeds").first { it["feed"] == "photos" }
@@ -358,9 +373,9 @@ class SnapzServiceTest {
 
     upload("pantry", jpeg(color = Color.GREEN))
     assertThat(publisher.publishAll()).isEqualTo(0)
-    api("PUT", "/_feeds/publishing/photos", mapOf("enabled" to true))
+    api("POST", "/_feeds/photos/resume")
     assertThat(publisher.publishAll()).isEqualTo(1)
-    assertThat(call("PUT", "/_feeds/publishing/nope", mapOf("enabled" to true)).code).isEqualTo(404)
+    assertThat(call("POST", "/_feeds/nope/resume").code).isEqualTo(404)
   }
 
   @Test
@@ -796,7 +811,9 @@ class SnapzServiceTest {
     assertThat(call("POST", "/api/photos?collection=pantry", token = token, raw = jpeg()).code).isEqualTo(403)
     assertThat(call("DELETE", "/api/collections/pantry", token = token).code).isEqualTo(403)
     // the one write a feed consumer needs
-    assertThat(call("PUT", "/_feeds/cursors/dash", mapOf("feed" to "photos", "cursor" to 3), token = token).code).isEqualTo(200)
+    assertThat(call("PUT", "/_feeds/cursors/dash", mapOf("feed" to "photos", "cursor" to 0), token = token).code).isEqualTo(200)
+    assertThat(call("POST", "/_feeds/photos/cursors/dash/commit?token=0", token = token).code).isEqualTo(200)
+    assertThat(call("POST", "/_feeds/photos/cursors/dash/seek?token=0", token = token).code).describedAs("operator action").isEqualTo(403)
     assertThat(call("POST", "/api/tokens", mapOf("name" to "x", "ttl_days" to 0)).code).isEqualTo(400)
     db.tx { c -> c.exec("UPDATE api_tokens SET expires_at_ms = 1") }
     assertThat(call("GET", "/api/me", token = token).code).isEqualTo(401)

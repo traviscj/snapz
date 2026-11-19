@@ -13,6 +13,10 @@ import misk.web.WebActionModule
 import misk.web.dashboard.AdminDashboardAccess
 import misk.web.dashboard.AdminDashboardModule
 import misk.web.metadata.all.AllMetadataAccess
+import tcj.feedz.FeedzAccess
+import tcj.feedz.FeedzConfig
+import tcj.feedz.FeedzDashboardTabModule
+import tcj.feedz.FeedzModule
 
 /** Everything except deployment + web server wiring, which differ between app and tests. */
 class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
@@ -37,7 +41,18 @@ class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
     multibind<MiskCallerAuthenticator>().to<SnapzAuthenticator>()
 
     install(JdbcModule(SnapzDb::class, config.data_source))
-    install(ServiceModule<FeedPublisher>().dependsOn<SchemaMigratorService>(SnapzDb::class))
+    // Feeds: publisher, cursors, /_feeds/status and the operator endpoints come from misk-feedz. The
+    // fetch endpoint is snapz's own (FeedActions), since a feed here is scoped by the caller's vault.
+    install(
+      FeedzModule(
+        SnapzDb::class,
+        FeedzConfig(tick_ms = config.snapz.feed_publish_interval_ms, fetch_endpoint = false, admin_page = false),
+        read = FeedzAccess(capabilities = listOf(USER)),
+        admin = FeedzAccess(capabilities = listOf(ADMIN)),
+      ),
+    )
+    install(FeedzDashboardTabModule())   // /_admin/feedz/, a tab of the dashboard above
+    install(SnapzFeedsModule())
     install(ServiceModule<TransformRunner>().dependsOn<SchemaMigratorService>(SnapzDb::class))
 
     install(WebActionModule.create<WebUiAction>())

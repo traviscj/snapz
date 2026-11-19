@@ -1,197 +1,59 @@
 package tcj.snapz
 
-import com.google.common.util.concurrent.AbstractIdleService
-import java.time.Clock
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
-import javax.inject.Inject
-import javax.inject.Singleton
-import misk.exceptions.NotFoundException
-import misk.logging.getLogger
-
-/** feed name -> backing table. Every feed table carries (id, feed_sync_id, shard). */
-val FEEDS = linkedMapOf(
-  "photos" to "photos", "collections" to "collections", "records" to "records", "vaults" to "vaults",
-  "intents" to "transform_intents", "results" to "transform_results",
-)
-
-fun feedTable(feed: String): String = FEEDS[feed] ?: throw NotFoundException("no feed '$feed' (have: ${FEEDS.keys.joinToString()})")
+import com.google.inject.multibindings.ProvidesIntoSet
+import misk.inject.KAbstractModule
+import tcj.feedz.FeedQuery
+import tcj.feedz.FeedSource
+import tcj.feedz.feedSource
 
 /**
- * feedz-style publisher: the tables are the feed. Every mutation NULLs a row's feed_sync_id; this
- * assigns fresh, monotonically increasing ids from `sequences`, one transaction per batch.
- * Republished rows get a new, higher id, so a consumer paging `feed_sync_id > cursor` sees every
- * row's latest state at least once.
- *
- * Ids are allocated and committed under the sequence row lock, so they become visible in order:
- * a consumer can never observe id N+1 and later have N appear behind its cursor. That only holds
- * with a single publisher per database, which is what this is.
+ * Filters a feed's fetch understands, carried as [FeedQuery.params]. [FeedActions] builds them from
+ * the caller's vault context and the named query parameters; nothing else from the request gets in.
  */
-@Singleton
-class FeedPublisher @Inject constructor(
-  private val db: Db,
-  private val config: SnapzConfig,
-) : AbstractIdleService() {
-  private lateinit var executor: ScheduledExecutorService
-
-  override fun startUp() {
-    val period = config.snapz.feed_publish_interval_ms
-    executor = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "feed-publisher").apply { isDaemon = true } }
-    executor.scheduleWithFixedDelay({
-      try {
-        publishAll()
-      } catch (e: Exception) {
-        logger.error(e) { "feed publish failed; will retry" }
-      }
-    }, period, period, TimeUnit.MILLISECONDS)
-  }
-
-  override fun shutDown() {
-    executor.shutdownNow()
-  }
-
-  /**
-   * Drains feeds; returns rows published. A feed whose publishing is switched off is skipped
-   * unless [force] — its rows stay pending (feed_sync_id NULL), invisible to consumers, until it
-   * is switched back on or stepped by hand. [only] restricts the run to one feed.
-   */
-  @Synchronized
-  fun publishAll(only: String? = null, force: Boolean = false): Int = FEEDS.keys.filter { only == null || it == only }.sumOf { feed ->
-    var total = 0
-    do {
-      val n = publishBatch(feed, force)
-      total += n
-    } while (n == BATCH)
-    total
-  }
-
-  /** Persisted per feed, so a pause survives restarts. */
-  fun setEnabled(feed: String, enabled: Boolean) {
-    feedTable(feed)
-    db.tx { c ->
-      c.exec("INSERT IGNORE INTO sequences (name, value) VALUES (?, 0)", listOf(feed))
-      c.exec("UPDATE sequences SET publishing_enabled = ? WHERE name = ?", listOf(enabled, feed))
-    }
-  }
-
-  private fun publishBatch(feed: String, force: Boolean): Int = db.tx { c ->
-    val table = feedTable(feed)
-    val pending = c.select("SELECT id FROM $table WHERE feed_sync_id IS NULL AND shard >= 0 ORDER BY id LIMIT $BATCH") { it.getLong(1) }
-    if (pending.isEmpty()) return@tx 0
-    c.exec("INSERT IGNORE INTO sequences (name, value) VALUES (?, 0)", listOf(feed))
-    val (current, enabled) = c.select("SELECT value, publishing_enabled FROM sequences WHERE name = ? FOR UPDATE", listOf(feed)) { it.getLong(1) to it.getBoolean(2) }.first()
-    if (!enabled && !force) return@tx 0
-    var seq = current
-    c.prepareStatement("UPDATE $table SET feed_sync_id = ? WHERE id = ? AND feed_sync_id IS NULL").use { ps ->
-      for (id in pending) {
-        ps.setLong(1, ++seq)
-        ps.setLong(2, id)
-        ps.addBatch()
-      }
-      ps.executeBatch()
-    }
-    c.exec("UPDATE sequences SET value = ? WHERE name = ?", listOf(seq, feed))
-    pending.size
-  }
-
-  companion object {
-    private const val BATCH = 500
-    private val logger = getLogger<FeedPublisher>()
-  }
+object FeedParams {
+  /** Only this vault's entries. Absent = every vault. */
+  const val VAULT_ID = "vault_id"
+  /** The vault a `collection` slug is resolved in. */
+  const val CURRENT_VAULT_ID = "current_vault_id"
+  const val COLLECTION = "collection"
+  const val NS = "ns"
+  const val TRANSFORM = "transform"
 }
 
-data class FeedPage(val feed: String, val entries: List<Any>, val cursor: Long)
+private val FeedQuery.vaultId get() = params[FeedParams.VAULT_ID]?.toLong()
 
-data class CursorDto(
-  val consumer: String,
-  val feed: String,
-  val shard: Int,
-  val shard_count: Int,
-  val cursor: Long,
-  val lag: Long?,
-  val updated_at: String,
-)
+/** Rows with a negative shard are held back: never published, never fetched. */
+private const val PUBLISHABLE = "shard >= 0"
 
-data class FeedStatusDto(val feed: String, val sequence: Long, val rows: Long, val pending: Long, val unpublished: Long, val publishing_enabled: Boolean)
+/**
+ * The feeds, on misk-feedz: each is a table whose rows carry (id, feed_sync_id, shard) and whose
+ * mutations NULL feed_sync_id. The library publishes (one publisher per database), pages and keeps
+ * consumer cursors; these say which tables, and how a page of each is read as its DTO.
+ */
+class SnapzFeedsModule : KAbstractModule() {
+  override fun configure() {}
 
-data class FeedsStatus(val feeds: List<FeedStatusDto>, val cursors: List<CursorDto>)
-
-@Singleton
-class FeedService @Inject constructor(
-  private val db: Db,
-  private val clock: Clock,
-  private val photos: PhotoStore,
-  private val collections: CollectionStore,
-  private val records: RecordStore,
-  private val transforms: TransformStore,
-  private val vaults: VaultStore,
-) {
-  /**
-   * One page of entries with feed_sync_id > [after], ascending. `cursor` in the reply is the
-   * position to pass as the next `after` (unchanged when the page is empty). [vault] null = every
-   * vault; a `collection` filter is a slug in [current].
-   */
-  fun fetch(feed: String, after: Long, limit: Int, shard: Int?, shardCount: Int?, vault: Vault?, current: Vault, collection: String?, ns: String?, transform: String? = null): FeedPage {
-    val n = limit.coerceIn(1, 1000)
-    val v = vault?.id
-    val (entries, last) = when (feed) {
-      "photos" -> photos.feed(after, n, shard, shardCount, v, current.id, collection).let { it to it.lastOrNull()?.feed_sync_id }
-      "collections" -> collections.feed(after, n, shard, shardCount, v).let { it to it.lastOrNull()?.feed_sync_id }
-      "records" -> records.feed(after, n, shard, shardCount, v, ns).let { it to it.lastOrNull()?.feed_sync_id }
-      "vaults" -> vaults.feed(after, n, shard, shardCount, v).let { it to it.lastOrNull()?.feed_sync_id }
-      "intents" -> transforms.intentFeed(after, n, shard, shardCount, v, transform).let { it to it.lastOrNull()?.feed_sync_id }
-      "results" -> transforms.resultFeed(after, n, shard, shardCount, v, transform).let { it to it.lastOrNull()?.feed_sync_id }
-      else -> throw NotFoundException("no feed '$feed' (have: ${FEEDS.keys.joinToString()})")
+  @ProvidesIntoSet fun photos(store: PhotoStore): FeedSource =
+    feedSource<PhotoDto>("photos", "photos", PUBLISHABLE, syncId = { it.feed_sync_id }) { q ->
+      store.feed(q.after, q.limit, q.shard, q.shardCount, q.vaultId, q.params[FeedParams.CURRENT_VAULT_ID]?.toLong() ?: -1, q.params[FeedParams.COLLECTION])
     }
-    return FeedPage(feed, entries, last ?: after)
-  }
 
-  fun cursor(consumer: String, feed: String, shard: Int): Long {
-    feedTable(feed)
-    return db.tx { c ->
-      c.select("SELECT position FROM feed_cursors WHERE consumer = ? AND feed = ? AND shard = ?", listOf(consumer, feed, shard)) { it.getLong(1) }.firstOrNull() ?: 0L
-    }
-  }
+  @ProvidesIntoSet fun collections(store: CollectionStore): FeedSource =
+    feedSource<CollectionDto>("collections", "collections", PUBLISHABLE, syncId = { it.feed_sync_id }) { q -> store.feed(q.after, q.limit, q.shard, q.shardCount, q.vaultId) }
 
-  fun setCursor(consumer: String, feed: String, shard: Int, shardCount: Int, position: Long) {
-    feedTable(feed)
-    db.tx { c ->
-      c.exec(
-        """
-        INSERT INTO feed_cursors (consumer, feed, shard, shard_count, position, updated_at_ms) VALUES (?,?,?,?,?,?)
-        ON DUPLICATE KEY UPDATE position = VALUES(position), shard_count = VALUES(shard_count), updated_at_ms = VALUES(updated_at_ms)
-        """.trimIndent(),
-        listOf(consumer, feed, shard, shardCount, position, clock.millis()),
-      )
-    }
-  }
+  @ProvidesIntoSet fun records(store: RecordStore): FeedSource =
+    feedSource<RecordDto>("records", "records", PUBLISHABLE, syncId = { it.feed_sync_id }) { q -> store.feed(q.after, q.limit, q.shard, q.shardCount, q.vaultId, q.params[FeedParams.NS]) }
 
-  fun deleteCursor(consumer: String, feed: String): Int = db.tx { c ->
-    c.exec("DELETE FROM feed_cursors WHERE consumer = ? AND feed = ?", listOf(consumer, feed))
-  }
+  @ProvidesIntoSet fun vaults(store: VaultStore): FeedSource =
+    feedSource<VaultDto>("vaults", "vaults", PUBLISHABLE, syncId = { it.feed_sync_id }) { q -> store.feed(q.after, q.limit, q.shard, q.shardCount, q.vaultId) }
 
-  fun status(): FeedsStatus = db.tx { c ->
-    val seqs = c.select("SELECT name, value FROM sequences") { it.getString(1) to it.getLong(2) }.toMap()
-    val paused = c.select("SELECT name FROM sequences WHERE publishing_enabled = 0") { it.getString(1) }.toSet()
-    val feeds = FEEDS.map { (feed, table) ->
-      c.select("SELECT COUNT(*), COALESCE(SUM(feed_sync_id IS NULL AND shard >= 0), 0), COALESCE(SUM(shard < 0), 0) FROM $table") {
-        FeedStatusDto(feed, seqs[feed] ?: 0, it.getLong(1), it.getLong(2), it.getLong(3), feed !in paused)
-      }.first()
+  @ProvidesIntoSet fun intents(store: TransformStore): FeedSource =
+    feedSource<IntentDto>("intents", "transform_intents", PUBLISHABLE, syncId = { it.feed_sync_id }) { q ->
+      store.intentFeed(q.after, q.limit, q.shard, q.shardCount, q.vaultId, q.params[FeedParams.TRANSFORM])
     }
-    val cursors = c.select("SELECT * FROM feed_cursors ORDER BY feed, consumer, shard") { rs ->
-      val feed = rs.getString("feed")
-      val pos = rs.getLong("position")
-      CursorDto(
-        consumer = rs.getString("consumer"),
-        feed = feed,
-        shard = rs.getInt("shard"),
-        shard_count = rs.getInt("shard_count"),
-        cursor = pos,
-        lag = seqs[feed]?.let { it - pos },
-        updated_at = iso(rs.getLong("updated_at_ms")),
-      )
+
+  @ProvidesIntoSet fun results(store: TransformStore): FeedSource =
+    feedSource<ResultDto>("results", "transform_results", PUBLISHABLE, syncId = { it.feed_sync_id }) { q ->
+      store.resultFeed(q.after, q.limit, q.shard, q.shardCount, q.vaultId, q.params[FeedParams.TRANSFORM])
     }
-    FeedsStatus(feeds, cursors)
-  }
 }

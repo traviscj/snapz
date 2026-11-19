@@ -28,12 +28,15 @@ class SecurityHeaders @Inject constructor(config: SnapzConfig) : NetworkIntercep
       call.setResponseHeader("Referrer-Policy", "no-referrer")
       val path = call.url.encodedPath
       val own = path == "/" || OWN_PREFIXES.any { path.startsWith(it) }
-      call.setResponseHeader("X-Frame-Options", if (own) "DENY" else "SAMEORIGIN")
+      // The feeds page is shown as a tab (an iframe) of the admin dashboard, so it alone may be framed, by us.
+      val framed = path == FEEDS_PAGE
+      call.setResponseHeader("X-Frame-Options", if (own && !framed) "DENY" else "SAMEORIGIN")
       call.setResponseHeader("Cross-Origin-Resource-Policy", "same-origin")
       call.setResponseHeader(
         "Content-Security-Policy",
         when {
           path.startsWith("/blobs/") -> BLOB_CSP
+          framed -> PAGE_CSP.replace("frame-ancestors 'none'", "frame-ancestors 'self'")
           own -> PAGE_CSP
           else -> DASHBOARD_CSP
         },
@@ -54,6 +57,7 @@ class SecurityHeaders @Inject constructor(config: SnapzConfig) : NetworkIntercep
     const val DASHBOARD_CSP = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; frame-ancestors 'self'"
     /** Everything snapz itself serves; any other path belongs to misk. */
     val OWN_PREFIXES = listOf("/api/", "/auth/", "/_feeds/", "/blobs/", "/icon.png")
+    const val FEEDS_PAGE = "/_feeds/ui"
     const val BLOB_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
   }
 }

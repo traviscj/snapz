@@ -836,28 +836,28 @@ function photoKeys(ev) {
 
 // ---------------------------------------------------------------------------- feeds tab
 async function feedsTab() {
-  main.innerHTML = `<div class="pane"><div class="cols"><div><h3>feeds</h3><div id="f-feeds"></div></div><div><h3>consumers</h3><div id="f-cursors"></div></div></div>
+  main.innerHTML = `<div class="pane"><div class="cols"><div><h3>feeds</h3><div id="f-feeds"></div></div><div><h3>consumers ${S.me.admin ? `<a class="dim" style="font-weight:400" href="/_admin/feedz/" target="_blank" title="enable/disable, seek, reshard, delete">operate ↗</a>` : ""}</h3><div id="f-cursors"></div></div></div>
     <h3>tail <span class="dim" style="font-weight:400">— newest 40 entries per feed across every vault, by feed_sync_id</span></h3><div id="f-tail"></div>
     <h3>consume</h3><pre class="dim" style="margin:0">curl -H "Authorization: Bearer $SNAPZ_TOKEN" "${esc(location.origin)}/_feeds/fetch/photos?after=0&limit=100&vault=${esc(S.vault)}&collection=pantry"
 → {"feed":"photos","entries":[…],"cursor":N}   # poll again with after=N; scripts/snapz.py wraps this loop</pre></div>`;
   startPoll(async () => {
     const st = await api("GET", "/_feeds/status");
     const seq = Object.fromEntries(st.feeds.map(f => [f.feed, f.sequence]));
-    $("#f-feeds").innerHTML = `<table><thead><tr><th>feed</th><th class="n">sequence</th><th class="n">rows</th><th class="n">pending</th><th class="n">unpub</th><th>publishing</th><th></th></tr></thead><tbody>` +
-      st.feeds.map(f => `<tr><td>${esc(f.feed)}</td><td class="n">${f.sequence}</td><td class="n">${f.rows}</td><td class="n ${f.pending ? (f.publishing_enabled ? "warn" : "bad") : "dim"}">${f.pending}</td><td class="n dim">${f.unpublished}</td>
+    $("#f-feeds").innerHTML = `<table><thead><tr><th>feed</th><th class="n">sequence</th><th class="n">rows</th><th class="n">pending</th><th class="n" title="rows held back from the feed (negative shard)">held</th><th>publishing</th><th></th></tr></thead><tbody>` +
+      st.feeds.map(f => `<tr><td>${esc(f.feed)}</td><td class="n">${f.sequence}</td><td class="n">${f.rows}</td><td class="n ${f.pending ? (f.publishing_enabled ? "warn" : "bad") : "dim"}">${f.pending}</td><td class="n dim">${f.held}</td>
         <td><button class="${f.publishing_enabled ? "on" : "off"}" data-pub="${esc(f.feed)}" data-to="${f.publishing_enabled ? 0 : 1}" title="${f.publishing_enabled ? "publishing every tick — click to pause" : "PAUSED: mutations pile up as pending, consumers see nothing new — click to resume"}">${f.publishing_enabled ? "ON" : "PAUSED"}</button></td>
         <td><button data-step="${esc(f.feed)}" ${f.pending ? "" : "disabled"} title="publish this feed's pending rows now, even while paused">publish now</button></td></tr>`).join("") + `</tbody></table>`;
     $("#f-feeds").querySelectorAll("[data-pub]").forEach(b => b.onclick = async () => {
-      await run(`${b.dataset.to === "1" ? "resume" : "pause"} ${b.dataset.pub}`, () => api("PUT", `/_feeds/publishing/${b.dataset.pub}`, { enabled: b.dataset.to === "1" }));
+      await run(`${b.dataset.to === "1" ? "resume" : "pause"} ${b.dataset.pub}`, () => api("POST", `/_feeds/${b.dataset.pub}/${b.dataset.to === "1" ? "resume" : "pause"}`));
       poller?.tick();
     });
     $("#f-feeds").querySelectorAll("[data-step]").forEach(b => b.onclick = async () => {
-      const r = await run(`publish ${b.dataset.step}`, () => api("POST", `/_feeds/publish?feed=${b.dataset.step}&force=true`));
+      const r = await run(`publish ${b.dataset.step}`, () => api("POST", `/_feeds/publish?feed=${b.dataset.step}`));
       say(`published ${r.published} ${b.dataset.step}`, "ok"); poller?.tick();
     });
-    $("#f-cursors").innerHTML = st.cursors.length ? `<table><thead><tr><th>consumer</th><th>feed</th><th class="n">shard</th><th class="n">cursor</th><th class="n">lag</th><th>updated</th><th class="n">age</th><th></th></tr></thead><tbody>` +
-      st.cursors.map(c => `<tr><td>${esc(c.consumer)}</td><td>${esc(c.feed)}</td><td class="n dim">${c.shard}/${c.shard_count}</td><td class="n">${c.cursor}</td>
-        <td class="n ${c.lag > 100 ? "bad" : c.lag > 0 ? "warn" : "ok"}">${c.lag ?? ""}</td><td>${fmtTs(c.updated_at)}</td><td class="n dim">${age(c.updated_at)}</td>
+    $("#f-cursors").innerHTML = st.cursors.length ? `<table><thead><tr><th>consumer</th><th>feed</th><th class="n">shard</th><th class="n">cursor</th><th class="n">lag</th><th>state</th><th title="last time a commit moved the cursor">advanced</th><th class="n">age</th><th></th></tr></thead><tbody>` +
+      st.cursors.map(c => `<tr><td>${esc(c.consumer)}</td><td>${esc(c.feed)}</td><td class="n dim">${c.shard}/${c.shard_count}</td><td class="n">${c.token ?? 0}</td>
+        <td class="n ${c.lag > 100 ? "bad" : c.lag > 0 ? "warn" : "ok"}">${c.lag ?? ""}</td><td class="${c.enabled ? "dim" : "bad"}" title="${c.enabled ? "" : "disabled " + fmtTs(c.updated_at)}">${c.enabled ? "on" : "OFF"}</td><td>${fmtTs(c.last_advanced_at)}</td><td class="n dim">${age(c.last_advanced_at)}</td>
         <td><button data-rewind="${esc(c.consumer)}" data-feed="${esc(c.feed)}" data-shard="${c.shard}" data-sc="${c.shard_count}" title="set cursor to 0: replay the whole feed">rewind</button></td></tr>`).join("") + `</tbody></table>`
       : `<span class="dim">no consumers have stored a cursor yet</span>`;
     const tails = await Promise.all(st.feeds.map(f => api("GET", `/_feeds/fetch/${f.feed}?after=${Math.max(0, f.sequence - 40)}&limit=40`, undefined, { vault: S.me.vault ?? null })));

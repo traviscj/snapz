@@ -144,10 +144,20 @@ single publisher (every 500 ms) assigns fresh monotonic ids per feed, so consume
 
     GET /_feeds/fetch/{photos|collections|records|vaults|intents|results}?after=N&limit=&collection=&ns=&transform=&shard=&shard_count=
         → {"feed": "photos", "entries": [...], "cursor": N'}        # poll again with after=N'
-    GET|PUT|DELETE /_feeds/cursors/{consumer}?feed=                  # server-side cursor storage
-    GET /_feeds/status                                               # sequences, pending, consumer lag
-    PUT /_feeds/publishing/{feed} {enabled}                          # per-feed publish switch
-    POST /_feeds/publish?feed=&force=true                            # publish now / step a paused feed
+    GET /_feeds/fetch/{feed}?consumer=NAME                           # the page after NAME's server-side cursor; 409 while it is disabled
+    POST /_feeds/{feed}/cursors/{consumer}/commit?token=N'           # move it (forward only)
+    GET|PUT /_feeds/cursors/{consumer}?feed=                         # what scripts/snapz.py uses: read / set own position (set lower = rewind)
+    GET /_feeds/status                                               # sequences, pending, cursors (token, lag, enabled, last_advanced_at)
+    POST /_feeds/{feed}/pause · /resume                              # per-feed publish switch (admin)
+    POST /_feeds/publish?feed=                                       # publish now, even while paused (admin)
+    POST /_feeds/{feed}/cursors/{consumer}/enable · /disable · /seek?token= · /reshard?shard_count=     (admin)
+    DELETE /_feeds/{feed}/cursors/{consumer}                         # (admin)
+
+Publishing, cursors and those endpoints are the [misk-feedz](https://github.com/traviscj/misk-feedz)
+library; the fetch is snapz's own, because a feed here is scoped by vault. Admins get its page (every
+feed and cursor, each operation shown as the `curl` it sends) as the **Feeds** tab of `/_admin/`.
+A cursor has two switches worth telling apart: `enabled`/`updated_at` move when an operator acts on
+it, `last_advanced_at` only when a commit moves it.
 
 ### transforms
 
