@@ -71,7 +71,7 @@ class SnapzTestModule : KAbstractModule() {
         oidc = OidcConfig(
           issuer = FakeIdp.issuer, client_id = "snapz", client_secret = "s3cret",
           allowed_emails = listOf("travis@example.com"), allowed_groups = listOf("snapz-users"),
-          bearer_audiences = listOf("snapz-cli"),
+          bearer_audiences = listOf("snapz-cli"), admin_groups = listOf("snapz-admins"),
         ),
       ),
     )
@@ -484,7 +484,8 @@ class SnapzServiceTest {
     )
     val me = obj(call("GET", "/api/me", token = jwt()))
     assertThat(me["principal"]).isEqualTo("travis@example.com")
-    assertThat(me["admin"]).isEqualTo(true)
+    assertThat(me["admin"]).describedAs("on the allowlist but not in an admin group").isEqualTo(false)
+    assertThat(obj(call("GET", "/api/me", token = jwt("groups" to listOf("snapz-admins"))))["admin"]).isEqualTo(true)
     assertThat(call("GET", "/api/me", token = jwt("aud" to "snapz-cli")).code).describedAs("an extra bearer audience").isEqualTo(200)
     assertThat(call("GET", "/api/me", token = jwt("email" to "ally@else.com", "groups" to listOf("snapz-users"))).code).describedAs("allowed by group").isEqualTo(200)
 
@@ -1026,5 +1027,36 @@ class SnapzServiceTest {
     assertThat(call("GET", "/_feeds/blobs/$lost", token = reader).code).isEqualTo(200)
     assertThat(call("PUT", "/_feeds/blobs/$lost", raw = lostBytes, token = reader).code).isEqualTo(403)
     assertThat(call("POST", "/_feeds/receive/intents", mapOf("entries" to listOf<Any>())).code).isEqualTo(400)
+  }
+
+  @Test
+  fun `admin is a group at the identity provider, and gates misk's dashboard too`() {
+    // Signed in through the provider without the admin group: a user, not an admin.
+    FakeIdp.user = mapOf("sub" to "u1", "email" to "travis@example.com", "groups" to listOf("snapz-users"))
+    val (s1, _) = startLogin("")
+    val plain = call("GET", "/auth/callback?code=c0de&state=$s1", token = null).header("Set-Cookie")!!.substringBefore(';')
+    assertThat(obj(call("GET", "/api/me", token = null, cookie = plain))).containsEntry("admin", false)
+    assertThat(call("GET", "/api/collections", token = null, cookie = plain).code).isEqualTo(200)
+    assertThat(call("GET", "/api/tokens", token = null, cookie = plain).code).isEqualTo(403)
+    assertThat(call("POST", "/api/vaults", mapOf("name" to "nope"), token = null, cookie = plain).code).isEqualTo(403)
+    assertThat(call("GET", "/_admin/", token = null, cookie = plain).code).isEqualTo(403)
+
+    // In the admin group at sign-in: the session carries it.
+    FakeIdp.user = mapOf("sub" to "u1", "email" to "travis@example.com", "groups" to listOf("snapz-users", "snapz-admins"))
+    val (s2, _) = startLogin("")
+    val admin = call("GET", "/auth/callback?code=c0de&state=$s2", token = null).header("Set-Cookie")!!.substringBefore(';')
+    assertThat(obj(call("GET", "/api/me", token = null, cookie = admin))).containsEntry("admin", true)
+    assertThat(call("GET", "/api/tokens", token = null, cookie = admin).code).isEqualTo(200)
+    val dash = call("GET", "/_admin/", token = null, cookie = admin)
+    assertThat(dash.code).isEqualTo(200)
+    assertThat(dash.header("Content-Security-Policy")).contains("'self'")
+
+    // Nobody signed in gets nothing; tokens minted by an admin keep working as before.
+    assertThat(call("GET", "/_admin/", token = null).code).isEqualTo(401)
+    assertThat(call("GET", "/no/such/page", token = null).code).describedAs("misk's catch-all is gated too").isEqualTo(401)
+    assertThat(call("GET", "/_status", token = null).code).isEqualTo(200)
+    assertThat(call("GET", "/_admin/").code).isEqualTo(200)
+    val pinned = api("POST", "/api/tokens", mapOf("name" to "work-bot", "vault" to "personal"))["token"] as String
+    assertThat(call("GET", "/_admin/", token = pinned).code).isEqualTo(403)
   }
 }

@@ -3,6 +3,10 @@ package tcj.snapz
 import javax.inject.Inject
 import javax.inject.Singleton
 import misk.Action
+import misk.MiskCaller
+import misk.exceptions.UnauthenticatedException
+import misk.exceptions.UnauthorizedException
+import misk.scope.ActionScoped
 import misk.web.DispatchMechanism
 import misk.web.HttpCall
 import misk.web.NetworkChain
@@ -22,9 +26,18 @@ class SecurityHeaders @Inject constructor(config: SnapzConfig) : NetworkIntercep
       val call = chain.httpCall
       call.setResponseHeader("X-Content-Type-Options", "nosniff")
       call.setResponseHeader("Referrer-Policy", "no-referrer")
-      call.setResponseHeader("X-Frame-Options", "DENY")
+      val path = call.url.encodedPath
+      val own = path == "/" || OWN_PREFIXES.any { path.startsWith(it) }
+      call.setResponseHeader("X-Frame-Options", if (own) "DENY" else "SAMEORIGIN")
       call.setResponseHeader("Cross-Origin-Resource-Policy", "same-origin")
-      call.setResponseHeader("Content-Security-Policy", if (call.url.encodedPath.startsWith("/blobs/")) BLOB_CSP else PAGE_CSP)
+      call.setResponseHeader(
+        "Content-Security-Policy",
+        when {
+          path.startsWith("/blobs/") -> BLOB_CSP
+          own -> PAGE_CSP
+          else -> DASHBOARD_CSP
+        },
+      )
       // Only when the deployment says it is https: on a plain-http LAN server this would be a lie.
       if (https) call.setResponseHeader("Strict-Transport-Security", "max-age=31536000")
       chain.proceed(call)
@@ -37,7 +50,37 @@ class SecurityHeaders @Inject constructor(config: SnapzConfig) : NetworkIntercep
     const val PAGE_CSP =
       "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:; " +
         "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    /** misk's admin dashboard (admin-only) brings its own scripts, styles and CDN assets. */
+    const val DASHBOARD_CSP = "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https:; frame-ancestors 'self'"
+    /** Everything snapz itself serves; any other path belongs to misk. */
+    val OWN_PREFIXES = listOf("/api/", "/auth/", "/_feeds/", "/blobs/", "/icon.png")
     const val BLOB_CSP = "default-src 'none'; sandbox; frame-ancestors 'none'"
+  }
+}
+
+/**
+ * misk's dashboard guards its tabs but serves its shell page (a catch-all route) to anyone. Here
+ * the whole of it is for admins: any path that is neither snapz's own nor a health check needs
+ * the admin capability, whatever misk would have let through.
+ */
+@Singleton
+class DashboardGate @Inject constructor(private val caller: @JvmSuppressWildcards ActionScoped<MiskCaller?>) : NetworkInterceptor.Factory {
+  private val interceptor = object : NetworkInterceptor {
+    override fun intercept(chain: NetworkChain) {
+      val path = chain.httpCall.url.encodedPath
+      val open = path == "/" || SecurityHeaders.OWN_PREFIXES.any { path.startsWith(it) } || path in HEALTH
+      if (!open) {
+        val who = caller.get() ?: throw UnauthenticatedException("sign in first")
+        if (ADMIN !in who.capabilities) throw UnauthorizedException("${who.principal} is not an admin")
+      }
+      chain.proceed(chain.httpCall)
+    }
+  }
+
+  override fun create(action: Action): NetworkInterceptor = interceptor
+
+  private companion object {
+    val HEALTH = setOf("/_status", "/_liveness", "/_readiness")
   }
 }
 

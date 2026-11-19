@@ -4,11 +4,15 @@ import misk.ServiceModule
 import misk.inject.KAbstractModule
 import misk.jdbc.JdbcModule
 import misk.jdbc.SchemaMigratorService
+import misk.security.authz.AccessAnnotationEntry
 import misk.security.authz.AccessControlModule
 import misk.security.authz.MiskCallerAuthenticator
 import misk.logging.getLogger
 import misk.web.NetworkInterceptor
 import misk.web.WebActionModule
+import misk.web.dashboard.AdminDashboardAccess
+import misk.web.dashboard.AdminDashboardModule
+import misk.web.metadata.all.AllMetadataAccess
 
 /** Everything except deployment + web server wiring, which differ between app and tests. */
 class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
@@ -20,6 +24,13 @@ class SnapzModule(private val config: SnapzConfig) : KAbstractModule() {
       check(fatal.isEmpty()) { "refusing to start: " + fatal.joinToString("; ") { it.message } }
     }
     multibind<NetworkInterceptor.Factory>().to<SecurityHeaders>()
+    multibind<NetworkInterceptor.Factory>().to<DashboardGate>()
+
+    // misk's own dashboard at /_admin/ (service status, config with secrets redacted, database,
+    // web actions): for holders of the admin capability only, same as snapz's admin routes.
+    install(AdminDashboardModule(isDevelopment = false))
+    multibind<AccessAnnotationEntry>().toInstance(AccessAnnotationEntry<AdminDashboardAccess>(capabilities = listOf(ADMIN)))
+    multibind<AccessAnnotationEntry>().toInstance(AccessAnnotationEntry<AllMetadataAccess>(capabilities = listOf(ADMIN)))
 
     // Without this, @Authenticated is decorative: misk only enforces it via AccessInterceptor.
     install(AccessControlModule())

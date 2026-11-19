@@ -4,7 +4,7 @@ snapz.example.net {
 	request_body {
 		max_size 64MB
 	}
-	@internal path /_status /_readiness /_liveness /_admin*
+	@internal path /_status /_readiness /_liveness
 	respond @internal 404
 	reverse_proxy 127.0.0.1:8788
 }

@@ -19,6 +19,7 @@ application {
 dependencies {
   implementation(libs.misk)
   implementation(libs.miskActions)
+  implementation(libs.miskAdmin)
   implementation(libs.miskConfig)
   implementation(libs.miskCore)
   implementation(libs.miskInject)

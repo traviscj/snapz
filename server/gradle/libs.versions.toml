@@ -12,6 +12,7 @@ junitEngine = { module = "org.junit.jupiter:junit-jupiter-engine" }
 junitPlatformLauncher = { module = "org.junit.platform:junit-platform-launcher" }
 
 misk = { module = "com.squareup.misk:misk", version.ref = "misk" }
+miskAdmin = { module = "com.squareup.misk:misk-admin", version.ref = "misk" }
 miskActions = { module = "com.squareup.misk:misk-actions", version.ref = "misk" }
 miskConfig = { module = "com.squareup.misk:misk-config", version.ref = "misk" }
 miskCore = { module = "com.squareup.misk:misk-core", version.ref = "misk" }

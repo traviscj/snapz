@@ -66,7 +66,7 @@ class SnapzAuthenticator @Inject constructor(
       user = resolved.principal,
       capabilities = buildSet {
         if (mayCall) add(USER)
-        if (resolved.vault == null && !resolved.readOnly) add(ADMIN)
+        if (resolved.vault == null && !resolved.readOnly && resolved.admin) add(ADMIN)
         resolved.vault?.let { add(vaultCapability(it)) }
         if (resolved.readOnly) add(READ_ONLY)
       },
@@ -99,7 +99,7 @@ class OidcClient @Inject constructor(
     val id = verifier.verify(token) ?: return null
     val user = OidcUser(id.subject, id.username, id.claims["name"] as? String, id.groups)
     if (!allowed(user)) return null
-    return ResolvedToken(null, "oidc", user.email ?: user.sub)
+    return ResolvedToken(null, "oidc", user.email ?: user.sub, admin = isAdmin(user))
   }
 
   @Volatile private var discovery: Map<String, Any?>? = null
@@ -165,6 +165,8 @@ class OidcClient @Inject constructor(
     )
   }
 
+  fun isAdmin(u: OidcUser): Boolean = oidc.admin_groups.isEmpty() || u.groups.any { it in oidc.admin_groups }
+
   fun allowed(u: OidcUser): Boolean =
     (u.email != null && oidc.allowed_emails.any { it.equals(u.email, ignoreCase = true) }) || u.groups.any { it in oidc.allowed_groups }
 
@@ -180,7 +182,7 @@ class OidcClient @Inject constructor(
 @Singleton
 class LoginStates @Inject constructor(private val clock: Clock) {
   data class Pending(val client: String, val appChallenge: String?, val returnTo: String, val idpVerifier: String, val atMs: Long)
-  data class IosCode(val principal: String, val appChallenge: String, val atMs: Long)
+  data class IosCode(val principal: String, val appChallenge: String, val atMs: Long, val admin: Boolean = true)
 
   private val pending = ConcurrentHashMap<String, Pending>()
   private val iosCodes = ConcurrentHashMap<String, IosCode>()
@@ -202,9 +204,9 @@ class LoginStates @Inject constructor(private val clock: Clock) {
 
   fun finish(state: String): Pending? = pending.remove(state)?.takeIf { it.atMs >= clock.millis() - TTL_MS }
 
-  fun issueIosCode(principal: String, appChallenge: String): String {
+  fun issueIosCode(principal: String, appChallenge: String, admin: Boolean): String {
     sweep()
-    return randomSecret(24).also { iosCodes[it] = IosCode(principal, appChallenge, clock.millis()) }
+    return randomSecret(24).also { iosCodes[it] = IosCode(principal, appChallenge, clock.millis(), admin) }
   }
 
   fun redeemIosCode(code: String): IosCode? = iosCodes.remove(code)?.takeIf { it.atMs >= clock.millis() - TTL_MS }
@@ -219,8 +221,8 @@ class Sessions @Inject constructor(private val config: SnapzConfig, private val 
   private val ttlMs get() = Duration.ofDays(config.snapz.session_ttl_days).toMillis()
 
   /** Set-Cookie value for a fresh web session. */
-  fun start(principal: String, name: String, vault: String? = null, readOnly: Boolean = false): String {
-    val (_, token) = tokens.create("session", name, principal, ttlMs, vault, readOnly)
+  fun start(principal: String, name: String, vault: String? = null, readOnly: Boolean = false, admin: Boolean = true): String {
+    val (_, token) = tokens.create("session", name, principal, ttlMs, vault, readOnly, admin)
     return cookie(token, ttlMs / 1000)
   }
 
@@ -278,9 +280,9 @@ class CallbackAction @Inject constructor(
     val principal = user.email ?: user.sub
     logger.info { "login ok: $principal via ${pending.client}" }
     return if (pending.client == "ios") {
-      redirect("${config.snapz.ios_redirect_scheme}://auth?code=" + states.issueIosCode(principal, pending.appChallenge!!))
+      redirect("${config.snapz.ios_redirect_scheme}://auth?code=" + states.issueIosCode(principal, pending.appChallenge!!, oidc.isAdmin(user)))
     } else {
-      redirect(pending.returnTo, "Set-Cookie" to sessions.start(principal, "web"))
+      redirect(pending.returnTo, "Set-Cookie" to sessions.start(principal, "web", admin = oidc.isAdmin(user)))
     }
   }
 
@@ -304,7 +306,7 @@ class DeviceTokenAction @Inject constructor(
   fun exchange(@RequestBody req: DeviceTokenReq): DeviceTokenResp {
     val issued = states.redeemIosCode(req.code) ?: throw UnauthenticatedException("unknown or expired code")
     if (!MessageDigest.isEqual(OidcClient.s256(req.verifier).toByteArray(), issued.appChallenge.toByteArray())) throw UnauthenticatedException("verifier mismatch")
-    val (_, token) = tokens.create("device", req.name?.takeIf { it.isNotBlank() } ?: "ios", issued.principal)
+    val (_, token) = tokens.create("device", req.name?.takeIf { it.isNotBlank() } ?: "ios", issued.principal, admin = issued.admin)
     return DeviceTokenResp(token, issued.principal)
   }
 }
@@ -323,8 +325,8 @@ class TokenLoginAction @Inject constructor(
   @ResponseContentType(MediaTypes.APPLICATION_JSON)
   fun login(@RequestBody req: TokenLoginReq): MeDto {
     val resolved = tokens.resolve(req.token.trim()) ?: throw UnauthenticatedException("bad token")
-    httpCall.get().setResponseHeader("Set-Cookie", sessions.start(resolved.principal, "web (token login)", resolved.vault, resolved.readOnly))
-    return MeDto(resolved.principal, true, resolved.vault, resolved.readOnly, resolved.vault == null && !resolved.readOnly)
+    httpCall.get().setResponseHeader("Set-Cookie", sessions.start(resolved.principal, "web (token login)", resolved.vault, resolved.readOnly, resolved.admin))
+    return MeDto(resolved.principal, true, resolved.vault, resolved.readOnly, resolved.vault == null && !resolved.readOnly && resolved.admin)
   }
 }
 

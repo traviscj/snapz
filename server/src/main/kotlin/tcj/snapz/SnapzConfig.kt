@@ -54,6 +54,12 @@ data class OidcConfig(
    * of these client ids (a CLI's device-flow client, say). The same allowlist applies.
    */
   val bearer_audiences: List<String> = listOf(),
+  /**
+   * Groups at the issuer whose members get the admin capability (vault and token management, purge,
+   * the publish switch, the sink endpoints, and misk's /_admin/ dashboard). Empty = everyone on the
+   * allowlist is an admin. Membership is read at sign-in and kept on the session / device token.
+   */
+  val admin_groups: List<String> = listOf(),
 ) {
   override fun toString() = "OidcConfig(issuer=$issuer, client_id=$client_id, client_secret=████)"
 }

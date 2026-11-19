@@ -20,6 +20,9 @@ snapz:
     # Register this callback URL with the provider: <public_url>/auth/callback
     allowed_emails: [you@example.net]
     allowed_groups: []
+    # Members of these groups at the provider are admins (vault/token management, purge, sink
+    # endpoints, misk's /_admin/ dashboard). Empty = everyone on the allowlist is.
+    admin_groups: [snapz-admins]
     # Other client ids whose issuer-signed JWTs are accepted as bearer tokens (client_id always is):
     # bearer_audiences: []
   # Optional break-glass token for first boot / when SSO is down. Remove once a script token exists.

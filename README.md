@@ -309,6 +309,10 @@ What the server does by itself:
   the cookie and that the browser labels cross-site (`Sec-Fetch-Site`, else `Origin` vs `Host`) is
   treated as unauthenticated. Bearer tokens are unaffected.
 - Uploads must sniff as an image, whatever `Content-Type` says.
+- Admin is a group at the identity provider (`oidc.admin_groups`), read at sign-in and kept on the
+  session or device token. It gates vault and token management, purge, the publish switch, the
+  sink endpoints, and misk's `/_admin/` dashboard, all of which is closed to everyone else
+  (including the shell page misk itself would serve to anyone).
 - With an https `public_url` it refuses to start on a bootstrap token shorter than 32 characters,
   and logs (and lists under `posture` in `GET /api/info`) what else it thinks is wrong: bootstrap
   tokens still present, `root` or passwordless database access, no OIDC.

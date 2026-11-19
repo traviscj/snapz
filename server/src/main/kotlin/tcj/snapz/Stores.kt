@@ -700,7 +700,8 @@ class RecordStore @Inject constructor(
 
 // ---------------------------------------------------------------------------------------------
 
-data class ResolvedToken(val id: Long?, val kind: String, val principal: String, val vault: String? = null, val readOnly: Boolean = false)
+/** [admin]: may hold the ADMIN capability (it still needs to be unpinned and not read-only). */
+data class ResolvedToken(val id: Long?, val kind: String, val principal: String, val vault: String? = null, val readOnly: Boolean = false, val admin: Boolean = true)
 
 /** Bearer credentials: web sessions, per-device tokens (iOS), and named script tokens. Only SHA-256 hashes are stored. */
 @Singleton
@@ -710,14 +711,14 @@ class TokenStore @Inject constructor(
   private val config: SnapzConfig,
 ) {
   /** [vault] pins the credential to one vault (and off the admin routes); [readOnly] limits it to GETs. */
-  fun create(kind: String, name: String, principal: String, ttlMs: Long? = null, vault: String? = null, readOnly: Boolean = false): Pair<Long, String> {
+  fun create(kind: String, name: String, principal: String, ttlMs: Long? = null, vault: String? = null, readOnly: Boolean = false, admin: Boolean = true): Pair<Long, String> {
     val plain = "snapz_" + randomSecret()
     val now = clock.millis()
     val id = db.tx { c ->
       val vaultId = vault?.let { v -> c.select("SELECT id FROM vaults WHERE slug = ? AND deleted_at_ms IS NULL", listOf(v)) { it.getLong(1) }.firstOrNull() ?: throw NotFoundException("no vault '$v'") }
       c.insert(
-        "INSERT INTO api_tokens (kind, name, token_hash, principal, created_at_ms, expires_at_ms, vault_id, read_only) VALUES (?,?,?,?,?,?,?,?)",
-        listOf(kind, name.take(255), sha256Hex(plain.toByteArray()), principal, now, ttlMs?.let { now + it }, vaultId, readOnly),
+        "INSERT INTO api_tokens (kind, name, token_hash, principal, created_at_ms, expires_at_ms, vault_id, read_only, admin) VALUES (?,?,?,?,?,?,?,?,?)",
+        listOf(kind, name.take(255), sha256Hex(plain.toByteArray()), principal, now, ttlMs?.let { now + it }, vaultId, readOnly, admin),
       )
     }
     return id to plain
@@ -732,14 +733,14 @@ class TokenStore @Inject constructor(
     return db.tx { c ->
       val row = c.select(
         """
-        SELECT t.id, t.kind, t.principal, t.last_used_at_ms, t.read_only, t.vault_id, v.slug AS vault
+        SELECT t.id, t.kind, t.principal, t.last_used_at_ms, t.read_only, t.admin, t.vault_id, v.slug AS vault
         FROM api_tokens t LEFT JOIN vaults v ON v.id = t.vault_id AND v.deleted_at_ms IS NULL
         WHERE t.token_hash = ? AND t.revoked_at_ms IS NULL AND (t.expires_at_ms IS NULL OR t.expires_at_ms > ?)
         """.trimIndent(),
         listOf(sha256Hex(plain.toByteArray()), now),
       ) { rs ->
         Triple(
-          ResolvedToken(rs.getLong("id"), rs.getString("kind"), rs.getString("principal"), rs.getString("vault"), rs.getBoolean("read_only")),
+          ResolvedToken(rs.getLong("id"), rs.getString("kind"), rs.getString("principal"), rs.getString("vault"), rs.getBoolean("read_only"), rs.getBoolean("admin")),
           rs.longOrNull("last_used_at_ms"),
           // Pinned to a vault that has since been deleted: the credential dies with it.
           rs.longOrNull("vault_id") != null && rs.getString("vault") == null,
