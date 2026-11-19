@@ -24,6 +24,7 @@ jobs:
         working-directory: server
         run: |
           . bin/activate-hermit
+          hermit install          # activation only sets paths; this fetches the pinned JDK and Gradle
           gradle test --no-daemon
       - uses: actions/upload-artifact@v4
         if: failure()

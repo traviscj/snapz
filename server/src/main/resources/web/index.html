@@ -1008,6 +1008,9 @@ document.querySelectorAll("#top .tab").forEach(t => t.onclick = () => { if (S.me
 document.addEventListener("keydown", ev => { if (S.me && S.tab === "photos") photoKeys(ev); });
 
 async function boot() {
+  // Ask the open endpoint first: a visitor who is not signed in should not produce a 401 on every
+  // page load (intrusion detection in front of the server counts those, and bans on a handful).
+  try { const info = await api("GET", "/auth/info", undefined, { noLogin: true }); if (!info.principal) return showLogin(); } catch (e) { /* fall through to /api/me */ }
   try { S.me = await api("GET", "/api/me"); } catch (e) { if (e.status !== 401) say("server unreachable: " + e.message, "bad"); return; }
   $("#who").textContent = S.me.principal + (S.me.vault ? ` @${S.me.vault}` : "") + (S.me.read_only ? " ro" : ""); $("#logout").classList.remove("hide");
   document.querySelector('#top .tab[data-tab="tokens"]').classList.toggle("hide", !S.me.admin);
