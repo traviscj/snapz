@@ -13,6 +13,8 @@
     nameplate        extract   an equipment rating plate, structured           -> meta `nameplate`
     expiry           extract   best-by / use-by / expiry date and the product  -> meta `expiry`
     whiteboard       extract   handwriting, whiteboards and notes as markdown  -> meta `transcript`
+    check            extract   a paper check: who it is from (the name block, top left), plus the
+                               number, date, amount and memo when they are in the shot   -> meta `check`
 
 Put `look` in a collection's chain and each photo costs one model call plus one per reader that
 applies, instead of one per reader. Any reader can also be attached or run on its own.
@@ -83,6 +85,7 @@ ROUTES = {
     "container": "fullness",
     "expiry": "expiry",
     "notes": "whiteboard",
+    "check": "check",
 }
 
 LOOK_PROMPT = """Describe this photo for a personal photo index.
@@ -99,7 +102,18 @@ meter        a utility meter, gauge, odometer, thermostat or scale showing a rea
 nameplate    an equipment rating plate or spec label (appliance, HVAC, motor, electronics)
 container    a bottle, jug, jar, carton, glass or tank whose fill level is visible
 expiry       a best-by, use-by, sell-by or expiry date on a product
-notes        a whiteboard, handwritten note, sticky note, to-do list or page of notes worth transcribing"""
+notes        a whiteboard, handwritten note, sticky note, to-do list or page of notes worth transcribing
+check        a paper bank check (cheque) or money order, or the name-and-address corner of one"""
+
+CHECK_PROMPT = """This is a photo of a paper bank check, or of just its top left corner. Read who the check is FROM.
+
+The payer is the account holder: the name (or names, on a joint account) printed at the top left, usually with a postal address under it. It is printed, not handwritten. It is not the bank's name, not the "pay to the order of" line, and not the signature.
+The rest of the check may be out of frame; anything you cannot see is null. The amount is the number in the box at the right (handwritten on a personal check): give it only if every digit is legible. Do not work it out from the amount written in words unless the box is unreadable and the words are clear.
+Never copy the routing or account numbers printed along the bottom edge.
+
+Answer with JSON only, in this shape:
+{"payers": ["<each account-holder name exactly as printed, one per person or business>"], "street": "<payer's street line including any apt / suite, or null>", "city": null, "state": "<two letters, or null>", "zip": null, "number": "<check number, top right, digits only, or null>", "date": "<date written on the check as YYYY-MM-DD, or null>", "amount": <number or null>, "payee": "<pay to the order of, or null>", "memo": "<memo / for line, or null>", "bank": "<bank name, or null>", "confidence": <0 to 1 that the payer name is read correctly>}
+If this is not a check, answer {"payers": []}."""
 
 ADDRESS_PROMPT = """Read the postal addresses and contact details printed or written in this photo (envelope, package label, sign, business card, vehicle lettering, letterhead).
 Do not guess characters you cannot read; leave that field null. Do not invent a city or ZIP that is not shown.
@@ -353,6 +367,21 @@ def expiry_in(image):
             "confidence": _num(a.get("confidence"))}
 
 
+def check_in(image):
+    a = ask(image, CHECK_PROMPT, max_tokens=500)
+    payers = [p for p in (_s(p, 80) for p in (a.get("payers") if isinstance(a.get("payers"), list) else [])) if p][:4]
+    amount = _amount(a.get("amount"))
+    number = re.sub(r"\D", "", _s(a.get("number"), 12) or "")
+    street, city, state, zip_ = _s(a.get("street"), 80), _s(a.get("city"), 40), _s(a.get("state"), 2), _s(a.get("zip"), 10)
+    return {
+        "payers": payers, "payer": " / ".join(payers) or None,
+        "address": ", ".join(p for p in (street, city, " ".join(p for p in (state, zip_) if p)) if p) or None,
+        "number": number.lstrip("0") or None, "date": _date(a.get("date")),
+        "amount": round(amount, 2) if amount and 0 < amount < 1_000_000 else None,
+        "payee": _s(a.get("payee"), 80), "memo": _s(a.get("memo"), 120), "bank": _s(a.get("bank"), 60), "confidence": _num(a.get("confidence")),
+    }
+
+
 def whiteboard_in(image):
     a = ask(image, WHITEBOARD_PROMPT, max_tokens=3000)
     md = a.get("markdown")
@@ -368,7 +397,7 @@ def _out(data, patch):
 
 
 @image_transform("look", kind="extract",
-                 description="Caption + tags, then queues only the readers that apply (text, address, receipt, meter, nameplate, fullness, expiry, whiteboard). Sets meta.caption, meta.tags.")
+                 description="Caption + tags, then queues only the readers that apply (text, address, receipt, meter, nameplate, fullness, expiry, whiteboard, check). Sets meta.caption, meta.tags.")
 def look_transform(intent, image, sz):
     # Filing a photo starts the destination's chain; if a chain already looked at it (say, in the inbox), once was enough.
     if intent.get("origin") == "chain" and intent.get("photo") and (sz.photo(intent["photo"]).get("meta") or {}).get("caption"):
@@ -454,8 +483,17 @@ def whiteboard_transform(intent, image, sz):
     return _out(r, {"transcript": r["markdown"][:4000], "transcript_title": r["title"]})
 
 
+@image_transform("check", kind="extract",
+                 description="A paper check, or just its top left corner: who it is from (name, address), and the number, date, amount and memo when they are in the shot (vision model). Never the routing / account line. Sets meta.check.")
+def check_transform(intent, image, sz):
+    r = check_in(image)
+    if not r["payer"]:
+        return _out(r, {"check": None})
+    return _out(r, {"check": _compact({k: r[k] for k in ("payer", "address", "number", "date", "amount", "memo", "bank", "confidence")})})
+
+
 READERS = {"important-text": important_text, "fullness": fullness_of, "address": addresses_in, "receipt": receipt_in,
-           "meter-read": meter_in, "nameplate": nameplate_in, "expiry": expiry_in, "whiteboard": whiteboard_in}
+           "meter-read": meter_in, "nameplate": nameplate_in, "expiry": expiry_in, "whiteboard": whiteboard_in, "check": check_in}
 
 
 def _try(args):

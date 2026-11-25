@@ -781,6 +781,9 @@ function facts(p) {
   if (Array.isArray(m.dup_of) && m.dup_of.length) out.push(["warn", "dup", "looks the same as " + m.dup_of.join(" ")]);
   if (m.expiry?.date) out.push([expCls(m.expiry.date), m.expiry.date.slice(2), `${m.expiry.kind || "date"}${m.expiry.product ? ": " + m.expiry.product : ""}`]);
   if (m.receipt?.total != null) out.push(["acc", money(m.receipt.total, m.receipt.currency), [m.receipt.merchant, m.receipt.date].filter(Boolean).join(" ")]);
+  if (m.check?.payer) out.push(["acc", m.check.amount != null ? money(m.check.amount) : "chk", [m.check.payer, m.check.number ? "#" + m.check.number : null].filter(Boolean).join(" ")]);
+  // What a ledger did with the check (written back by whatever consumes the collection, e.g. rrcli's `rr deposits`).
+  if (m.rentredi?.status) out.push([{recorded: "ok", already_recorded: "dim", review: "warn"}[m.rentredi.status] || "dim", m.rentredi.status === "recorded" ? "paid " + (m.rentredi.units || "") : m.rentredi.status.replace("_", " "), [m.rentredi.verdict, m.rentredi.why].filter(Boolean).join(": ")]);
   if (m.reading?.value != null) out.push(["acc", `${m.reading.value}${m.reading.unit ? " " + m.reading.unit : ""}`, [m.reading.kind, m.reading.meter_id].filter(Boolean).join(" ")]);
   if (m.place) out.push(["dim", "@" + m.place, m.gps ? `${m.gps.lat},${m.gps.lon}` : ""]);
   return out;
@@ -794,6 +797,8 @@ function factRows(p) {
   for (const a of Array.isArray(m.addresses) ? m.addresses : []) rows.push([a.role || "address", [a.name, a.line].filter(Boolean).join(" — ")]);
   for (const c of Array.isArray(m.contacts) ? m.contacts : []) rows.push(["contact", [c.name, c.title, c.company, c.phone, c.email, c.url, c.license].filter(Boolean).join(" · ")]);
   if (m.receipt) rows.push(["receipt", [m.receipt.merchant, m.receipt.date, money(m.receipt.total, m.receipt.currency), m.receipt.tax != null ? "tax " + money(m.receipt.tax, m.receipt.currency) : null, m.receipt.lines ? m.receipt.lines + " lines" : null, m.receipt.invoice].filter(Boolean).join(" · ")]);
+  if (m.check) rows.push(["check", [m.check.payer, m.check.number ? "#" + m.check.number : null, m.check.amount != null ? money(m.check.amount) : "amount not in shot", m.check.date, m.check.memo, m.check.address, m.check.bank].filter(Boolean).join(" · ")]);
+  if (m.rentredi) rows.push(["ledger", [m.rentredi.status, m.rentredi.verdict, m.rentredi.units, m.rentredi.amount != null ? money(m.rentredi.amount) : null, m.rentredi.why, m.rentredi.at].filter(Boolean).join(" · ")]);
   if (m.reading) rows.push(["reading", [`${m.reading.value}${m.reading.unit ? " " + m.reading.unit : ""}`, m.reading.kind, m.reading.meter_id ? "#" + m.reading.meter_id : null].filter(Boolean).join(" · ")]);
   if (m.nameplate) rows.push(["nameplate", [m.nameplate.type, m.nameplate.make, m.nameplate.model, m.nameplate.serial ? "s/n " + m.nameplate.serial : null, m.nameplate.mfg_date, ...Object.entries(m.nameplate.specs || {}).map(([k, v]) => `${k} ${v}`)].filter(Boolean).join(" · ")]);
   if (m.expiry?.date) rows.push(["expiry", [m.expiry.date, m.expiry.kind, m.expiry.product].filter(Boolean).join(" · ")]);

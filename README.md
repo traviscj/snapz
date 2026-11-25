@@ -273,6 +273,7 @@ Ollama server keeps the photos on your network):
 | `nameplate` | `meta.nameplate`: `{type, make, model, serial, mfg_date, specs}` off an equipment rating plate |
 | `expiry` | `meta.expiry`: `{date, kind, product}` for a best-by / use-by / expiry date |
 | `whiteboard` | `meta.transcript` (Markdown) and `meta.transcript_title` for whiteboards, notes and lists |
+| `check` | `meta.check`: `{payer, address, number, date, amount, memo, bank}` for a paper check; only the name block (top left) has to be in the shot, and the routing / account line is never read. Something downstream can act on it and write its verdict back (rrcli's `rr deposits` marks the rent paid and sets `meta.rentredi`) |
 
 A reader that finds nothing answers ok and clears its keys, so a retake does not keep the old answer.
 
